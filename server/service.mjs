@@ -15,6 +15,10 @@ export const _MODEL_DIR = path.resolve(__dirname, 'saved');
 let model = null;
 let building = false;
 
+// Хранилище игровой истории для дообучения
+let gameHistory = [];
+const MAX_HISTORY_SIZE = 10000; // Максимум сохраненных ходов
+
 async function ensureDir(p) { try { await fs.mkdir(p, { recursive: true }); } catch {} }
 
 // Проверяет, существует ли обученная модель
@@ -144,6 +148,104 @@ export async function predictMove({ board, current = 1, mode = 'model' }) {
   let best=-1, bestv=-1; for (const mm of moves) if (pa[mm]>bestv){ best=mm; bestv=pa[mm]; }
   console.log('[Predict] Using trained model, move:', best);
   return { move: best, probs: Array.from(pa), isRandom: false, mode: 'model' };
+}
+
+// Сохраняет ход игры в историю для дообучения
+export function saveGameMove({ board, move, current }) {
+  try {
+    const rel = relativeCells(board, current);
+    const pos = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+    const onehot = new Array(9).fill(0);
+    if (move >= 0 && move < 9) {
+      onehot[move] = 1;
+    }
+    
+    gameHistory.push({ X: rel, P: pos, Y: onehot });
+    
+    // Ограничиваем размер истории
+    if (gameHistory.length > MAX_HISTORY_SIZE) {
+      gameHistory = gameHistory.slice(-MAX_HISTORY_SIZE);
+    }
+    
+    console.log(`[GameHistory] Saved move, total: ${gameHistory.length}`);
+  } catch (e) {
+    console.error('[GameHistory] Error saving move:', e);
+  }
+}
+
+// Очищает историю игр
+export function clearGameHistory() {
+  gameHistory = [];
+  console.log('[GameHistory] Cleared');
+  return { success: true, count: 0 };
+}
+
+// Получает статистику истории
+export function getGameHistoryStats() {
+  return { count: gameHistory.length, maxSize: MAX_HISTORY_SIZE };
+}
+
+// Дообучение модели на реальных играх
+export async function trainOnGames(progressCb, { epochs = 3, batchSize = 32 } = {}) {
+  try {
+    if (gameHistory.length < 10) {
+      throw new Error(`Недостаточно данных для обучения. Нужно минимум 10 ходов, есть ${gameHistory.length}`);
+    }
+    
+    progressCb?.({ type: 'train.start', payload: { epochs, batchSize, nTrain: gameHistory.length, nVal: 0 } });
+    
+    console.log(`[TrainOnGames] Training on ${gameHistory.length} game moves...`);
+    progressCb?.({ type: 'train.status', payload: { message: `Подготовка данных (${gameHistory.length} ходов)...` } });
+    
+    const m = await ensureModel({ forceFresh: false }); // Не пересоздаем модель, продолжаем обучение
+    
+    // Подготавливаем данные из истории
+    const X = gameHistory.map(h => h.X);
+    const P = gameHistory.map(h => h.P);
+    const Y = gameHistory.map(h => h.Y);
+    
+    console.log(`[TrainOnGames] Creating tensors from ${X.length} moves...`);
+    const xCells = tf.tensor2d(X, [X.length, 9], 'int32');
+    const xPos = tf.tensor2d(P, [P.length, 9], 'int32');
+    const yOneHot = tf.tensor2d(Y, [Y.length, 9], 'float32');
+    
+    progressCb?.({ type: 'train.status', payload: { message: 'Начало дообучения...' } });
+    
+    await m.fit([xCells, xPos], yOneHot, {
+      epochs,
+      batchSize,
+      shuffle: true,
+      verbose: 0,
+      callbacks: {
+        onEpochEnd: (epoch, logs) => {
+          console.log(`[TrainOnGames] Epoch ${epoch+1}/${epochs}, loss: ${logs.loss}, acc: ${logs.acc}`);
+          progressCb?.({ type:'train.progress',
+            payload: {
+              epoch: epoch+1, epochs,
+              loss: Number(logs.loss ?? 0).toFixed(4),
+              acc: Number(logs.acc ?? 0).toFixed(4),
+              val_loss: 0,
+              val_acc: 0,
+              percent: Math.round(((epoch+1)/epochs)*100),
+            }});
+        },
+        onTrainEnd: () => {
+          console.log('[TrainOnGames] Training completed');
+          progressCb?.({ type:'train.done', payload:{ saved:true } });
+        },
+      }
+    });
+    
+    console.log('[TrainOnGames] Saving model...');
+    await m.save(`file://${_MODEL_DIR}`);
+    
+    xCells.dispose(); xPos.dispose(); yOneHot.dispose();
+    console.log('[TrainOnGames] Done');
+  } catch (e) {
+    console.error('[TrainOnGames] Error:', e);
+    progressCb?.({ type: 'error', error: String(e) });
+    throw e;
+  }
 }
 
 export async function clearModel() {

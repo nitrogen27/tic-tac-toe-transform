@@ -7,7 +7,18 @@
       <div class="controls">
         <div class="button-group">
           <button :disabled="training || clearing" @click="startTrain">Обучить</button>
+          <button :disabled="training || clearing" @click="trainOnGames" :class="historyCount >= 10 ? '' : 'disabled-btn'">Дообучить на играх</button>
           <button :disabled="training || clearing" @click="clearModel" class="clear-btn">Очистить модель</button>
+        </div>
+        <div class="history-info" v-if="historyCount > 0">
+          <span>Сохранено ходов: {{historyCount}}</span>
+          <button @click="clearHistory" class="small-btn">Очистить историю</button>
+        </div>
+        <div class="checkbox-group">
+          <label>
+            <input type="checkbox" v-model="autoTrainAfterGame" />
+            <span>Автоматически дообучать после каждой игры</span>
+          </label>
         </div>
         <div class="progress" v-if="progress">
           <div class="bar" :style="{ width: (progress.percent||0)+'%' }"></div>
@@ -82,6 +93,9 @@ const gameOver = ref(false) // Игра завершена
 const autoPlaying = ref(false) // Автоматическая игра идет
 const pauseMs = ref(1000) // Пауза между ходами в мс
 let autoGameInterval = null
+const historyCount = ref(0) // Количество сохраненных ходов
+const autoTrainAfterGame = ref(false) // Автоматическое дообучение после игры
+let currentGameMoves = [] // Ходы текущей игры
 let reconnectAttempts = 0
 let reconnectTimeout = null
 let isConnecting = false
@@ -124,6 +138,10 @@ function connectWS() {
       reconnectAttempts = 0
       status.value = 'Подключено'
       hasHandledClose = false
+      // Запрашиваем статистику истории
+      if (ws.value.readyState === WebSocket.OPEN) {
+        ws.value.send(JSON.stringify({ type: 'get_history_stats' }))
+      }
     }
     
     ws.value.onerror = (err) => { 
@@ -189,11 +207,15 @@ function connectWS() {
           status.value = msg.payload.message || 'Обработка...'
           console.log('[WS] Status:', msg.payload.message)
         }
-        if (msg.type === 'train.done') { 
-          training.value = false
-          status.value = 'Обучение завершено'
-          console.log('[WS] Training completed')
+      if (msg.type === 'train.done') { 
+        training.value = false
+        status.value = 'Обучение завершено'
+        console.log('[WS] Training completed')
+        // Обновляем статистику истории после обучения
+        if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+          ws.value.send(JSON.stringify({ type: 'get_history_stats' }))
         }
+      }
         if (msg.type === 'predict.result') {
           waiting.value = false
           const move = msg.payload.move
@@ -217,6 +239,9 @@ function connectWS() {
               }
             } else {
               // В режиме человек vs бот
+              // Сохраняем ход бота для обучения
+              saveMove(board.value, move, 2)
+              
               board.value[move] = 2
               current.value = 1
               
@@ -230,6 +255,9 @@ function connectWS() {
                 } else {
                   status.value = 'Ваш ход (X)'
                 }
+              } else {
+                // Игра окончена - проверяем авто-дообучение
+                autoTrainAfterGameIfEnabled()
               }
               // Если checkGameOver вернул true, статус уже установлен
             }
@@ -245,6 +273,18 @@ function connectWS() {
           progress.value = null
           status.value = 'Модель очищена'
           console.log('[WS] Model cleared:', msg.payload)
+        }
+        if (msg.type === 'move.saved') {
+          historyCount.value = msg.payload.count || 0
+          console.log('[WS] Move saved, history:', msg.payload)
+        }
+        if (msg.type === 'history.cleared') {
+          historyCount.value = 0
+          currentGameMoves = []
+          console.log('[WS] History cleared')
+        }
+        if (msg.type === 'history.stats') {
+          historyCount.value = msg.payload.count || 0
         }
         if (msg.type === 'error') {
           console.error('[WS] Server error:', msg.error)
@@ -340,6 +380,8 @@ function checkGameOver() {
       status.value = '🎉 Модель выиграла! (X)';
     } else {
       status.value = '🎉 Вы выиграли! (X)';
+      // Сохраняем финальные ходы если игра окончена
+      autoTrainAfterGameIfEnabled()
     }
     return true;
   } else if (winner === 2) {
@@ -348,11 +390,15 @@ function checkGameOver() {
       status.value = '❌ Бот (minimax) выиграл! (O)';
     } else {
       status.value = '❌ Бот выиграл! (O)';
+      autoTrainAfterGameIfEnabled()
     }
     return true;
   } else if (winner === 0) {
     gameOver.value = true;
     status.value = '🤝 Ничья!';
+    if (gameType.value === 'human') {
+      autoTrainAfterGameIfEnabled()
+    }
     return true;
   }
   gameOver.value = false;
@@ -367,6 +413,65 @@ function reset() {
   current.value = 1
   status.value = gameType.value === 'auto' ? 'Готово к игре' : 'Ваш ход (X)'
   gameOver.value = false
+  currentGameMoves = []
+}
+
+function saveMove(board, move, currentPlayer) {
+  if (gameType.value === 'human' && move >= 0) {
+    // Сохраняем только ходы в режиме человек vs бот (ходы человека и бота)
+    if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+      ws.value.send(JSON.stringify({
+        type: 'save_move',
+        payload: { board: [...board], move, current: currentPlayer }
+      }))
+      currentGameMoves.push({ board: [...board], move, current: currentPlayer })
+    } else {
+      console.warn('[WS] Cannot save move - WebSocket not connected')
+    }
+  }
+}
+
+async function autoTrainAfterGameIfEnabled() {
+  if (autoTrainAfterGame.value && historyCount.value >= 10 && !training.value) {
+    status.value = 'Автоматическое дообучение...'
+    setTimeout(() => {
+      trainOnGames()
+    }, 500)
+  }
+}
+
+function trainOnGames() {
+  if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
+    status.value = 'Ошибка: WebSocket не подключен. Переподключение...'
+    if (!isConnecting) {
+      connectWS()
+    }
+    return
+  }
+  if (historyCount.value < 10) {
+    alert(`Недостаточно данных для обучения. Нужно минимум 10 ходов, есть ${historyCount.value}`)
+    return
+  }
+  training.value = true
+  status.value = 'Дообучение на реальных играх...'
+  try {
+    ws.value.send(JSON.stringify({ type: 'train_on_games', payload: { epochs: 3, batchSize: 32 } }))
+    console.log('[TrainOnGames] Request sent')
+  } catch (e) {
+    console.error('[TrainOnGames] Send error:', e)
+    training.value = false
+    status.value = 'Ошибка: ' + e.message
+  }
+}
+
+function clearHistory() {
+  if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
+    status.value = 'Ошибка: WebSocket не подключен.'
+    return
+  }
+  if (confirm('Очистить историю игр?')) {
+    ws.value.send(JSON.stringify({ type: 'clear_history' }))
+  }
 }
 
 function stopAutoGame() {
@@ -471,6 +576,9 @@ function humanMove(idx) {
     return
   }
   
+  // Сохраняем ход человека для обучения
+  saveMove(board.value, idx, 1)
+  
   // Делаем ход
   board.value[idx] = 1
   current.value = 2
@@ -530,6 +638,12 @@ onMounted(() => {
 .cell { width: 80px; height: 80px; font-size: 28px; border: 1px solid #ccc; border-radius: 8px; background: white; cursor: pointer; }
 .cell:disabled { background: #f3f3f3; cursor: not-allowed; }
 .row { display:flex; align-items:center; gap: 12px; }
+.history-info { display: flex; align-items: center; gap: 12px; margin-top: 8px; padding: 8px; background: #f0f0f0; border-radius: 4px; font-size: 0.9em; }
+.small-btn { padding: 4px 8px; font-size: 0.85em; }
+.disabled-btn { opacity: 0.5; cursor: not-allowed; }
+.checkbox-group { margin-top: 8px; padding: 8px; background: #f9f9f9; border-radius: 4px; }
+.checkbox-group label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.checkbox-group input[type="checkbox"] { cursor: pointer; }
 .status { opacity: .8; }
 .status.game-over { 
   font-weight: bold; 

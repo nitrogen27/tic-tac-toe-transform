@@ -1,5 +1,5 @@
 import { WebSocketServer } from 'ws';
-import { trainWithProgress, predictMove, clearModel } from './service.mjs';
+import { trainWithProgress, predictMove, clearModel, saveGameMove, trainOnGames, clearGameHistory, getGameHistoryStats } from './service.mjs';
 
 const wss = new WebSocketServer({ port: 8080 });
 console.log('[WS] Listening on ws://localhost:8080');
@@ -44,6 +44,19 @@ wss.on('connection', (ws) => {
         } catch (e) {
           ws.send(JSON.stringify({ type: 'error', error: String(e) }));
         }
+      } else if (m.type === 'save_move') {
+        // Сохраняем ход для обучения
+        saveGameMove(m.payload || { board: [], move: -1, current: 1 });
+        ws.send(JSON.stringify({ type: 'move.saved', payload: getGameHistoryStats() }));
+      } else if (m.type === 'train_on_games') {
+        console.log('[WS] Training on game history...');
+        await trainOnGames((ev)=>ws.send(JSON.stringify(ev)), m.payload || {});
+      } else if (m.type === 'clear_history') {
+        const result = clearGameHistory();
+        ws.send(JSON.stringify({ type: 'history.cleared', payload: result }));
+      } else if (m.type === 'get_history_stats') {
+        const stats = getGameHistoryStats();
+        ws.send(JSON.stringify({ type: 'history.stats', payload: stats }));
       } else {
         ws.send(JSON.stringify({ type: 'error', error: 'unknown_type' }));
       }
