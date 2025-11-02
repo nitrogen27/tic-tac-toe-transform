@@ -19,6 +19,10 @@ let building = false;
 let gameHistory = [];
 const MAX_HISTORY_SIZE = 10000; // Максимум сохраненных ходов
 
+// Хранилище полных игр для анализа ошибок
+let gameSequences = []; // [{ moves: [{board, move, current}], winner, playerRole }]
+const MAX_GAME_SEQUENCES = 100; // Храним последние 100 игр
+
 async function ensureDir(p) { try { await fs.mkdir(p, { recursive: true }); } catch {} }
 
 // Проверяет, существует ли обученная модель
@@ -151,7 +155,7 @@ export async function predictMove({ board, current = 1, mode = 'model' }) {
 }
 
 // Сохраняет ход игры в историю для дообучения
-export function saveGameMove({ board, move, current }) {
+export function saveGameMove({ board, move, current, gameId }) {
   try {
     const rel = relativeCells(board, current);
     const pos = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -162,6 +166,14 @@ export function saveGameMove({ board, move, current }) {
     
     gameHistory.push({ X: rel, P: pos, Y: onehot });
     
+    // Также сохраняем в последовательность игры, если указан gameId
+    if (gameId !== undefined) {
+      const gameSeq = gameSequences.find(g => g.id === gameId);
+      if (gameSeq) {
+        gameSeq.moves.push({ board: [...board], move, current });
+      }
+    }
+    
     // Ограничиваем размер истории
     if (gameHistory.length > MAX_HISTORY_SIZE) {
       gameHistory = gameHistory.slice(-MAX_HISTORY_SIZE);
@@ -171,6 +183,214 @@ export function saveGameMove({ board, move, current }) {
   } catch (e) {
     console.error('[GameHistory] Error saving move:', e);
   }
+}
+
+// Начинает новую игру (для отслеживания последовательности)
+export function startNewGame({ playerRole = 1 } = {}) {
+  const gameId = Date.now() + Math.random();
+  gameSequences.push({
+    id: gameId,
+    moves: [],
+    winner: null,
+    playerRole, // 1 = модель играет за X, 2 = модель играет за O
+  });
+  
+  // Ограничиваем размер
+  if (gameSequences.length > MAX_GAME_SEQUENCES) {
+    gameSequences = gameSequences.slice(-MAX_GAME_SEQUENCES);
+  }
+  
+  return gameId;
+}
+
+// Завершает игру и анализирует ошибки
+export async function finishGame({ gameId, winner, patternsPerError = 1000 }) {
+  const gameSeq = gameSequences.find(g => g.id === gameId);
+  if (!gameSeq) return;
+  
+  gameSeq.winner = winner;
+  
+  // Если модель проиграла, анализируем ошибки
+  if ((gameSeq.playerRole === 1 && winner === 2) || (gameSeq.playerRole === 2 && winner === 1)) {
+    console.log(`[ErrorDetection] Model lost game ${gameId}, analyzing mistakes...`);
+    await analyzeAndGenerateCorrections(gameSeq, patternsPerError);
+  }
+}
+
+// Анализирует ошибки и генерирует обучающие паттерны
+async function analyzeAndGenerateCorrections(gameSeq, patternsPerError = 1000) {
+  try {
+    const { teacherBestMove, legalMoves, getWinner } = await import('./src/tic_tac_toe.mjs');
+    const corrections = [];
+    
+    // Анализируем каждый ход модели
+    for (let i = 0; i < gameSeq.moves.length; i++) {
+      const move = gameSeq.moves[i];
+      
+      // Проверяем, это ход модели?
+      const isModelMove = (gameSeq.playerRole === 1 && move.current === 1) || 
+                         (gameSeq.playerRole === 2 && move.current === 2);
+      
+      if (!isModelMove) continue;
+      
+      // Проверяем, был ли это правильный ход (сравниваем с minimax)
+      const correctMove = teacherBestMove(move.board, move.current);
+      
+      if (correctMove !== move.move) {
+        // Модель сделала ошибку!
+        console.log(`[ErrorDetection] Found mistake at move ${i}: model chose ${move.move}, should be ${correctMove}`);
+        
+        // Генерируем вариации этого паттерна (количество из настроек)
+        const variations = await generateBoardVariations(move.board, move.current, patternsPerError);
+        
+        for (const variant of variations) {
+          const bestMove = teacherBestMove(variant.board, variant.current);
+          const rel = relativeCells(variant.board, variant.current);
+          const pos = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+          const onehot = new Array(9).fill(0);
+          if (bestMove >= 0 && bestMove < 9) {
+            onehot[bestMove] = 1;
+          }
+          
+          corrections.push({ X: rel, P: pos, Y: onehot });
+        }
+      }
+    }
+    
+    // Добавляем исправления в историю
+    if (corrections.length > 0) {
+      console.log(`[ErrorDetection] Generated ${corrections.length} correction patterns`);
+      gameHistory.push(...corrections);
+      
+      // Ограничиваем размер истории
+      if (gameHistory.length > MAX_HISTORY_SIZE) {
+        gameHistory = gameHistory.slice(-MAX_HISTORY_SIZE);
+      }
+    }
+  } catch (e) {
+    console.error('[ErrorDetection] Error analyzing mistakes:', e);
+  }
+}
+
+// Генерирует вариации доски для обучения на ошибках
+async function generateBoardVariations(board, current, count = 1000) {
+  const variations = [];
+  const { legalMoves, getWinner } = await import('./src/tic_tac_toe.mjs');
+  
+  // Базовый паттерн
+  variations.push({ board: [...board], current });
+  
+  // Генерируем вариации:
+  // 1. Разные комбинации заполнения незанятых клеток (сохраняя структуру)
+  const emptyIndices = [];
+  for (let i = 0; i < 9; i++) {
+    if (board[i] === 0) emptyIndices.push(i);
+  }
+  
+  // Если слишком мало свободных клеток, просто дублируем базовый паттерн
+  if (emptyIndices.length <= 2) {
+    for (let i = 0; i < count - 1; i++) {
+      variations.push({ board: [...board], current });
+    }
+    return variations;
+  }
+  
+  // Генерируем вариации несколькими способами для разнообразия
+  const maxAttempts = count * 3; // Увеличено для генерации 1000 уникальных вариантов
+  const seenBoards = new Set();
+  seenBoards.add(board.join(''));
+  
+  console.log(`[GenerateVariations] Generating ${count} variations from board with ${emptyIndices.length} empty cells`);
+  
+  for (let i = 0; i < maxAttempts && variations.length < count; i++) {
+    const variant = [...board];
+    
+    // Разные стратегии генерации вариаций для разнообразия
+    const strategy = i % 5; // Используем 5 стратегий вместо 3
+    
+    if (strategy === 0) {
+      // Стратегия 1: Меняем одну клетку (консервативно)
+      if (emptyIndices.length > 0) {
+        const idx = emptyIndices[Math.floor(Math.random() * emptyIndices.length)];
+        variant[idx] = current === 1 ? 2 : 1;
+      }
+    } else if (strategy === 1) {
+      // Стратегия 2: Меняем 2 клетки
+      const numChanges = Math.min(2, emptyIndices.length);
+      const indicesToChange = [];
+      const available = [...emptyIndices];
+      
+      for (let j = 0; j < numChanges && available.length > 0; j++) {
+        const idx = Math.floor(Math.random() * available.length);
+        indicesToChange.push(available.splice(idx, 1)[0]);
+      }
+      
+      for (const idx of indicesToChange) {
+        variant[idx] = current === 1 ? 2 : 1;
+      }
+    } else if (strategy === 2) {
+      // Стратегия 3: Меняем 3 клетки
+      const numChanges = Math.min(3, emptyIndices.length);
+      const indicesToChange = [];
+      const available = [...emptyIndices];
+      
+      for (let j = 0; j < numChanges && available.length > 0; j++) {
+        const idx = Math.floor(Math.random() * available.length);
+        indicesToChange.push(available.splice(idx, 1)[0]);
+      }
+      
+      for (const idx of indicesToChange) {
+        variant[idx] = current === 1 ? 2 : 1;
+      }
+    } else if (strategy === 3) {
+      // Стратегия 4: Меняем 4 клетки
+      const numChanges = Math.min(4, emptyIndices.length);
+      const indicesToChange = [];
+      const available = [...emptyIndices];
+      
+      for (let j = 0; j < numChanges && available.length > 0; j++) {
+        const idx = Math.floor(Math.random() * available.length);
+        indicesToChange.push(available.splice(idx, 1)[0]);
+      }
+      
+      for (const idx of indicesToChange) {
+        variant[idx] = current === 1 ? 2 : 1;
+      }
+    } else {
+      // Стратегия 5: Меняем случайное количество (1-5)
+      const numChanges = Math.min(Math.max(1, Math.floor(Math.random() * 5) + 1), emptyIndices.length);
+      const indicesToChange = [];
+      const available = [...emptyIndices];
+      
+      for (let j = 0; j < numChanges && available.length > 0; j++) {
+        const idx = Math.floor(Math.random() * available.length);
+        indicesToChange.push(available.splice(idx, 1)[0]);
+      }
+      
+      for (const idx of indicesToChange) {
+        variant[idx] = current === 1 ? 2 : 1;
+      }
+    }
+    
+    // Проверяем уникальность и валидность
+    const variantKey = variant.join('');
+    if (!seenBoards.has(variantKey)) {
+      if (getWinner(variant) === null && legalMoves(variant).length > 0) {
+        variations.push({ board: variant, current });
+        seenBoards.add(variantKey);
+      }
+    }
+  }
+  
+  // Дополняем до нужного количества базовым паттерном (если не удалось сгенерировать достаточно уникальных)
+  const uniqueCount = new Set(variations.map(v => v.board.join(''))).size;
+  console.log(`[GenerateVariations] Generated ${variations.length} variations (${uniqueCount} unique, ${variations.length - uniqueCount} duplicates)`);
+  
+  while (variations.length < count) {
+    variations.push({ board: [...board], current });
+  }
+  
+  return variations.slice(0, count);
 }
 
 // Очищает историю игр
@@ -186,16 +406,24 @@ export function getGameHistoryStats() {
 }
 
 // Дообучение модели на реальных играх
-export async function trainOnGames(progressCb, { epochs = 3, batchSize = 32 } = {}) {
+export async function trainOnGames(progressCb, { epochs = 5, batchSize = 32, focusOnErrors = true } = {}) {
   try {
     if (gameHistory.length < 10) {
       throw new Error(`Недостаточно данных для обучения. Нужно минимум 10 ходов, есть ${gameHistory.length}`);
     }
     
-    progressCb?.({ type: 'train.start', payload: { epochs, batchSize, nTrain: gameHistory.length, nVal: 0 } });
+    // Если включен режим фокуса на ошибках и много данных, увеличиваем эпохи
+    let actualEpochs = epochs;
+    if (focusOnErrors && gameHistory.length > 100) {
+      // Если много паттернов ошибок, используем больше эпох для лучшего усвоения
+      actualEpochs = Math.min(15, Math.max(epochs, Math.floor(gameHistory.length / 50)));
+      console.log(`[TrainOnGames] Many correction patterns detected (${gameHistory.length}), using ${actualEpochs} epochs`);
+    }
     
-    console.log(`[TrainOnGames] Training on ${gameHistory.length} game moves...`);
-    progressCb?.({ type: 'train.status', payload: { message: `Подготовка данных (${gameHistory.length} ходов)...` } });
+    progressCb?.({ type: 'train.start', payload: { epochs: actualEpochs, batchSize, nTrain: gameHistory.length, nVal: 0 } });
+    
+    console.log(`[TrainOnGames] Training on ${gameHistory.length} game moves with ${actualEpochs} epochs...`);
+    progressCb?.({ type: 'train.status', payload: { message: `Подготовка данных (${gameHistory.length} ходов, ${actualEpochs} эпох)...` } });
     
     const m = await ensureModel({ forceFresh: false }); // Не пересоздаем модель, продолжаем обучение
     
@@ -209,24 +437,24 @@ export async function trainOnGames(progressCb, { epochs = 3, batchSize = 32 } = 
     const xPos = tf.tensor2d(P, [P.length, 9], 'int32');
     const yOneHot = tf.tensor2d(Y, [Y.length, 9], 'float32');
     
-    progressCb?.({ type: 'train.status', payload: { message: 'Начало дообучения...' } });
+    progressCb?.({ type: 'train.status', payload: { message: 'Начало дообучения (интенсивное обучение на ошибках)...' } });
     
     await m.fit([xCells, xPos], yOneHot, {
-      epochs,
+      epochs: actualEpochs,
       batchSize,
       shuffle: true,
       verbose: 0,
       callbacks: {
         onEpochEnd: (epoch, logs) => {
-          console.log(`[TrainOnGames] Epoch ${epoch+1}/${epochs}, loss: ${logs.loss}, acc: ${logs.acc}`);
+          console.log(`[TrainOnGames] Epoch ${epoch+1}/${actualEpochs}, loss: ${logs.loss}, acc: ${logs.acc}`);
           progressCb?.({ type:'train.progress',
             payload: {
-              epoch: epoch+1, epochs,
+              epoch: epoch+1, epochs: actualEpochs,
               loss: Number(logs.loss ?? 0).toFixed(4),
               acc: Number(logs.acc ?? 0).toFixed(4),
               val_loss: 0,
               val_acc: 0,
-              percent: Math.round(((epoch+1)/epochs)*100),
+              percent: Math.round(((epoch+1)/actualEpochs)*100),
             }});
         },
         onTrainEnd: () => {

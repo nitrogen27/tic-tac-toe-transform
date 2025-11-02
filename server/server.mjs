@@ -1,5 +1,5 @@
 import { WebSocketServer } from 'ws';
-import { trainWithProgress, predictMove, clearModel, saveGameMove, trainOnGames, clearGameHistory, getGameHistoryStats } from './service.mjs';
+import { trainWithProgress, predictMove, clearModel, saveGameMove, trainOnGames, clearGameHistory, getGameHistoryStats, startNewGame, finishGame } from './service.mjs';
 
 const wss = new WebSocketServer({ port: 8080 });
 console.log('[WS] Listening on ws://localhost:8080');
@@ -46,10 +46,19 @@ wss.on('connection', (ws) => {
         }
       } else if (m.type === 'save_move') {
         // Сохраняем ход для обучения
-        saveGameMove(m.payload || { board: [], move: -1, current: 1 });
+        saveGameMove(m.payload || { board: [], move: -1, current: 1, gameId: undefined });
         ws.send(JSON.stringify({ type: 'move.saved', payload: getGameHistoryStats() }));
+      } else if (m.type === 'start_game') {
+        // Начинаем новую игру для отслеживания последовательности
+        const gameId = startNewGame({ playerRole: m.payload?.playerRole || 1 });
+        ws.send(JSON.stringify({ type: 'game.started', payload: { gameId } }));
+      } else if (m.type === 'finish_game') {
+        // Завершаем игру и анализируем ошибки
+        const patternsPerError = m.payload?.patternsPerError || 1000;
+        await finishGame({ gameId: m.payload?.gameId, winner: m.payload?.winner, patternsPerError });
+        ws.send(JSON.stringify({ type: 'game.finished', payload: getGameHistoryStats() }));
       } else if (m.type === 'train_on_games') {
-        console.log('[WS] Training on game history...');
+        console.log('[WS] Training on game history...', m.payload);
         await trainOnGames((ev)=>ws.send(JSON.stringify(ev)), m.payload || {});
       } else if (m.type === 'clear_history') {
         const result = clearGameHistory();

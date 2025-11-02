@@ -20,6 +20,24 @@
             <span>Автоматически дообучать после каждой игры</span>
           </label>
         </div>
+        <div class="training-settings">
+          <h3>Настройки дообучения</h3>
+          <div class="setting-row">
+            <label>
+              <span>Количество эпох:</span>
+              <input type="number" v-model.number="trainingEpochs" min="1" max="20" step="1" :disabled="training || clearing" />
+            </label>
+          </div>
+          <div class="setting-row">
+            <label>
+              <span>Вариаций паттерна на ошибку:</span>
+              <input type="number" v-model.number="patternsPerError" min="10" max="2000" step="10" :disabled="training || clearing" />
+            </label>
+          </div>
+          <div class="setting-hint">
+            <small>Больше вариаций = лучшее обучение, но медленнее генерация</small>
+          </div>
+        </div>
         <div class="progress" v-if="progress">
           <div class="bar" :style="{ width: (progress.percent||0)+'%' }"></div>
         </div>
@@ -85,7 +103,7 @@ const clearing = ref(false)
 const progress = ref(null)
 const board = ref(Array(9).fill(0))
 const current = ref(1) // 1 = X (человек/модель), 2 = O (бот/алгоритм)
-const waiting = ref(false)
+const waiting = ref(false) // Флаг ожидания ответа от сервера
 const status = ref('Ваш ход (X)')
 const gameMode = ref('model') // 'model' или 'algorithm' (для режима human)
 const gameType = ref('human') // 'human' или 'auto'
@@ -95,7 +113,10 @@ const pauseMs = ref(1000) // Пауза между ходами в мс
 let autoGameInterval = null
 const historyCount = ref(0) // Количество сохраненных ходов
 const autoTrainAfterGame = ref(false) // Автоматическое дообучение после игры
+const trainingEpochs = ref(5) // Количество эпох при дообучении
+const patternsPerError = ref(1000) // Количество вариаций паттерна для каждой ошибки
 let currentGameMoves = [] // Ходы текущей игры
+let currentGameId = null // ID текущей игры для отслеживания последовательности
 let reconnectAttempts = 0
 let reconnectTimeout = null
 let isConnecting = false
@@ -217,8 +238,15 @@ function connectWS() {
         }
       }
         if (msg.type === 'predict.result') {
+          console.log('[WS] Received predict.result, resetting waiting')
           waiting.value = false
           const move = msg.payload.move
+          
+          // Проверяем, что игра еще не закончилась (может быть состояние изменилось)
+          if (gameOver.value) {
+            console.log('[WS] Game already over, ignoring move')
+            return
+          }
           
           if (move !== -1 && board.value[move] === 0) {
             // Определяем текущего игрока по режиму игры
@@ -286,10 +314,20 @@ function connectWS() {
         if (msg.type === 'history.stats') {
           historyCount.value = msg.payload.count || 0
         }
+        if (msg.type === 'game.started') {
+          currentGameId = msg.payload.gameId
+          console.log('[WS] Game tracking started:', currentGameId)
+        }
+        if (msg.type === 'game.finished') {
+          historyCount.value = msg.payload.count || 0
+          console.log('[WS] Game finished, error patterns generated')
+          currentGameId = null
+        }
         if (msg.type === 'error') {
           console.error('[WS] Server error:', msg.error)
           training.value = false
           clearing.value = false
+          waiting.value = false // Сбрасываем ожидание при ошибке
           status.value = 'Ошибка: ' + msg.error
         }
       } catch (e) {
@@ -380,6 +418,10 @@ function checkGameOver() {
       status.value = '🎉 Модель выиграла! (X)';
     } else {
       status.value = '🎉 Вы выиграли! (X)';
+      // Если модель проиграла, анализируем ошибки
+      if (gameMode.value === 'model') {
+        finishGameTracking(1) // Человек (1) выиграл, модель (2) проиграла
+      }
       // Сохраняем финальные ходы если игра окончена
       autoTrainAfterGameIfEnabled()
     }
@@ -390,6 +432,10 @@ function checkGameOver() {
       status.value = '❌ Бот (minimax) выиграл! (O)';
     } else {
       status.value = '❌ Бот выиграл! (O)';
+      // Если модель выиграла, ничего особенного не делаем
+      if (gameMode.value === 'model') {
+        finishGameTracking(2) // Модель (2) выиграла
+      }
       autoTrainAfterGameIfEnabled()
     }
     return true;
@@ -397,6 +443,9 @@ function checkGameOver() {
     gameOver.value = true;
     status.value = '🤝 Ничья!';
     if (gameType.value === 'human') {
+      if (gameMode.value === 'model') {
+        finishGameTracking(0) // Ничья
+      }
       autoTrainAfterGameIfEnabled()
     }
     return true;
@@ -413,7 +462,9 @@ function reset() {
   current.value = 1
   status.value = gameType.value === 'auto' ? 'Готово к игре' : 'Ваш ход (X)'
   gameOver.value = false
+  waiting.value = false // Сбрасываем флаг ожидания
   currentGameMoves = []
+  currentGameId = null
 }
 
 function saveMove(board, move, currentPlayer) {
@@ -422,12 +473,41 @@ function saveMove(board, move, currentPlayer) {
     if (ws.value && ws.value.readyState === WebSocket.OPEN) {
       ws.value.send(JSON.stringify({
         type: 'save_move',
-        payload: { board: [...board], move, current: currentPlayer }
+        payload: { board: [...board], move, current: currentPlayer, gameId: currentGameId }
       }))
       currentGameMoves.push({ board: [...board], move, current: currentPlayer })
     } else {
       console.warn('[WS] Cannot save move - WebSocket not connected')
     }
+  }
+}
+
+function startGameTracking() {
+  // Начинаем отслеживание новой игры только в режиме человек vs бот с моделью
+  if (gameType.value === 'human' && gameMode.value === 'model' && ws.value && ws.value.readyState === WebSocket.OPEN) {
+    try {
+      ws.value.send(JSON.stringify({ 
+        type: 'start_game', 
+        payload: { playerRole: 2 } // Модель играет за O (2)
+      }))
+      console.log('[GameTracking] Start game request sent')
+    } catch (e) {
+      console.error('[GameTracking] Error sending start_game:', e)
+    }
+  }
+}
+
+function finishGameTracking(winner) {
+  // Завершаем отслеживание игры и анализируем ошибки
+  if (currentGameId && ws.value && ws.value.readyState === WebSocket.OPEN) {
+    ws.value.send(JSON.stringify({ 
+      type: 'finish_game', 
+      payload: { 
+        gameId: currentGameId, 
+        winner,
+        patternsPerError: patternsPerError.value // Передаем настройку количества паттернов
+      }
+    }))
   }
 }
 
@@ -453,10 +533,19 @@ function trainOnGames() {
     return
   }
   training.value = true
-  status.value = 'Дообучение на реальных играх...'
+  status.value = 'Дообучение на реальных играх (с фокусом на ошибках)...'
   try {
-    ws.value.send(JSON.stringify({ type: 'train_on_games', payload: { epochs: 3, batchSize: 32 } }))
-    console.log('[TrainOnGames] Request sent')
+    // Используем настройки из интерфейса
+    ws.value.send(JSON.stringify({ 
+      type: 'train_on_games', 
+      payload: { 
+        epochs: trainingEpochs.value,
+        batchSize: 32,
+        focusOnErrors: true, // Включаем автоматическое увеличение эпох для паттернов ошибок
+        patternsPerError: patternsPerError.value // Передаем настройку количества паттернов
+      } 
+    }))
+    console.log(`[TrainOnGames] Request sent: ${trainingEpochs.value} epochs, ${patternsPerError.value} patterns per error`)
   } catch (e) {
     console.error('[TrainOnGames] Send error:', e)
     training.value = false
@@ -561,9 +650,11 @@ async function continueAutoGame() {
 }
 
 function humanMove(idx) {
-  if (board.value[idx] !== 0 || waiting.value || gameOver.value || gameType.value !== 'human') return
+  if (board.value[idx] !== 0 || waiting.value || gameOver.value || gameType.value !== 'human') {
+    return
+  }
   
-  // Проверяем подключение
+  // Проверяем подключение WebSocket
   if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
     if (reconnectAttempts === 0 || (reconnectAttempts > 0 && !isConnecting)) {
       status.value = '⚠️ Сервер не запущен. Запустите сервер командой: npm start'
@@ -574,6 +665,11 @@ function humanMove(idx) {
       status.value = 'Ожидание подключения к серверу...'
     }
     return
+  }
+  
+  // Начинаем отслеживание игры при первом ходе (только для модели)
+  if (!currentGameId && gameMode.value === 'model') {
+    startGameTracking()
   }
   
   // Сохраняем ход человека для обучения
@@ -589,16 +685,24 @@ function humanMove(idx) {
   }
   
   // Если игра продолжается - ждем ход бота
+  console.log('[HumanMove] Setting waiting=true, sending predict request')
   waiting.value = true
   status.value = 'Ожидание хода бота...'
-  ws.value.send(JSON.stringify({ 
-    type: 'predict', 
-    payload: { 
-      board: board.value, 
-      current: 2, 
-      mode: gameMode.value 
-    } 
-  }))
+  try {
+    ws.value.send(JSON.stringify({ 
+      type: 'predict', 
+      payload: { 
+        board: board.value, 
+        current: 2, 
+        mode: gameMode.value 
+      } 
+    }))
+    console.log('[HumanMove] Predict request sent')
+  } catch (e) {
+    console.error('[HumanMove] Error sending predict:', e)
+    waiting.value = false
+    status.value = 'Ошибка отправки запроса'
+  }
 }
 
 // Останавливаем автоматическую игру при смене типа игры
@@ -644,6 +748,15 @@ onMounted(() => {
 .checkbox-group { margin-top: 8px; padding: 8px; background: #f9f9f9; border-radius: 4px; }
 .checkbox-group label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 .checkbox-group input[type="checkbox"] { cursor: pointer; }
+.training-settings { margin-top: 12px; padding: 12px; background: #f0f7ff; border-radius: 6px; border: 1px solid #cce5ff; }
+.training-settings h3 { margin: 0 0 12px 0; font-size: 1em; color: #0066cc; }
+.setting-row { margin-bottom: 10px; }
+.setting-row label { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.setting-row label span { flex: 1; }
+.setting-row input[type="number"] { width: 100px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; text-align: center; }
+.setting-row input[type="number"]:disabled { background: #f5f5f5; cursor: not-allowed; }
+.setting-hint { margin-top: 8px; padding-top: 8px; border-top: 1px solid #ddd; }
+.setting-hint small { color: #666; font-size: 0.85em; }
 .status { opacity: .8; }
 .status.game-over { 
   font-weight: bold; 
