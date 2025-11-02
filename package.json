@@ -1,0 +1,18 @@
+{
+  "name": "t3-transformer-fullstack-m2",
+  "private": true,
+  "version": "1.2.2",
+  "type": "module",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "server": "npm run -w server start",
+    "client": "npm run -w client dev",
+    "start": "concurrently -n server,client -c green,blue \"npm:server\" \"npm:client\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}
