@@ -69,4 +69,3 @@ npm run client  # Клиент на http://localhost:5173
 ## Лицензия
 
 Private
-
