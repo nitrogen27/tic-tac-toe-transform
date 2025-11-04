@@ -283,6 +283,12 @@ export async function trainTTT3WithProgress(progressCb, {
         console.log('[TrainTTT3] Early stopping: model reached perfection!');
         await model.save(`file://${saveDir}`);
         progressCb?.({ type: 'train.status', payload: { message: 'Модель достигла идеальности! Сохранение...' } });
+        
+        // Перезагружаем модель в памяти после сохранения
+        const { reloadTTT3Model } = await import('../service.mjs');
+        reloadTTT3Model();
+        console.log('[TrainTTT3] Model reloaded in memory after early stop');
+        
         progressCb?.({ type: 'train.done', payload: { saved: true, earlyStop: true, accuracy, mae } });
         return;
       }
@@ -299,6 +305,12 @@ export async function trainTTT3WithProgress(progressCb, {
     // Сохраняем финальную модель
     await model.save(`file://${saveDir}`);
     progressCb?.({ type: 'train.status', payload: { message: 'Обучение завершено! Сохранение модели...' } });
+    
+    // Перезагружаем модель в памяти после сохранения
+    const { reloadTTT3Model } = await import('../service.mjs');
+    reloadTTT3Model();
+    console.log('[TrainTTT3] Model reloaded in memory after training');
+    
     progressCb?.({ type: 'train.done', payload: { saved: true, accuracy: bestAccuracy, mae: bestMae } });
     
     console.log('[TrainTTT3] Training completed!');

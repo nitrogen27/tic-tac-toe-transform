@@ -169,6 +169,20 @@ export async function trainWithProgress(progressCb, { epochs=5, batchSize, nTrai
 let ttt3Model = null;
 let ttt3ModelLoading = false;
 
+// Экспортируем функцию для принудительной перезагрузки модели
+export function reloadTTT3Model() {
+  console.log('[PredictTTT3] Reloading model: clearing cache...');
+  if (ttt3Model) {
+    try {
+      ttt3Model.dispose();
+    } catch (e) {
+      console.warn('[PredictTTT3] Error disposing old model:', e.message);
+    }
+  }
+  ttt3Model = null;
+  ttt3ModelLoading = false;
+}
+
 async function ensureTTT3Model() {
   if (ttt3ModelLoading) {
     while (ttt3ModelLoading) await new Promise(r => setTimeout(r, 25));
@@ -760,6 +774,10 @@ export async function trainOnGames(progressCb, { epochs = 1, batchSize = 256, fo
     console.log('[TrainOnGames] Saving model...');
     await m.save(`file://${_MODEL_DIR}`);
     
+    // Перезагружаем модель в памяти после сохранения
+    reloadTTT3Model();
+    console.log('[TrainOnGames] Model reloaded in memory after training');
+    
     xCells.dispose(); xPos.dispose(); yOneHot.dispose();
     console.log('[TrainOnGames] Done');
   } catch (e) {
@@ -855,15 +873,19 @@ async function startBackgroundTraining(progressCb = null, newSkillsCount = 0, in
               } 
             });
           } else if (ev.type === 'train.done') {
-            progressCb?.({ 
-              type: 'background_train.done', 
-              payload: { 
-                newSkills: newSkillsCount,
-                totalSkills: totalSkills,
-                newSkillsPercent: Math.round(newSkillsCount / totalSkills * 100),
-                message: `Обучение завершено: ${newSkillsCount} новых навыков усвоено`
-              } 
-            });
+              // Перезагружаем модель после фонового обучения
+              reloadTTT3Model();
+              console.log('[BackgroundTrain] Model reloaded in memory after background training');
+              
+              progressCb?.({ 
+                type: 'background_train.done', 
+                payload: { 
+                  newSkills: newSkillsCount,
+                  totalSkills: totalSkills,
+                  newSkillsPercent: Math.round(newSkillsCount / totalSkills * 100),
+                  message: `Обучение завершено: ${newSkillsCount} новых навыков усвоено`
+                } 
+              });
           } else if (ev.type === 'error') {
             progressCb?.({ 
               type: 'background_train.error', 

@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import fs from 'fs/promises';
-import { trainWithProgress, trainTTT3WithProgress, predictMove, clearModel, saveGameMove, trainOnGames, clearGameHistory, getGameHistoryStats, startNewGame, finishGame } from './service.mjs';
+import { trainWithProgress, trainTTT3WithProgress, predictMove, clearModel, saveGameMove, trainOnGames, clearGameHistory, getGameHistoryStats, startNewGame, finishGame, reloadTTT3Model } from './service.mjs';
 import { getGpuInfo } from './src/tf.mjs';
 import tfpkg from './src/tf.mjs';
 const tf = tfpkg;
