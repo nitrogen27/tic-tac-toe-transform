@@ -195,8 +195,8 @@ let autoGameInterval = null
 const historyCount = ref(0) // Количество сохраненных ходов
 const autoTrainAfterGame = ref(false) // Автоматическое дообучение после игры
 // Настройки основного обучения
-const mainTrainingEpochs = ref(2) // Количество эпох для основного обучения
-const mainTrainingBatchSize = ref(1024) // Размер батча для основного обучения
+const mainTrainingEpochs = ref(1) // Количество эпох для основного обучения
+const mainTrainingBatchSize = ref(4096) // Размер батча для основного обучения
 // Настройки дообучения
 const trainingEpochs = ref(1) // Количество эпох при дообучении
 const incrementalBatchSize = ref(256) // Размер батча для дообучения

@@ -71,7 +71,7 @@ wss.on('connection', (ws) => {
         // Убеждаемся, что payload передается правильно и epochs не больше 10
         const trainingPayload = m.payload || {};
         if (trainingPayload.epochs === undefined) {
-          trainingPayload.epochs = 2; // Дефолтное значение из конфига
+          trainingPayload.epochs = 1; // Дефолтное значение из конфига
         } else if (trainingPayload.epochs > 10) {
           console.warn(`[WS] WARNING: Client sent epochs=${trainingPayload.epochs}, limiting to 10`);
           trainingPayload.epochs = 10; // Ограничиваем максимум 10 эпохами
