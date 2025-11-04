@@ -4,6 +4,66 @@ import tfpkg from './tf.mjs';
 const tf = tfpkg;
 import { TRANSFORMER_CFG } from './config.mjs';
 
+// Кастомный слой для Scaled Dot-Product Attention с правильной сериализацией
+// Определяем глобально, чтобы можно было зарегистрировать для десериализации
+class ScaledDotProductAttention extends tf.layers.Layer {
+  constructor(config) {
+    super(config);
+    this.scale = config.scale || 1.0;
+  }
+  
+  getConfig() {
+    const config = super.getConfig();
+    config.scale = this.scale;
+    return config;
+  }
+  
+  static get className() {
+    return 'ScaledDotProductAttention';
+  }
+  
+  call(inputs) {
+    // inputs это массив [q, k, v] или один тензор
+    // В call() мы получаем реальные тензоры, не SymbolicTensor
+    return tf.tidy(() => {
+      let q, k, v;
+      if (Array.isArray(inputs)) {
+        [q, k, v] = inputs;
+      } else {
+        // Если один тензор, это ошибка
+        throw new Error('ScaledDotProductAttention expects array of 3 tensors [q, k, v]');
+      }
+      
+      // Q @ K^T
+      const scores = tf.matMul(q, k, false, true);
+      // Scale
+      const scaled = scores.mul(this.scale);
+      // Softmax
+      const attn = tf.softmax(scaled, -1);
+      // Apply to V
+      return tf.matMul(attn, v);
+    });
+  }
+  
+  computeOutputShape(inputShapes) {
+    // inputShapes это массив форм входов
+    if (Array.isArray(inputShapes) && inputShapes.length >= 1) {
+      return inputShapes[0]; // [B, seqLen, dModel]
+    }
+    return inputShapes;
+  }
+}
+
+// Регистрируем кастомный слой для десериализации (выполняется один раз при импорте)
+try {
+  tf.serialization.registerClass(ScaledDotProductAttention);
+} catch (e) {
+  // Игнорируем ошибку, если уже зарегистрирован
+  if (!e.message.includes('already registered')) {
+    console.warn('[MHA] Could not register ScaledDotProductAttention:', e.message);
+  }
+}
+
 // Синусоидальное позиционное кодирование для 9 позиций
 function sinusoidalPositionalEmbedding(seqLen, dModel) {
   const embeddings = [];
@@ -39,35 +99,17 @@ function mhaBlock(x, dModel, numHeads, dropout, namePrefix = 'mha') {
   // Scaled dot-product attention: Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
   // Используем прямые тензорные операции вместо lambda (который недоступен в tfjs-node)
   
-  // Создаем кастомный слой для attention
-  class ScaledDotProductAttention extends tf.layers.Layer {
-    constructor(config) {
-      super(config);
-      this.scale = config.scale;
-    }
-    
-    call(inputs) {
-      return tf.tidy(() => {
-        const [q, k, v] = inputs;
-        // Q @ K^T
-        const scores = tf.matMul(q, k, false, true);
-        // Scale
-        const scaled = scores.mul(this.scale);
-        // Softmax
-        const attn = tf.softmax(scaled, -1);
-        // Apply to V
-        const output = tf.matMul(attn, v);
-        return output;
-      });
-    }
-    
-    computeOutputShape(inputShapes) {
-      return inputShapes[0]; // [B, seqLen, dModel]
-    }
-  }
-  
+  // Scaled dot-product attention: Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
+  // Используем кастомный слой с правильной сериализацией
   const scale = 1.0 / Math.sqrt(keyDim);
-  const attentionLayer = new ScaledDotProductAttention({ scale, name: `${namePrefix}_attention` });
+  
+  // Используем зарегистрированный кастомный слой
+  const attentionLayer = new ScaledDotProductAttention({ 
+    scale, 
+    name: `${namePrefix}_attention` 
+  });
+  
+  // Применяем слой к [q, k, v] - слой правильно обработает SymbolicTensor
   const attnOutput = attentionLayer.apply([q, k, v]);
   
   // Output projection

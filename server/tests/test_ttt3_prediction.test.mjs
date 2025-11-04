@@ -7,9 +7,9 @@ import { getTeacherValueAndPolicy } from '../src/ttt3_minimax.mjs';
 describe('TTT3 Prediction with Safety Rules', () => {
   it('should block first column attack', () => {
     // Человек заполняет первый столбец: 0, 3
-    const board = emptyBoard();
-    applyMove(board, 0, 1); // Человек (X) ходит в 0
-    applyMove(board, 3, 1); // Человек (X) ходит в 3
+    let board = emptyBoard();
+    board = applyMove(board, 0, 1); // Человек (X) ходит в 0
+    board = applyMove(board, 3, 1); // Человек (X) ходит в 3
     
     // Бот (O) должен заблокировать ход в 6
     // Проверяем, что blockingMove правильно определяет угрозу

@@ -18,11 +18,16 @@ export function winningMove(board, player) {
 export function blockingMove(board, player) {
   const opponent = -player;
   const moves = legalMoves(board);
+  
+  // Проверяем каждую доступную позицию: если оппонент сделает ход в неё, выиграет ли он?
   for (const move of moves) {
-    const newBoard = applyMove(board, move, opponent);
-    const w = winner(newBoard);
+    // Симулируем ход оппонента в эту позицию
+    const testBoard = applyMove(board, move, opponent);
+    const w = winner(testBoard);
     if (w === opponent) {
-      return move; // Нужно заблокировать этот ход
+      // Оппонент выиграет, если сделает ход в эту позицию
+      // Нужно заблокировать эту позицию
+      return move;
     }
   }
   return -1; // Нет необходимости блокировать

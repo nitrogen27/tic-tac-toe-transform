@@ -175,7 +175,14 @@ async function ensureTTT3Model() {
     return ttt3Model;
   }
   
-  if (ttt3Model) return ttt3Model;
+  // Если модель уже загружена, возвращаем её
+  if (ttt3Model) {
+    console.log('[PredictTTT3] Using cached TTT3 model from memory');
+    return ttt3Model;
+  }
+  
+  // Логируем попытку загрузки для отладки
+  console.log('[PredictTTT3] Model not in cache, attempting to load from disk...');
   
   ttt3ModelLoading = true;
   try {
@@ -184,21 +191,35 @@ async function ensureTTT3Model() {
     
     if (exists) {
       // Загружаем сохраненную модель
-      ttt3Model = await tf.loadLayersModel(`file://${ttt3ModelPath}`);
-      // Компилируем для инференса (не нужен оптимизатор, но нужны входы/выходы)
-      console.log('[PredictTTT3] Loaded TTT3 Transformer model from', ttt3ModelPath);
-      console.log('[PredictTTT3] Model inputs:', ttt3Model.inputs.map(i => i.shape));
-      console.log('[PredictTTT3] Model outputs:', ttt3Model.outputs.map(o => o.shape));
+      // ВАЖНО: Модель с кастомными слоями может не загрузиться
+      // Если загрузка не удалась, нужно переобучить модель
+      try {
+        ttt3Model = await tf.loadLayersModel(`file://${ttt3ModelPath}`);
+        // Компилируем для инференса (не нужен оптимизатор, но нужны входы/выходы)
+        console.log('[PredictTTT3] ✓ Loaded TTT3 Transformer model from', ttt3ModelPath);
+        console.log('[PredictTTT3] Model inputs:', ttt3Model.inputs.map(i => i.shape));
+        console.log('[PredictTTT3] Model outputs:', ttt3Model.outputs.map(o => o.shape));
+      } catch (loadError) {
+        console.error('[PredictTTT3] ❌ Failed to load model:', loadError.message);
+        console.error('[PredictTTT3] Model file exists but cannot be loaded.');
+        console.error('[PredictTTT3] This usually means the model was saved with custom layers that cannot be deserialized.');
+        console.error('[PredictTTT3] Solution: Delete the model (click "Clear Model") and retrain.');
+        console.error('[PredictTTT3] Will use random moves as fallback');
+        ttt3Model = null;
+      }
     } else {
       console.log('[PredictTTT3] TTT3 Transformer model not found at', ttt3ModelPath);
+      console.log('[PredictTTT3] Will use random moves as fallback');
     }
   } catch (e) {
     console.error('[PredictTTT3] Error loading model:', e);
+    console.log('[PredictTTT3] Will use random moves as fallback');
+    ttt3Model = null;
   } finally {
     ttt3ModelLoading = false;
   }
   
-  return ttt3Model;
+  return ttt3Model; // null если модель не найдена
 }
 
 // Предсказание для TTT3 (3x3) с использованием Transformer модели
@@ -216,27 +237,25 @@ async function predictTTT3Move({ board, current = 1 }) {
   const model = await ensureTTT3Model();
   
   if (!model) {
-    // Если модели нет - используем minimax как fallback
-    const { getTeacherValueAndPolicy } = await import('./src/ttt3_minimax.mjs');
-    const { value, policy } = getTeacherValueAndPolicy(
-      new Int8Array(board), 
-      current === 1 ? 1 : -1
-    );
-    
+    // Если модели нет - используем СЛУЧАЙНЫЕ ходы (не minimax!)
     const moves = legalMoves(new Int8Array(board));
     if (moves.length === 0) {
-      return { move: -1, probs: Array(9).fill(0), isRandom: false, mode: 'model', fallback: 'minimax' };
+      return { move: -1, probs: Array(9).fill(0), isRandom: true, mode: 'model', fallback: 'random' };
     }
     
-    // Применяем safety-правила
-    const move = safePick(new Int8Array(board), current === 1 ? 1 : -1, Array.from(policy));
+    // Выбираем случайный ход из доступных
+    const randomMove = moves[Math.floor(Math.random() * moves.length)];
+    const probs = Array(9).fill(0);
+    probs[randomMove] = 1.0;
+    
+    console.log('[PredictTTT3] No trained model, using RANDOM move:', randomMove);
     return { 
-      move, 
-      probs: Array.from(policy), 
-      value, 
-      isRandom: false, 
+      move: randomMove, 
+      probs, 
+      value: 0, 
+      isRandom: true, 
       mode: 'model', 
-      fallback: 'minimax' 
+      fallback: 'random' 
     };
   }
   
@@ -272,9 +291,42 @@ async function predictTTT3Move({ board, current = 1 }) {
     return { move: -1, probs: Array(9).fill(0), value, isRandom: false, mode: 'model' };
   }
   
+  // Детальное логирование для отладки
+  const policyMax = Math.max(...policyArray);
+  const policyMaxIdx = policyArray.indexOf(policyMax);
+  
+  // Проверяем safety-правила ДО вызова safePick для логирования
+  const { winningMove, blockingMove } = await import('./src/safety.mjs');
+  const winMove = winningMove(new Int8Array(board), player);
+  const blockMove = blockingMove(new Int8Array(board), player);
+  
+  console.log('[PredictTTT3] Model prediction BEFORE safety:', {
+    board: Array.from(board),
+    player,
+    policyMax: policyMax.toFixed(4),
+    policyMaxIdx,
+    value: value.toFixed(4),
+    hasWinningMove: winMove >= 0,
+    hasBlockingMove: blockMove >= 0,
+    policy: policyArray.map((p, i) => `${i}:${p.toFixed(3)}`).join(' ')
+  });
+  
   const move = safePick(new Int8Array(board), player, policyArray);
   
-  console.log('[PredictTTT3] Move:', move, 'Value:', value.toFixed(4), 'Policy max:', Math.max(...policyArray).toFixed(4));
+  // Проверяем, был ли ход изменен safety-правилами
+  const wasChangedBySafety = move !== policyMaxIdx;
+  if (wasChangedBySafety) {
+    console.log('[PredictTTT3] ⚠️ Move changed by safety rules!', {
+      modelPrediction: policyMaxIdx,
+      modelPolicy: policyArray[policyMaxIdx].toFixed(4),
+      safetyMove: move,
+      reason: winMove >= 0 ? 'winning' : (blockMove >= 0 ? 'blocking' : 'unknown')
+    });
+  } else {
+    console.log('[PredictTTT3] ✓ Using model prediction (no safety override)');
+  }
+  
+  console.log('[PredictTTT3] Final move:', move);
   
   return { 
     move, 
@@ -669,7 +721,7 @@ export async function trainTTT3WithProgress(progressCb, { epochs, batchSize, ear
 
 export async function clearModel() {
   try {
-    console.log('[Clear] Clearing saved model...');
+    console.log('[Clear] Clearing all saved models...');
     
     // Освобождаем текущую модель из памяти
     if (model) {
@@ -677,7 +729,17 @@ export async function clearModel() {
       model = null;
     }
     
-    // Удаляем файлы модели
+    // Освобождаем TTT3 модель из памяти и сбрасываем флаг загрузки
+    if (ttt3Model) {
+      ttt3Model.dispose?.();
+      ttt3Model = null;
+      console.log('[Clear] TTT3 model cleared from memory');
+    }
+    // Сбрасываем флаг загрузки, чтобы модель могла быть загружена заново после очистки
+    ttt3ModelLoading = false;
+    console.log('[Clear] TTT3 model cache reset - model will be reloaded from disk if exists');
+    
+    // Удаляем файлы старой модели
     const modelJsonPath = path.join(_MODEL_DIR, 'model.json');
     const weightsBinPath = path.join(_MODEL_DIR, 'weights.bin');
     
@@ -696,7 +758,47 @@ export async function clearModel() {
       if (e.code !== 'ENOENT') throw e;
     }
     
-    // Пробуем удалить другие файлы весов (на случай если есть несколько shards)
+    // Удаляем TTT3 Transformer модель
+    const ttt3ModelDir = path.join(_MODEL_DIR, 'ttt3_transformer');
+    try {
+      const ttt3ModelPath = path.join(ttt3ModelDir, 'model.json');
+      const ttt3WeightsPath = path.join(ttt3ModelDir, 'weights.bin');
+      
+      try {
+        await fs.unlink(ttt3ModelPath);
+        deletedFiles.push('ttt3_transformer/model.json');
+        console.log('[Clear] Deleted TTT3 model.json');
+      } catch (e) {
+        if (e.code !== 'ENOENT') throw e;
+      }
+      
+      try {
+        await fs.unlink(ttt3WeightsPath);
+        deletedFiles.push('ttt3_transformer/weights.bin');
+        console.log('[Clear] Deleted TTT3 weights.bin');
+      } catch (e) {
+        if (e.code !== 'ENOENT') throw e;
+      }
+      
+      // Пробуем удалить другие файлы весов TTT3 (на случай если есть несколько shards)
+      try {
+        const ttt3Files = await fs.readdir(ttt3ModelDir);
+        for (const file of ttt3Files) {
+          if (file.startsWith('weights') || file.endsWith('.bin')) {
+            await fs.unlink(path.join(ttt3ModelDir, file));
+            const filePath = `ttt3_transformer/${file}`;
+            if (!deletedFiles.includes(filePath)) deletedFiles.push(filePath);
+          }
+        }
+      } catch (e) {
+        // Игнорируем ошибки чтения директории (может не существовать)
+      }
+    } catch (e) {
+      // Игнорируем ошибки при удалении TTT3 модели
+      console.warn('[Clear] Error clearing TTT3 model directory:', e.message);
+    }
+    
+    // Пробуем удалить другие файлы весов старой модели (на случай если есть несколько shards)
     try {
       const files = await fs.readdir(_MODEL_DIR);
       for (const file of files) {
@@ -709,7 +811,7 @@ export async function clearModel() {
       // Игнорируем ошибки чтения директории
     }
     
-    console.log(`[Clear] Model cleared. Deleted files: ${deletedFiles.join(', ') || 'none'}`);
+    console.log(`[Clear] All models cleared. Deleted files: ${deletedFiles.join(', ') || 'none'}`);
     return { success: true, deletedFiles };
   } catch (e) {
     console.error('[Clear] Error clearing model:', e);

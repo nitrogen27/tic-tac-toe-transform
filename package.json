@@ -10,7 +10,8 @@
   "scripts": {
     "server": "npm run -w server start",
     "client": "npm run -w client dev",
-    "start": "concurrently -n server,client -c green,blue \"npm:server\" \"npm:client\"",
+    "start": "echo 'INFO: npm start запускает проект ЛОКАЛЬНО (CPU режим). Для GPU используйте: npm run docker:up' && concurrently -n server,client -c green,blue \"npm:server\" \"npm:client\"",
+    "start:gpu": "npm run docker:up",
     "dev": "npm start",
     "stop": "node scripts/stop-all.js",
     "restart": "node scripts/restart-all.js",
