@@ -12,12 +12,39 @@ services:
     # Использование NVIDIA runtime (работает после установки nvidia-container-toolkit)
     # Если runtime недоступен, используйте docker-gpu-up.sh который использует --gpus all
     runtime: nvidia
+    # Явное указание GPU для максимальной производительности
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute, utility]
+    # Увеличенный /dev/shm для больших батчей и IPC
+    shm_size: 8g
+    # Использование host IPC для лучшей производительности
+    ipc: host
+    # Привилегированный режим для изменения power limit GPU (требуется для nvidia-smi -pl)
+    # ВАЖНО: Это может быть небезопасно для продакшена, используйте только если доверяете контейнеру
+    privileged: true
+    # Альтернатива: использовать только необходимые capabilities
+    # cap_add:
+    #   - SYS_ADMIN
     environment:
       - NODE_ENV=production
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - USE_GPU_BIG=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
+      # Оптимизация для TensorFlow.js
+      - TF_ENABLE_ONEDNN_OPTS=1
+      - CUDA_CACHE_DISABLE=0
+      - CUDA_CACHE_MAXSIZE=2147483647
+    # Снятие ограничений cgroups для максимальной производительности
+    # (CPU и память ограничены только ресурсами хоста)
+    # Для продакшена можно добавить ограничения:
+    # cpus: '0-7'  # Укажите нужные CPU ядра
+    # mem_limit: 16g  # Укажите нужный лимит памяти
     restart: unless-stopped
 
   client:

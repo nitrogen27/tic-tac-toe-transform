@@ -51,10 +51,15 @@ COPY server/ ./server/
 # Создание директории для сохранения моделей
 RUN mkdir -p /app/server/saved
 
+# Копирование entrypoint скрипта для оптимизации GPU
+COPY docker-entrypoint-server.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint-server.sh
+
 # Открытие порта для WebSocket
 EXPOSE 8080
 
-# Запуск сервера
+# Запуск сервера через entrypoint для оптимизации GPU
 WORKDIR /app/server
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint-server.sh"]
 CMD ["node", "server.mjs"]
 

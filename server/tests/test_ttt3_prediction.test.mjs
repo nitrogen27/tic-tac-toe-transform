@@ -29,7 +29,7 @@ describe('TTT3 Prediction with Safety Rules', () => {
     expect(move).toBe(6);
   });
   
-  it('should use minimax when model not available', async () => {
+  it('should use random fallback when model not available', async () => {
     // Импортируем функцию предсказания
     const { predictMove } = await import('../service.mjs');
     
@@ -41,9 +41,19 @@ describe('TTT3 Prediction with Safety Rules', () => {
     console.log('[Test] Prediction result:', result);
     console.log('[Test] Selected move:', result.move);
     
-    // Должен заблокировать (ход в 6)
-    expect(result.move).toBe(6);
-    expect(result.fallback || result.mode).toBeDefined();
+    // Без модели используется случайный ход (fallback: random)
+    // Проверяем что это случайный ход из доступных
+    expect(result.isRandom).toBe(true);
+    expect(result.fallback).toBe('random');
+    expect(result.move).toBeGreaterThanOrEqual(0);
+    expect(result.move).toBeLessThan(9);
+    // Проверяем что выбранный ход легальный (не занят)
+    expect(board[result.move]).toBe(0);
+    
+    // Для проверки блокировки используем режим 'algorithm'
+    const algorithmResult = await predictMove({ board, current: 2, mode: 'algorithm' });
+    expect(algorithmResult.move).toBe(6); // minimax должен заблокировать
+    expect(algorithmResult.mode).toBe('algorithm');
   });
 });
 

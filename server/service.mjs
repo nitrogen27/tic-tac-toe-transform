@@ -237,18 +237,20 @@ async function predictTTT3Move({ board, current = 1 }) {
   const model = await ensureTTT3Model();
   
   if (!model) {
-    // Если модели нет - используем СЛУЧАЙНЫЕ ходы (не minimax!)
+    // Если модели нет - можно играть, используя случайные ходы или minimax
+    // Для удобства используем случайные ходы (можно переключить на minimax)
     const moves = legalMoves(new Int8Array(board));
     if (moves.length === 0) {
       return { move: -1, probs: Array(9).fill(0), isRandom: true, mode: 'model', fallback: 'random' };
     }
     
     // Выбираем случайный ход из доступных
+    // Модель можно обучить с нуля, нажав "Обучить"
     const randomMove = moves[Math.floor(Math.random() * moves.length)];
     const probs = Array(9).fill(0);
     probs[randomMove] = 1.0;
     
-    console.log('[PredictTTT3] No trained model, using RANDOM move:', randomMove);
+    console.log('[PredictTTT3] No trained model, using RANDOM move. Use "Train" button to train from scratch.');
     return { 
       move: randomMove, 
       probs, 
@@ -441,16 +443,34 @@ export function startNewGame({ playerRole = 1 } = {}) {
 }
 
 // Завершает игру и анализирует ошибки
-export async function finishGame({ gameId, winner, patternsPerError = 1000 }) {
+// Флаг для отслеживания фонового обучения
+let backgroundTraining = false;
+let backgroundTrainingPromise = null;
+let backgroundTrainingProgressCb = null; // Callback для отправки прогресса
+
+export async function finishGame({ gameId, winner, patternsPerError = 1000, autoTrain = false, progressCb = null, incrementalBatchSize = 256 }) {
   const gameSeq = gameSequences.find(g => g.id === gameId);
   if (!gameSeq) return;
   
   gameSeq.winner = winner;
   
+  // Сохраняем количество паттернов до анализа ошибок
+  const patternsBefore = gameHistory.length;
+  
   // Если модель проиграла, анализируем ошибки
   if ((gameSeq.playerRole === 1 && winner === 2) || (gameSeq.playerRole === 2 && winner === 1)) {
     console.log(`[ErrorDetection] Model lost game ${gameId}, analyzing mistakes...`);
     await analyzeAndGenerateCorrections(gameSeq, patternsPerError);
+  }
+  
+  // Подсчитываем количество новых навыков (новых паттернов)
+  const patternsAfter = gameHistory.length;
+  const newSkillsCount = patternsAfter - patternsBefore;
+  
+  // Если включен авто-режим обучения, запускаем фоновое обучение
+  if (autoTrain && !backgroundTraining) {
+    console.log('[FinishGame] Auto-train enabled, starting background training...');
+    startBackgroundTraining(progressCb, newSkillsCount, incrementalBatchSize);
   }
 }
 
@@ -643,19 +663,14 @@ export function getGameHistoryStats() {
 }
 
 // Дообучение модели на реальных играх
-export async function trainOnGames(progressCb, { epochs = 5, batchSize = 128, focusOnErrors = true } = {}) {
+export async function trainOnGames(progressCb, { epochs = 1, batchSize = 256, focusOnErrors = true } = {}) {
   try {
     if (gameHistory.length < 10) {
       throw new Error(`Недостаточно данных для обучения. Нужно минимум 10 ходов, есть ${gameHistory.length}`);
     }
     
-    // Если включен режим фокуса на ошибках и много данных, увеличиваем эпохи
+    // Используем указанное количество эпох (оптимизировано: 1 эпоха для быстрого дообучения)
     let actualEpochs = epochs;
-    if (focusOnErrors && gameHistory.length > 100) {
-      // Если много паттернов ошибок, используем больше эпох для лучшего усвоения
-      actualEpochs = Math.min(15, Math.max(epochs, Math.floor(gameHistory.length / 50)));
-      console.log(`[TrainOnGames] Many correction patterns detected (${gameHistory.length}), using ${actualEpochs} epochs`);
-    }
     
     progressCb?.({ type: 'train.start', payload: { epochs: actualEpochs, batchSize, nTrain: gameHistory.length, nVal: 0 } });
     
@@ -676,23 +691,64 @@ export async function trainOnGames(progressCb, { epochs = 5, batchSize = 128, fo
     
     progressCb?.({ type: 'train.status', payload: { message: 'Начало дообучения (интенсивное обучение на ошибках)...' } });
     
+    // Подсчитываем количество батчей для промежуточных обновлений
+    const totalSamples = X.length;
+    const batchesPerEpoch = Math.ceil(totalSamples / batchSize);
+    let currentBatch = 0;
+    let lastProgressUpdate = 0;
+    
     await m.fit([xCells, xPos], yOneHot, {
       epochs: actualEpochs,
       batchSize,
       shuffle: true,
       verbose: 0,
       callbacks: {
+        onBatchEnd: (batch, logs) => {
+          // Обновляем прогресс каждые 10% или каждые 5 батчей, в зависимости от того, что меньше
+          currentBatch++;
+          const progressUpdateInterval = Math.max(1, Math.floor(batchesPerEpoch / 10)); // Обновляем ~10 раз за эпоху
+          
+          if (currentBatch % progressUpdateInterval === 0 || currentBatch === batchesPerEpoch) {
+            const batchProgress = Math.round((currentBatch / batchesPerEpoch) * 100);
+            const epochProgress = Math.round(((batchProgress / 100) + lastProgressUpdate) / actualEpochs * 100);
+            
+            progressCb?.({ 
+              type: 'train.progress',
+              payload: {
+                epoch: lastProgressUpdate + 1, 
+                epochs: actualEpochs,
+                loss: Number(logs.loss ?? 0).toFixed(4),
+                acc: Number(logs.acc ?? 0).toFixed(4),
+                val_loss: 0,
+                val_acc: 0,
+                percent: Math.min(epochProgress, 99), // Не показываем 100% до завершения эпохи
+                batchProgress: batchProgress, // Дополнительный прогресс внутри эпохи
+                batchesPerEpoch: batchesPerEpoch,
+                currentBatch: currentBatch
+              }
+            });
+          }
+        },
+        onEpochBegin: (epoch) => {
+          lastProgressUpdate = epoch;
+          currentBatch = 0;
+          console.log(`[TrainOnGames] Starting epoch ${epoch+1}/${actualEpochs}...`);
+        },
         onEpochEnd: (epoch, logs) => {
           console.log(`[TrainOnGames] Epoch ${epoch+1}/${actualEpochs}, loss: ${logs.loss}, acc: ${logs.acc}`);
-          progressCb?.({ type:'train.progress',
+          lastProgressUpdate = epoch + 1;
+          progressCb?.({ 
+            type:'train.progress',
             payload: {
-              epoch: epoch+1, epochs: actualEpochs,
+              epoch: epoch+1, 
+              epochs: actualEpochs,
               loss: Number(logs.loss ?? 0).toFixed(4),
               acc: Number(logs.acc ?? 0).toFixed(4),
               val_loss: 0,
               val_acc: 0,
               percent: Math.round(((epoch+1)/actualEpochs)*100),
-            }});
+            }
+          });
         },
         onTrainEnd: () => {
           console.log('[TrainOnGames] Training completed');
@@ -714,9 +770,133 @@ export async function trainOnGames(progressCb, { epochs = 5, batchSize = 128, fo
 }
 
 // Обучение TTT3 Transformer
-export async function trainTTT3WithProgress(progressCb, { epochs, batchSize, earlyStop = true } = {}) {
+export async function trainTTT3WithProgress(progressCb, { epochs, batchSize, earlyStop = true, fromScratch = false } = {}) {
   const { trainTTT3WithProgress: trainTTT3 } = await import('./src/train_ttt3_transformer_service.mjs');
-  return await trainTTT3(progressCb, { epochs, batchSize, earlyStop });
+  return await trainTTT3(progressCb, { epochs, batchSize, earlyStop, fromScratch });
+}
+
+// Фоновое мини-обучение после игры (быстрое, не блокирующее)
+async function startBackgroundTraining(progressCb = null, newSkillsCount = 0, incrementalBatchSize = 256) {
+  if (backgroundTraining) {
+    console.log('[BackgroundTrain] Training already in progress, skipping...');
+    return;
+  }
+  
+  // Проверяем, есть ли данные для обучения
+  const stats = getGameHistoryStats();
+  if (stats.count < 10) {
+    console.log(`[BackgroundTrain] Not enough data (${stats.count} moves), skipping...`);
+    return;
+  }
+  
+  backgroundTraining = true;
+  backgroundTrainingProgressCb = progressCb;
+  console.log('[BackgroundTrain] Starting background training...');
+  
+  // Отправляем старт фонового обучения
+  const totalSkills = stats.count;
+  progressCb?.({ 
+    type: 'background_train.start', 
+    payload: { 
+      newSkills: newSkillsCount,
+      totalSkills: totalSkills,
+      epochs: 1, // Одна эпоха для быстрого усвоения нового навыка
+      message: `Новые навыки: ${newSkillsCount} из ${totalSkills} (${Math.round(newSkillsCount / totalSkills * 100)}%)`
+    } 
+  });
+  
+  // Запускаем в фоне без блокировки
+  backgroundTrainingPromise = (async () => {
+    try {
+      // Мини-обучение: меньше эпох, меньше батч, без early stopping
+      await trainOnGames(
+        (ev) => {
+          // Преобразуем события обычного обучения в события фонового обучения
+          if (ev.type === 'train.start') {
+            progressCb?.({ 
+              type: 'background_train.start', 
+              payload: { 
+                newSkills: newSkillsCount,
+                totalSkills: totalSkills,
+                epochs: ev.payload?.epochs || 1,
+                newSkillsPercent: Math.round(newSkillsCount / totalSkills * 100),
+                message: `Начало обучения: ${newSkillsCount} новых навыков (${Math.round(newSkillsCount / totalSkills * 100)}%)`
+              } 
+            });
+          } else if (ev.type === 'train.progress') {
+            // Отправляем прогресс с информацией о новых навыках
+            const epoch = ev.payload?.epoch || 0;
+            const epochs = ev.payload?.epochs || 1;
+            // Используем percent из payload, если есть, иначе вычисляем
+            const percent = ev.payload?.percent || Math.round((epoch / epochs) * 100);
+            const epochPercent = percent;
+            const newSkillsPercent = Math.round(newSkillsCount / totalSkills * 100);
+            
+            // Добавляем информацию о батчах, если есть
+            const batchInfo = ev.payload?.batchProgress ? 
+              ` · Батч ${ev.payload.currentBatch}/${ev.payload.batchesPerEpoch} (${ev.payload.batchProgress}%)` : 
+              '';
+            
+            progressCb?.({ 
+              type: 'background_train.progress', 
+              payload: { 
+                epoch,
+                epochs,
+                epochPercent: percent, // Используем вычисленный percent
+                newSkills: newSkillsCount,
+                totalSkills: totalSkills,
+                newSkillsPercent,
+                loss: ev.payload?.loss,
+                acc: ev.payload?.acc,
+                batchProgress: ev.payload?.batchProgress,
+                currentBatch: ev.payload?.currentBatch,
+                batchesPerEpoch: ev.payload?.batchesPerEpoch,
+                message: `Эпоха ${epoch}/${epochs} (${percent}%)${batchInfo} · Новые навыки: ${newSkillsCount} (${newSkillsPercent}%)`
+              } 
+            });
+          } else if (ev.type === 'train.done') {
+            progressCb?.({ 
+              type: 'background_train.done', 
+              payload: { 
+                newSkills: newSkillsCount,
+                totalSkills: totalSkills,
+                newSkillsPercent: Math.round(newSkillsCount / totalSkills * 100),
+                message: `Обучение завершено: ${newSkillsCount} новых навыков усвоено`
+              } 
+            });
+          } else if (ev.type === 'error') {
+            progressCb?.({ 
+              type: 'background_train.error', 
+              error: ev.error,
+              payload: { message: `Ошибка обучения: ${ev.error}` }
+            });
+          }
+        },
+        {
+          epochs: 1, // Одна эпоха для быстрого усвоения нового навыка (фоновое обучение всегда 1 эпоха)
+          batchSize: incrementalBatchSize, // Используем переданный batch size из настроек
+          focusOnErrors: true
+        }
+      );
+      console.log('[BackgroundTrain] Background training completed');
+    } catch (e) {
+      console.error('[BackgroundTrain] Error during background training:', e);
+      progressCb?.({ 
+        type: 'background_train.error', 
+        error: String(e),
+        payload: { message: `Ошибка: ${e.message}` }
+      });
+    } finally {
+      backgroundTraining = false;
+      backgroundTrainingPromise = null;
+      backgroundTrainingProgressCb = null;
+    }
+  })();
+}
+
+// Экспортируем функцию для проверки статуса фонового обучения
+export function isBackgroundTraining() {
+  return backgroundTraining;
 }
 
 export async function clearModel() {

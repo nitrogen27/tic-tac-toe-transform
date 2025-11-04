@@ -67,6 +67,20 @@ wss.on('connection', (ws) => {
         }, m.payload || {});
       } else if (m.type === 'train_ttt3') {
         console.log('[WS] Starting TTT3 Transformer training with payload:', m.payload);
+        console.log('[WS] Payload epochs:', m.payload?.epochs);
+        // Убеждаемся, что payload передается правильно и epochs не больше 10
+        const trainingPayload = m.payload || {};
+        if (trainingPayload.epochs === undefined) {
+          trainingPayload.epochs = 2; // Дефолтное значение из конфига
+        } else if (trainingPayload.epochs > 10) {
+          console.warn(`[WS] WARNING: Client sent epochs=${trainingPayload.epochs}, limiting to 10`);
+          trainingPayload.epochs = 10; // Ограничиваем максимум 10 эпохами
+        }
+        // Валидируем batch size
+        if (trainingPayload.batchSize !== undefined) {
+          trainingPayload.batchSize = Math.max(128, Math.min(4096, trainingPayload.batchSize));
+        }
+        console.log('[WS] Final training config:', { epochs: trainingPayload.epochs, batchSize: trainingPayload.batchSize });
         console.log('[WS] Sending train.start immediately...');
         await trainTTT3WithProgress((ev)=>{
           console.log('[WS] Sending progress:', ev.type);
@@ -75,7 +89,7 @@ wss.on('connection', (ws) => {
           } catch (sendErr) {
             console.error('[WS] Error sending message:', sendErr);
           }
-        }, m.payload || {});
+        }, trainingPayload);
       } else if (m.type === 'predict') {
         const payload = m.payload || { board: Array(9).fill(0), current: 1 };
         const res = await predictMove({ 
@@ -102,12 +116,42 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({ type: 'game.started', payload: { gameId } }));
       } else if (m.type === 'finish_game') {
         // Завершаем игру и анализируем ошибки
-        const patternsPerError = m.payload?.patternsPerError || 1000;
-        await finishGame({ gameId: m.payload?.gameId, winner: m.payload?.winner, patternsPerError });
+        const patternsPerError = Math.max(10, Math.min(2000, m.payload?.patternsPerError || 1000));
+        const autoTrain = m.payload?.autoTrain || false;
+        const incrementalBatchSize = Math.max(32, Math.min(1024, m.payload?.incrementalBatchSize || 256));
+        // Передаем callback для отправки прогресса фонового обучения этому клиенту
+        await finishGame({ 
+          gameId: m.payload?.gameId, 
+          winner: m.payload?.winner, 
+          patternsPerError, 
+          autoTrain,
+          incrementalBatchSize,
+          progressCb: (ev) => {
+            try {
+              if (ws.readyState === ws.OPEN) {
+                ws.send(JSON.stringify(ev));
+              }
+            } catch (e) {
+              console.error('[WS] Error sending background training progress:', e);
+            }
+          }
+        });
         ws.send(JSON.stringify({ type: 'game.finished', payload: getGameHistoryStats() }));
       } else if (m.type === 'train_on_games') {
         console.log('[WS] Training on game history...', m.payload);
-        await trainOnGames((ev)=>ws.send(JSON.stringify(ev)), m.payload || {});
+        const incrementalPayload = m.payload || {};
+        // Валидируем настройки дообучения
+        if (incrementalPayload.epochs !== undefined) {
+          incrementalPayload.epochs = Math.max(1, Math.min(10, incrementalPayload.epochs));
+        }
+        if (incrementalPayload.batchSize !== undefined) {
+          incrementalPayload.batchSize = Math.max(32, Math.min(1024, incrementalPayload.batchSize));
+        }
+        if (incrementalPayload.patternsPerError !== undefined) {
+          incrementalPayload.patternsPerError = Math.max(10, Math.min(2000, incrementalPayload.patternsPerError));
+        }
+        console.log('[WS] Validated incremental training config:', incrementalPayload);
+        await trainOnGames((ev)=>ws.send(JSON.stringify(ev)), incrementalPayload);
       } else if (m.type === 'clear_history') {
         const result = clearGameHistory();
         ws.send(JSON.stringify({ type: 'history.cleared', payload: result }));

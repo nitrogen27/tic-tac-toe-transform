@@ -105,8 +105,14 @@ export async function trainTTT3WithProgress(progressCb, {
   earlyStop = true 
 } = {}) {
   try {
+    // Убеждаемся, что epochs не больше 2
+    if (epochs > 2) {
+      console.warn(`[TrainTTT3] WARNING: epochs=${epochs} is too high, using 2 instead`);
+      epochs = 2;
+    }
     console.log('[TrainTTT3] Starting training...');
     console.log('[TrainTTT3] Config:', { epochs, batchSize, ...TRANSFORMER_CFG });
+    console.log('[TrainTTT3] TRAIN.epochs from config:', TRAIN.epochs);
     
     // Проверяем GPU и явно проверяем backend
     const { getGpuInfo } = await import('./tf.mjs');

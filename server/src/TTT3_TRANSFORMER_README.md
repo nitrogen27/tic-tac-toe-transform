@@ -51,7 +51,7 @@ export const TRANSFORMER_CFG = {
 };
 export const TRAIN = {
   batchSize: 512,
-  epochs: 10,
+  epochs: 2, // Оптимизировано для быстрого обучения
   lr: 5e-4,
   weightValue: 0.5  // Вес value loss
 };

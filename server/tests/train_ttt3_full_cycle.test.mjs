@@ -136,6 +136,7 @@ describe('TTT3 Transformer Full Training Cycle', () => {
     // Генерируем небольшой датасет
     const batchSize = Math.min(TRAIN.batchSize || 32, 16); // Меньший размер для теста
     const nBatches = 5; // Небольшое количество батчей для теста
+    const epochs = 2; // Оптимизировано: 2 эпохи для полного обучения
     
     let totalLoss = 0;
     let iterations = 0;
@@ -179,18 +180,20 @@ describe('TTT3 Transformer Full Training Cycle', () => {
       );
       
       // Обучение
-      const history = await model.fit(
-        [x, pos],
-        [yPolicy, yValue],
-        {
-          batchSize: batchCount,
-          epochs: 1,
-          verbose: 0
-        }
-      );
+              const history = await model.fit(
+                [x, pos],
+                [yPolicy, yValue],
+                {
+                  batchSize: batchCount,
+                  epochs: epochs,
+                  verbose: 0
+                }
+              );
       
-      const loss = history.history.loss[0];
-      totalLoss += loss;
+      // Берем средний loss по всем эпохам
+      const losses = history.history.loss;
+      const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
+      totalLoss += avgLoss;
       iterations++;
       
       // Очистка

@@ -11,7 +11,7 @@
       </div>
       <div class="controls">
         <div class="button-group">
-          <button :disabled="training || clearing" @click="startTrain">Обучить</button>
+          <button :disabled="training || clearing" @click="startTrain">Обучить с нуля</button>
           <button :disabled="training || clearing" @click="trainOnGames" :class="historyCount >= 10 ? '' : 'disabled-btn'">Дообучить на играх</button>
           <button :disabled="training || clearing" @click="clearModel" class="clear-btn">Очистить модель</button>
         </div>
@@ -22,22 +22,54 @@
         <div class="checkbox-group">
           <label>
             <input type="checkbox" v-model="autoTrainAfterGame" />
-            <span>Автоматически дообучать после каждой игры</span>
+            <span>Автоматически дообучать после каждой игры (фоновое мини-обучение)</span>
           </label>
+          <small v-if="autoTrainAfterGame" style="display: block; margin-top: 4px; color: #666;">
+            После каждой игры будет запускаться быстрое фоновое обучение на ошибках (1 эпоха, не блокирует игру, выполняется за несколько секунд)
+          </small>
+        </div>
+        <div class="training-settings">
+          <h3>Настройки основного обучения</h3>
+          <div class="setting-row">
+            <label>
+              <span>Количество эпох:</span>
+              <input type="number" v-model.number="mainTrainingEpochs" min="1" max="10" step="1" :disabled="training || clearing" @blur="validateMainTrainingEpochs" @input="validateMainTrainingEpochs" />
+            </label>
+            <span v-if="validationErrors.mainTrainingEpochs" class="validation-error">{{ validationErrors.mainTrainingEpochs }}</span>
+          </div>
+          <div class="setting-row">
+            <label>
+              <span>Размер батча:</span>
+              <input type="number" v-model.number="mainTrainingBatchSize" min="128" max="4096" step="128" :disabled="training || clearing" @blur="validateMainTrainingBatchSize" @input="validateMainTrainingBatchSize" />
+            </label>
+            <span v-if="validationErrors.mainTrainingBatchSize" class="validation-error">{{ validationErrors.mainTrainingBatchSize }}</span>
+          </div>
+          <div class="setting-hint">
+            <small>Больше батч = быстрее, но больше памяти GPU</small>
+          </div>
         </div>
         <div class="training-settings">
           <h3>Настройки дообучения</h3>
           <div class="setting-row">
             <label>
               <span>Количество эпох:</span>
-              <input type="number" v-model.number="trainingEpochs" min="1" max="20" step="1" :disabled="training || clearing" />
+              <input type="number" v-model.number="trainingEpochs" min="1" max="10" step="1" :disabled="training || clearing" @blur="validateTrainingEpochs" @input="validateTrainingEpochs" />
             </label>
+            <span v-if="validationErrors.trainingEpochs" class="validation-error">{{ validationErrors.trainingEpochs }}</span>
+          </div>
+          <div class="setting-row">
+            <label>
+              <span>Размер батча:</span>
+              <input type="number" v-model.number="incrementalBatchSize" min="32" max="1024" step="32" :disabled="training || clearing" @blur="validateIncrementalBatchSize" @input="validateIncrementalBatchSize" />
+            </label>
+            <span v-if="validationErrors.incrementalBatchSize" class="validation-error">{{ validationErrors.incrementalBatchSize }}</span>
           </div>
           <div class="setting-row">
             <label>
               <span>Вариаций паттерна на ошибку:</span>
-              <input type="number" v-model.number="patternsPerError" min="10" max="2000" step="10" :disabled="training || clearing" />
+              <input type="number" v-model.number="patternsPerError" min="10" max="2000" step="10" :disabled="training || clearing" @blur="validatePatternsPerError" @input="validatePatternsPerError" />
             </label>
+            <span v-if="validationErrors.patternsPerError" class="validation-error">{{ validationErrors.patternsPerError }}</span>
           </div>
           <div class="setting-hint">
             <small>Больше вариаций = лучшее обучение, но медленнее генерация</small>
@@ -62,14 +94,38 @@
           </div>
         </div>
         <!-- Прогресс обучения -->
-        <div class="progress" v-if="progress && !datasetProgress">
+        <div class="progress" v-if="progress && !datasetProgress && !backgroundProgress">
           <div class="bar" :style="{ width: (progress.percent||0)+'%' }"></div>
         </div>
-        <div class="logs" v-if="progress && !datasetProgress">
+        <div class="logs" v-if="progress && !datasetProgress && !backgroundProgress">
           Эпоха {{progress.epoch}} / {{progress.epochs}} ·
           loss: {{progress.loss}} · acc: {{progress.acc}} ·
           <span v-if="progress.accuracy">Accuracy: {{progress.accuracy}}% · MAE: {{progress.mae}}</span>
           <span v-else>val_loss: {{progress.val_loss}} · val_acc: {{progress.val_acc}}</span>
+        </div>
+        <!-- Прогресс фонового дообучения -->
+        <div v-if="backgroundProgress" class="background-training" style="margin-top: 12px; padding: 12px; background: #e3f2fd; border-radius: 8px; border: 1px solid #90caf9;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <strong style="color: #1976d2;">🔄 Фоновое дообучение</strong>
+            <span style="font-size: 0.85em; color: #666;">{{backgroundProgress.epoch}}/{{backgroundProgress.epochs}} эпох</span>
+          </div>
+          <div class="progress" style="margin-bottom: 8px;">
+            <div class="bar" style="background: #2196F3;" :style="{ width: (backgroundProgress.epochPercent||0)+'%' }"></div>
+          </div>
+          <div style="font-size: 0.9em; color: #555;">
+            <div style="margin-bottom: 4px;">
+              <strong>Новые навыки:</strong> {{backgroundProgress.newSkills}} из {{backgroundProgress.totalSkills}} 
+              <span style="color: #1976d2;">({{backgroundProgress.newSkillsPercent}}%)</span>
+            </div>
+            <div>
+              <strong>Прогресс обучения:</strong> {{backgroundProgress.epochPercent}}%
+              <span v-if="backgroundProgress.batchProgress && backgroundProgress.batchesPerEpoch" style="margin-left: 8px; color: #666;">
+                (батч {{backgroundProgress.currentBatch}}/{{backgroundProgress.batchesPerEpoch}}: {{backgroundProgress.batchProgress}}%)
+              </span>
+              <span v-if="backgroundProgress.loss" style="margin-left: 12px;">loss: {{backgroundProgress.loss}}</span>
+              <span v-if="backgroundProgress.acc" style="margin-left: 8px;">acc: {{backgroundProgress.acc}}</span>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -138,8 +194,118 @@ const pauseMs = ref(1000) // Пауза между ходами в мс
 let autoGameInterval = null
 const historyCount = ref(0) // Количество сохраненных ходов
 const autoTrainAfterGame = ref(false) // Автоматическое дообучение после игры
-const trainingEpochs = ref(5) // Количество эпох при дообучении
+// Настройки основного обучения
+const mainTrainingEpochs = ref(2) // Количество эпох для основного обучения
+const mainTrainingBatchSize = ref(1024) // Размер батча для основного обучения
+// Настройки дообучения
+const trainingEpochs = ref(1) // Количество эпох при дообучении
+const incrementalBatchSize = ref(256) // Размер батча для дообучения
 const patternsPerError = ref(1000) // Количество вариаций паттерна для каждой ошибки
+
+// Ошибки валидации
+const validationErrors = ref({
+  mainTrainingEpochs: null,
+  mainTrainingBatchSize: null,
+  trainingEpochs: null,
+  incrementalBatchSize: null,
+  patternsPerError: null
+})
+
+// Валидация настроек основного обучения
+function validateMainTrainingSettings() {
+  validationErrors.value.mainTrainingEpochs = null
+  validationErrors.value.mainTrainingBatchSize = null
+  
+  if (mainTrainingEpochs.value < 1 || mainTrainingEpochs.value > 10 || !Number.isInteger(mainTrainingEpochs.value)) {
+    validationErrors.value.mainTrainingEpochs = 'Количество эпох должно быть от 1 до 10'
+    return false
+  }
+  
+  if (mainTrainingBatchSize.value < 128 || mainTrainingBatchSize.value > 4096 || !Number.isInteger(mainTrainingBatchSize.value)) {
+    validationErrors.value.mainTrainingBatchSize = 'Размер батча должен быть от 128 до 4096'
+    return false
+  }
+  
+  if (mainTrainingBatchSize.value % 128 !== 0) {
+    validationErrors.value.mainTrainingBatchSize = 'Размер батча должен быть кратен 128'
+    return false
+  }
+  
+  return true
+}
+
+// Валидация настроек дообучения
+function validateIncrementalTrainingSettings() {
+  validationErrors.value.trainingEpochs = null
+  validationErrors.value.incrementalBatchSize = null
+  validationErrors.value.patternsPerError = null
+  
+  if (trainingEpochs.value < 1 || trainingEpochs.value > 10 || !Number.isInteger(trainingEpochs.value)) {
+    validationErrors.value.trainingEpochs = 'Количество эпох должно быть от 1 до 10'
+    return false
+  }
+  
+  if (incrementalBatchSize.value < 32 || incrementalBatchSize.value > 1024 || !Number.isInteger(incrementalBatchSize.value)) {
+    validationErrors.value.incrementalBatchSize = 'Размер батча должен быть от 32 до 1024'
+    return false
+  }
+  
+  if (incrementalBatchSize.value % 32 !== 0) {
+    validationErrors.value.incrementalBatchSize = 'Размер батча должен быть кратен 32'
+    return false
+  }
+  
+  if (patternsPerError.value < 10 || patternsPerError.value > 2000 || !Number.isInteger(patternsPerError.value)) {
+    validationErrors.value.patternsPerError = 'Вариаций паттерна должно быть от 10 до 2000'
+    return false
+  }
+  
+  if (patternsPerError.value % 10 !== 0) {
+    validationErrors.value.patternsPerError = 'Вариаций паттерна должно быть кратно 10'
+    return false
+  }
+  
+  return true
+}
+
+// Валидация при изменении значений
+function validateMainTrainingEpochs() {
+  if (mainTrainingEpochs.value < 1) mainTrainingEpochs.value = 1
+  if (mainTrainingEpochs.value > 10) mainTrainingEpochs.value = 10
+  if (!Number.isInteger(mainTrainingEpochs.value)) mainTrainingEpochs.value = Math.round(mainTrainingEpochs.value)
+  validateMainTrainingSettings()
+}
+
+function validateMainTrainingBatchSize() {
+  if (mainTrainingBatchSize.value < 128) mainTrainingBatchSize.value = 128
+  if (mainTrainingBatchSize.value > 4096) mainTrainingBatchSize.value = 4096
+  // Округляем до ближайшего кратного 128
+  mainTrainingBatchSize.value = Math.round(mainTrainingBatchSize.value / 128) * 128
+  validateMainTrainingSettings()
+}
+
+function validateTrainingEpochs() {
+  if (trainingEpochs.value < 1) trainingEpochs.value = 1
+  if (trainingEpochs.value > 10) trainingEpochs.value = 10
+  if (!Number.isInteger(trainingEpochs.value)) trainingEpochs.value = Math.round(trainingEpochs.value)
+  validateIncrementalTrainingSettings()
+}
+
+function validateIncrementalBatchSize() {
+  if (incrementalBatchSize.value < 32) incrementalBatchSize.value = 32
+  if (incrementalBatchSize.value > 1024) incrementalBatchSize.value = 1024
+  // Округляем до ближайшего кратного 32
+  incrementalBatchSize.value = Math.round(incrementalBatchSize.value / 32) * 32
+  validateIncrementalTrainingSettings()
+}
+
+function validatePatternsPerError() {
+  if (patternsPerError.value < 10) patternsPerError.value = 10
+  if (patternsPerError.value > 2000) patternsPerError.value = 2000
+  // Округляем до ближайшего кратного 10
+  patternsPerError.value = Math.round(patternsPerError.value / 10) * 10
+  validateIncrementalTrainingSettings()
+}
 let currentGameMoves = [] // Ходы текущей игры
 let currentGameId = null // ID текущей игры для отслеживания последовательности
 let reconnectAttempts = 0
@@ -148,6 +314,7 @@ let isConnecting = false
 const gpuAvailable = ref(false)
 const gpuBackend = ref('')
 const datasetProgress = ref(null)
+const backgroundProgress = ref(null) // Прогресс фонового обучения
 
 function connectWS() {
   // Предотвращаем множественные попытки подключения
@@ -243,13 +410,66 @@ function connectWS() {
         const msg = JSON.parse(ev.data)
         console.log('[WS] Received:', msg.type, msg.payload || '')
         
+        // Обработка событий фонового обучения
+        if (msg.type === 'background_train.start') {
+          backgroundProgress.value = {
+            epoch: 0,
+            epochs: msg.payload.epochs || 1,
+            epochPercent: 0,
+            newSkills: msg.payload.newSkills || 0,
+            totalSkills: msg.payload.totalSkills || 0,
+            newSkillsPercent: msg.payload.newSkillsPercent || 0,
+            message: msg.payload.message
+          }
+          status.value = msg.payload.message || 'Фоновое обучение началось...'
+          console.log('[WS] Background training started:', msg.payload)
+        }
+        if (msg.type === 'background_train.progress') {
+          backgroundProgress.value = {
+            epoch: msg.payload.epoch || 0,
+            epochs: msg.payload.epochs || 1,
+            epochPercent: msg.payload.epochPercent || 0,
+            newSkills: msg.payload.newSkills || 0,
+            totalSkills: msg.payload.totalSkills || 0,
+            newSkillsPercent: msg.payload.newSkillsPercent || 0,
+            loss: msg.payload.loss,
+            acc: msg.payload.acc,
+            batchProgress: msg.payload.batchProgress,
+            currentBatch: msg.payload.currentBatch,
+            batchesPerEpoch: msg.payload.batchesPerEpoch,
+            message: msg.payload.message
+          }
+          // Используем epochPercent для статуса, если есть batchProgress - показываем его
+          const progressText = msg.payload.batchProgress ? 
+            `${msg.payload.epochPercent}% (батч ${msg.payload.currentBatch}/${msg.payload.batchesPerEpoch})` : 
+            `${msg.payload.epochPercent}%`
+          status.value = msg.payload.message || `Фоновое обучение: ${progressText}`
+          console.log('[WS] Background training progress:', msg.payload)
+        }
+        if (msg.type === 'background_train.done') {
+          status.value = msg.payload.message || 'Фоновое обучение завершено'
+          console.log('[WS] Background training done:', msg.payload)
+          // Очищаем прогресс через 3 секунды
+          setTimeout(() => {
+            backgroundProgress.value = null
+          }, 3000)
+        }
+        if (msg.type === 'background_train.error') {
+          status.value = msg.payload?.message || msg.error || 'Ошибка фонового обучения'
+          backgroundProgress.value = null
+          console.error('[WS] Background training error:', msg.error)
+        }
+        
         if (msg.type === 'train.progress') {
-          progress.value = msg.payload
-          // Для TTT3 Transformer показываем accuracy и MAE если доступны
-          if (msg.payload.accuracy !== undefined) {
-            status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs} - Accuracy: ${msg.payload.accuracy}%, MAE: ${msg.payload.mae}`
-          } else {
-            status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs}`
+          // Игнорируем прогресс обычного обучения, если идет фоновое
+          if (!backgroundProgress.value) {
+            progress.value = msg.payload
+            // Для TTT3 Transformer показываем accuracy и MAE если доступны
+            if (msg.payload.accuracy !== undefined) {
+              status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs} - Accuracy: ${msg.payload.accuracy}%, MAE: ${msg.payload.mae}`
+            } else {
+              status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs}`
+            }
           }
         }
         if (msg.type === 'train.start') { 
@@ -413,20 +633,26 @@ function startTrain() {
     }
     return
   }
+  
+  // Валидация настроек перед отправкой
+  if (!validateMainTrainingSettings()) {
+    status.value = 'Ошибка валидации: проверьте настройки основного обучения'
+    return
+  }
+  
   training.value = true
   status.value = 'Отправка запроса на обучение TTT3 Transformer...'
   try {
-    // Используем новый TTT3 Transformer обучение
-    // Параметры из конфига: epochs=10, batchSize=512
+    // Используем настройки из UI (после валидации)
     ws.value.send(JSON.stringify({ 
       type: 'train_ttt3', 
       payload: { 
-        epochs: 10, 
-        batchSize: 512,
+        epochs: mainTrainingEpochs.value, // Используем настройку из UI
+        batchSize: mainTrainingBatchSize.value, // Используем настройку из UI
         earlyStop: true 
       } 
     }))
-    console.log('[Train] TTT3 Transformer training request sent')
+    console.log(`[Train] TTT3 Transformer training request sent: epochs=${mainTrainingEpochs.value}, batchSize=${mainTrainingBatchSize.value}`)
   } catch (e) {
     console.error('[Train] Send error:', e)
     training.value = false
@@ -562,23 +788,25 @@ function startGameTracking() {
 function finishGameTracking(winner) {
   // Завершаем отслеживание игры и анализируем ошибки
   if (currentGameId && ws.value && ws.value.readyState === WebSocket.OPEN) {
-    ws.value.send(JSON.stringify({ 
-      type: 'finish_game', 
-      payload: { 
-        gameId: currentGameId, 
-        winner,
-        patternsPerError: patternsPerError.value // Передаем настройку количества паттернов
-      }
-    }))
+            ws.value.send(JSON.stringify({ 
+              type: 'finish_game', 
+              payload: { 
+                gameId: currentGameId, 
+                winner,
+                patternsPerError: patternsPerError.value, // Передаем настройку количества паттернов
+                autoTrain: autoTrainAfterGame.value, // Передаем флаг автоматического обучения
+                incrementalBatchSize: incrementalBatchSize.value // Передаем настройку batch size для дообучения
+              }
+            }))
   }
 }
 
 async function autoTrainAfterGameIfEnabled() {
-  if (autoTrainAfterGame.value && historyCount.value >= 10 && !training.value) {
-    status.value = 'Автоматическое дообучение...'
-    setTimeout(() => {
-      trainOnGames()
-    }, 500)
+  // Фоновое обучение теперь запускается автоматически на сервере
+  // после finish_game, если autoTrainAfterGame включен
+  // Эта функция больше не нужна, но оставляем для совместимости
+  if (autoTrainAfterGame.value) {
+    console.log('[AutoTrain] Background training will be triggered after game finish');
   }
 }
 
@@ -594,20 +822,27 @@ function trainOnGames() {
     alert(`Недостаточно данных для обучения. Нужно минимум 10 ходов, есть ${historyCount.value}`)
     return
   }
+  
+  // Валидация настроек перед отправкой
+  if (!validateIncrementalTrainingSettings()) {
+    status.value = 'Ошибка валидации: проверьте настройки дообучения'
+    return
+  }
+  
   training.value = true
   status.value = 'Дообучение на реальных играх (с фокусом на ошибках)...'
   try {
-    // Используем настройки из интерфейса
+    // Используем настройки из интерфейса (после валидации)
     ws.value.send(JSON.stringify({ 
       type: 'train_on_games', 
       payload: { 
-        epochs: trainingEpochs.value,
-        batchSize: 32,
+        epochs: trainingEpochs.value, // Используем настройку из UI
+        batchSize: incrementalBatchSize.value, // Используем настройку из UI
         focusOnErrors: true, // Включаем автоматическое увеличение эпох для паттернов ошибок
         patternsPerError: patternsPerError.value // Передаем настройку количества паттернов
       } 
     }))
-    console.log(`[TrainOnGames] Request sent: ${trainingEpochs.value} epochs, ${patternsPerError.value} patterns per error`)
+    console.log(`[TrainOnGames] Request sent: epochs=${trainingEpochs.value}, batchSize=${incrementalBatchSize.value}, patternsPerError=${patternsPerError.value}`)
   } catch (e) {
     console.error('[TrainOnGames] Send error:', e)
     training.value = false
@@ -859,10 +1094,12 @@ onMounted(() => {
 .checkbox-group input[type="checkbox"] { cursor: pointer; }
 .training-settings { margin-top: 12px; padding: 12px; background: #f0f7ff; border-radius: 6px; border: 1px solid #cce5ff; }
 .training-settings h3 { margin: 0 0 12px 0; font-size: 1em; color: #0066cc; }
+.validation-error { display: block; color: #d32f2f; font-size: 0.85em; margin-top: 4px; }
 .setting-row { margin-bottom: 10px; }
-.setting-row label { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.setting-row label { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-direction: row; }
 .setting-row label span { flex: 1; }
 .setting-row input[type="number"] { width: 100px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; text-align: center; }
+.setting-row input[type="number"]:invalid { border-color: #d32f2f; }
 .setting-row input[type="number"]:disabled { background: #f5f5f5; cursor: not-allowed; }
 .setting-hint { margin-top: 8px; padding-top: 8px; border-top: 1px solid #ddd; }
 .setting-hint small { color: #666; font-size: 0.85em; }
