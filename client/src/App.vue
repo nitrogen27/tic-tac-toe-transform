@@ -4,6 +4,11 @@
 
     <section class="panel">
       <h2>Тренировка</h2>
+      <div class="gpu-status" :class="{ 'gpu-active': gpuAvailable, 'gpu-inactive': !gpuAvailable }">
+        <span class="gpu-icon">{{ gpuAvailable ? '🚀' : '💻' }}</span>
+        <span class="gpu-text">{{ gpuAvailable ? 'CUDA GPU ускорение активно' : 'CPU режим' }}</span>
+        <span class="gpu-backend" v-if="gpuBackend">({{ gpuBackend }})</span>
+      </div>
       <div class="controls">
         <div class="button-group">
           <button :disabled="training || clearing" @click="startTrain">Обучить</button>
@@ -38,13 +43,33 @@
             <small>Больше вариаций = лучшее обучение, но медленнее генерация</small>
           </div>
         </div>
-        <div class="progress" v-if="progress">
+        <!-- Прогресс генерации датасета -->
+        <div v-if="datasetProgress" class="dataset-progress">
+          <div class="dataset-header">
+            <strong>Генерация датасета</strong>
+            <span v-if="datasetProgress.workers" class="workers-badge">{{ datasetProgress.workers }} воркеров</span>
+          </div>
+          <div class="progress">
+            <div class="bar dataset-bar" :style="{ width: (datasetProgress.percent||0)+'%' }"></div>
+          </div>
+          <div class="dataset-info">
+            <span>{{ datasetProgress.generated || 0 }} / {{ datasetProgress.total || 0 }} игр ({{ datasetProgress.percent || 0 }}%)</span>
+            <span v-if="datasetProgress.rate" class="rate-info">· {{ datasetProgress.rate }} игр/с</span>
+            <span v-if="datasetProgress.elapsed" class="time-info">· {{ datasetProgress.elapsed }}с</span>
+          </div>
+          <div v-if="datasetProgress.stage === 'concatenating'" class="dataset-stage">
+            {{ datasetProgress.message || 'Объединение тензоров на GPU...' }}
+          </div>
+        </div>
+        <!-- Прогресс обучения -->
+        <div class="progress" v-if="progress && !datasetProgress">
           <div class="bar" :style="{ width: (progress.percent||0)+'%' }"></div>
         </div>
-        <div class="logs" v-if="progress">
+        <div class="logs" v-if="progress && !datasetProgress">
           Эпоха {{progress.epoch}} / {{progress.epochs}} ·
           loss: {{progress.loss}} · acc: {{progress.acc}} ·
-          val_loss: {{progress.val_loss}} · val_acc: {{progress.val_acc}}
+          <span v-if="progress.accuracy">Accuracy: {{progress.accuracy}}% · MAE: {{progress.mae}}</span>
+          <span v-else>val_loss: {{progress.val_loss}} · val_acc: {{progress.val_acc}}</span>
         </div>
       </div>
     </section>
@@ -120,6 +145,9 @@ let currentGameId = null // ID текущей игры для отслежива
 let reconnectAttempts = 0
 let reconnectTimeout = null
 let isConnecting = false
+const gpuAvailable = ref(false)
+const gpuBackend = ref('')
+const datasetProgress = ref(null)
 
 function connectWS() {
   // Предотвращаем множественные попытки подключения
@@ -159,9 +187,10 @@ function connectWS() {
       reconnectAttempts = 0
       status.value = 'Подключено'
       hasHandledClose = false
-      // Запрашиваем статистику истории
+      // Запрашиваем статистику истории и GPU информацию
       if (ws.value.readyState === WebSocket.OPEN) {
         ws.value.send(JSON.stringify({ type: 'get_history_stats' }))
+        ws.value.send(JSON.stringify({ type: 'get_gpu_info' }))
       }
     }
     
@@ -216,11 +245,17 @@ function connectWS() {
         
         if (msg.type === 'train.progress') {
           progress.value = msg.payload
-          status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs}`
+          // Для TTT3 Transformer показываем accuracy и MAE если доступны
+          if (msg.payload.accuracy !== undefined) {
+            status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs} - Accuracy: ${msg.payload.accuracy}%, MAE: ${msg.payload.mae}`
+          } else {
+            status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs}`
+          }
         }
         if (msg.type === 'train.start') { 
           training.value = true
           progress.value = { percent: 0, epoch: 0, epochs: msg.payload.epochs }
+          // Не сбрасываем datasetProgress здесь - генерация еще не началась
           status.value = 'Подготовка к обучению...'
           console.log('[WS] Training started, epochs:', msg.payload.epochs)
         }
@@ -228,8 +263,21 @@ function connectWS() {
           status.value = msg.payload.message || 'Обработка...'
           console.log('[WS] Status:', msg.payload.message)
         }
+        if (msg.type === 'dataset.progress') {
+          // Прогресс генерации датасета
+          const p = msg.payload
+          console.log('[WS] Dataset progress received:', JSON.stringify(p))
+          datasetProgress.value = p
+          if (p.stage === 'concatenating') {
+            status.value = p.message || 'Объединение тензоров на GPU...'
+          } else {
+            status.value = `Генерация датасета: ${p.generated || 0}/${p.total || 0} игр (${p.percent || 0}%) - ${p.rate || 0} игр/с`
+          }
+          console.log('[WS] Dataset progress updated:', p.generated, '/', p.total, `(${p.percent}%)`)
+        }
       if (msg.type === 'train.done') { 
         training.value = false
+        datasetProgress.value = null // Очищаем прогресс датасета после обучения
         status.value = 'Обучение завершено'
         console.log('[WS] Training completed')
         // Обновляем статистику истории после обучения
@@ -314,6 +362,11 @@ function connectWS() {
         if (msg.type === 'history.stats') {
           historyCount.value = msg.payload.count || 0
         }
+        if (msg.type === 'gpu.info') {
+          gpuAvailable.value = msg.payload.available || false
+          gpuBackend.value = msg.payload.backend || 'cpu'
+          console.log('[WS] GPU info:', msg.payload)
+        }
         if (msg.type === 'game.started') {
           currentGameId = msg.payload.gameId
           console.log('[WS] Game tracking started:', currentGameId)
@@ -361,10 +414,19 @@ function startTrain() {
     return
   }
   training.value = true
-  status.value = 'Отправка запроса на обучение...'
+  status.value = 'Отправка запроса на обучение TTT3 Transformer...'
   try {
-    ws.value.send(JSON.stringify({ type: 'train', payload: { epochs: 5, batchSize: 256, nTrain: 4000, nVal: 1000 } }))
-    console.log('[Train] Training request sent')
+    // Используем новый TTT3 Transformer обучение
+    // Параметры из конфига: epochs=10, batchSize=512
+    ws.value.send(JSON.stringify({ 
+      type: 'train_ttt3', 
+      payload: { 
+        epochs: 10, 
+        batchSize: 512,
+        earlyStop: true 
+      } 
+    }))
+    console.log('[Train] TTT3 Transformer training request sent')
   } catch (e) {
     console.error('[Train] Send error:', e)
     training.value = false
@@ -738,6 +800,53 @@ onMounted(() => {
 .pause-label input[type="number"] { width: 80px; padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; }
 .progress { width: 100%; height: 10px; background: #eee; border-radius: 6px; margin-top: 8px; overflow: hidden; }
 .progress .bar { height: 100%; background: #4caf50; transition: width .25s ease; }
+.dataset-progress { 
+  margin-top: 12px; 
+  padding: 12px; 
+  background: white; 
+  border-radius: 8px; 
+  border: 1px solid #e0e0e0;
+}
+.dataset-header { 
+  display: flex; 
+  justify-content: space-between; 
+  align-items: center; 
+  margin-bottom: 8px;
+}
+.workers-badge { 
+  background: #2196F3; 
+  color: white; 
+  padding: 2px 8px; 
+  border-radius: 12px; 
+  font-size: 12px; 
+  font-weight: normal;
+}
+.dataset-bar { 
+  background: #2196F3 !important; 
+}
+.dataset-info { 
+  margin-top: 6px; 
+  font-size: 13px; 
+  color: #666; 
+  display: flex; 
+  gap: 8px; 
+  flex-wrap: wrap;
+}
+.rate-info { 
+  color: #4caf50; 
+  font-weight: 500;
+}
+.time-info { 
+  color: #666;
+}
+.dataset-stage { 
+  margin-top: 8px; 
+  padding: 6px; 
+  background: #f5f5f5; 
+  border-radius: 4px; 
+  font-size: 12px; 
+  color: #666;
+}
 .board { display: grid; grid-template-columns: repeat(3, 80px); grid-gap: 8px; margin: 12px 0; }
 .cell { width: 80px; height: 80px; font-size: 28px; border: 1px solid #ccc; border-radius: 8px; background: white; cursor: pointer; }
 .cell:disabled { background: #f3f3f3; cursor: not-allowed; }
@@ -762,5 +871,36 @@ onMounted(() => {
   font-weight: bold; 
   font-size: 1.1em;
   opacity: 1;
+}
+.gpu-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border-radius: 6px;
+  font-size: 0.95em;
+  font-weight: 500;
+}
+.gpu-status.gpu-active {
+  background: #e8f5e9;
+  border: 1px solid #4caf50;
+  color: #2e7d32;
+}
+.gpu-status.gpu-inactive {
+  background: #fff3e0;
+  border: 1px solid #ff9800;
+  color: #e65100;
+}
+.gpu-icon {
+  font-size: 1.2em;
+}
+.gpu-text {
+  flex: 1;
+}
+.gpu-backend {
+  font-size: 0.85em;
+  opacity: 0.8;
+  font-family: monospace;
 }
 </style>

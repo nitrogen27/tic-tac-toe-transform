@@ -20,6 +20,81 @@
 
 ## Установка
 
+### Вариант 1: Docker (рекомендуется) 🐳
+
+Самый простой способ запустить проект без проблем с зависимостями:
+
+## Быстрый старт
+
+### Локальный запуск (одной командой)
+
+```bash
+# Установка зависимостей (первый раз)
+npm install
+
+# Запуск всего проекта
+npm start
+
+# Остановка всех процессов и контейнеров
+npm stop
+
+# Перезапуск проекта
+npm restart
+```
+
+Это запустит:
+- Сервер на порту 8080 (WebSocket)  
+- Клиент на порту 5173 (Vite dev server)
+
+**Примечание:** 
+- `npm stop` останавливает все Docker контейнеры и локальные процессы проекта
+- `npm restart` останавливает всё и запускает заново
+- GPU автоматически определяется при запуске (проверьте логи сервера)
+
+### Docker запуск
+
+```bash
+# Убедитесь, что Docker Desktop запущен
+docker ps
+
+# GPU версия (требует NVIDIA GPU и nvidia-container-toolkit)
+docker-compose -f docker-compose.gpu.yml up --build
+
+# Или CPU версия
+docker-compose up --build
+```
+
+После запуска:
+- Сервер: `ws://localhost:8080` (WebSocket)
+- Клиент: `http://localhost:5173`
+
+Подробнее: [QUICK_DOCKER_START.md](QUICK_DOCKER_START.md) или [DOCKER_SETUP.md](DOCKER_SETUP.md)
+
+## Проверка GPU
+
+При запуске сервера проверьте логи:
+```
+[TFJS] Using tfjs-node-gpu backend (CUDA support)
+[TFJS] Backend: tensorflow (gpu)
+[TrainTTT3] GPU acceleration: ENABLED ✓
+```
+
+Если GPU недоступен:
+```
+[TFJS] WARNING: Backend is not GPU! Check NVIDIA/CUDA/cuDNN installation.
+[TrainTTT3] GPU acceleration: DISABLED ✗
+```
+
+**Все операции TensorFlow.js автоматически выполняются на GPU при использовании `@tensorflow/tfjs-node-gpu`** - тензоры, model.fit(), model.predict() и все операции размещаются на GPU автоматически.
+
+### Вариант 2: Локальная установка
+
+#### Требования
+
+- **Node.js v18.x или v20.x** (LTS версии)
+- **Visual Studio Build Tools 2022** с компонентом "Desktop development with C++" (для Windows)
+- **CUDA Toolkit** (опционально, для GPU/CUDA поддержки)
+
 ```bash
 # Установка зависимостей
 npm install
@@ -31,6 +106,16 @@ npm start
 npm run server  # Сервер на ws://localhost:8080
 npm run client  # Клиент на http://localhost:5173
 ```
+
+**Примечание:** Если возникают проблемы с установкой TensorFlow.js на Windows, используйте Docker (Вариант 1).
+
+### Поддержка CPU и GPU
+
+Проект автоматически определяет и использует:
+- **CPU (x86_64)** - через `@tensorflow/tfjs-node`
+- **CUDA GPU** - через `@tensorflow/tfjs-node-gpu` (если доступен)
+
+При запуске сервера проверьте логи для определения используемого backend.
 
 ## Использование
 

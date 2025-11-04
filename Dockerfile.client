@@ -1,0 +1,25 @@
+# Dockerfile для клиента (Vue.js + Vite)
+FROM node:20-slim
+
+# Создание рабочей директории
+WORKDIR /app
+
+# Копирование корневого package.json для workspace
+COPY package.json package-lock.json* ./
+
+# Копирование package.json клиента
+COPY client/package.json ./client/
+
+# Установка зависимостей клиента
+RUN npm install --workspace=client
+
+# Копирование исходного кода клиента
+COPY client/ ./client/
+
+# Открытие порта для Vite dev server
+EXPOSE 5173
+
+# Запуск dev server
+WORKDIR /app/client
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+

@@ -1,0 +1,39 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: tic-tac-toe-server
+    ports:
+      - "8080:8080"  # WebSocket
+    volumes:
+      # Монтируем директорию для сохранения моделей
+      - ./server/saved:/app/server/saved
+    # Использование NVIDIA runtime (работает после установки nvidia-container-toolkit)
+    # Если runtime недоступен, используйте docker-gpu-up.sh который использует --gpus all
+    runtime: nvidia
+    environment:
+      - NODE_ENV=production
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - USE_GPU_BIG=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: tic-tac-toe-client
+    ports:
+      - "5173:5173"
+    volumes:
+      # Монтируем исходный код для hot-reload (опционально)
+      - ./client:/app/client
+      - /app/client/node_modules
+    environment:
+      - VITE_WS_URL=ws://localhost:8080
+    depends_on:
+      - server
+    restart: unless-stopped
+

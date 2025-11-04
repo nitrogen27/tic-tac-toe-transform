@@ -2,8 +2,8 @@ import tfpkg from './tf.mjs';
 const tf = tfpkg;
 
 export function buildModel({
-  dModel = 64,
-  numLayers = 2,
+  dModel = 512,  // Сильно увеличено для демонстрации преимущества GPU
+  numLayers = 8,  // Больше слоев = больше параллелизма для GPU
   seqLen = 9,
   vocabSize = 3,
 } = {}) {

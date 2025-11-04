@@ -1,0 +1,60 @@
+# Dockerfile для сервера с TensorFlow.js и GPU поддержкой
+# Используем CUDA devel образ с cuDNN 8 для полной поддержки GPU TensorFlow.js
+FROM nvidia/cuda:12.0.0-cudnn8-devel-ubuntu22.04
+
+# Установка Node.js 20 LTS
+RUN apt-get update && apt-get install -y \
+    curl \
+    ca-certificates \
+    gnupg \
+    python3 \
+    build-essential \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Настройка переменных окружения для CUDA
+# В CUDA runtime образе библиотеки находятся в cuda-12.0/targets/x86_64-linux/lib
+ENV LD_LIBRARY_PATH=/usr/local/cuda-12.0/targets/x86_64-linux/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV CUDA_HOME=/usr/local/cuda-12.0
+ENV PATH=/usr/local/cuda-12.0/bin:${PATH}
+# Создаём симлинки для обратной совместимости и совместимости с TensorFlow.js (ожидает CUDA 11)
+RUN ln -sf /usr/local/cuda-12.0 /usr/local/cuda && \
+    mkdir -p /usr/local/cuda/lib64 && \
+    cd /usr/local/cuda-12.0/targets/x86_64-linux/lib && \
+    ln -sf libcudart.so.12 libcudart.so.11 && \
+    ln -sf libcudart.so.12.0.107 libcudart.so.11.0 && \
+    ln -sf libcublas.so.12 libcublas.so.11 && \
+    ln -sf libcublasLt.so.12 libcublasLt.so.11 && \
+    ([ -f libcufft.so.12 ] && ln -sf libcufft.so.12 libcufft.so.11 && ln -sf libcufft.so.12 libcufft.so.10 || \
+     [ -f libcufft.so.11 ] && ln -sf libcufft.so.11 libcufft.so.10 || true) && \
+    ([ -f libcurand.so.12 ] && ln -sf libcurand.so.12 libcurand.so.11 && ln -sf libcurand.so.12 libcurand.so.10 || true) && \
+    ln -sf libcusolver.so.12 libcusolver.so.11 2>/dev/null || true && \
+    ln -sf libcusparse.so.12 libcusparse.so.11 2>/dev/null || true
+
+# Создание рабочей директории
+WORKDIR /app
+
+# Копирование корневого package.json для workspace
+COPY package.json package-lock.json* ./
+
+# Копирование package.json сервера
+COPY server/package.json ./server/
+
+# Установка зависимостей сервера
+RUN npm install --workspace=server
+
+# Копирование исходного кода сервера
+COPY server/ ./server/
+
+# Создание директории для сохранения моделей
+RUN mkdir -p /app/server/saved
+
+# Открытие порта для WebSocket
+EXPOSE 8080
+
+# Запуск сервера
+WORKDIR /app/server
+CMD ["node", "server.mjs"]
+

@@ -4,6 +4,7 @@ import fs from 'fs/promises';
 import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { buildModel } from './src/model_transformer.mjs';
+import { BOARD_N, TRANSFORMER_CFG } from './src/config.mjs';
 import { loadDataset } from './src/dataset.mjs';
 import { relativeCells } from './src/tic_tac_toe.mjs';
 
@@ -49,39 +50,95 @@ export async function ensureModel({ forceFresh = false } = {}) {
         model = await tf.loadLayersModel(`file://${_MODEL_DIR}/model.json`);
         model.compile({ optimizer: tf.train.adam(1e-3), loss: 'categoricalCrossentropy', metrics: ['accuracy'] });
       } else {
-        model = buildModel({ dModel: 64, numLayers: 2 });
+        const useBig = process.env.USE_GPU_BIG === '1';
+        model = buildModel({  dModel: useBig ? 512 : 64, numLayers: useBig ? 8 : 2 , seqLen: (BOARD_N*BOARD_N), vocabSize: 3 });
+        console.log(`[Model] Using ${useBig ? 'BIG GPU' : 'small CPU'} model: dModel=${useBig ? 512 : 64}, numLayers=${useBig ? 8 : 2}`);
       }
     }
     return model;
   } finally { building = false; }
 }
 
-export async function trainWithProgress(progressCb, { epochs=5, batchSize=256, nTrain=4000, nVal=1000 } = {}) {
+// Оптимальные параметры для GPU/CPU: адаптивный batchSize
+export async function trainWithProgress(progressCb, { epochs=5, batchSize, nTrain=50000, nVal=5000 } = {}) {
   try {
+    // Определяем оптимальный batchSize в зависимости от backend
+    const { getGpuInfo } = await import('./src/tf.mjs');
+    const gpuInfo = getGpuInfo();
+    const isGPU = gpuInfo.available && gpuInfo.backend === 'gpu';
+    
+    // Адаптивный batchSize: GPU - 8192-16384, CPU - 2048-4096
+    // Но для маленьких датасетов (nTrain < 10000) используем меньший batch
+    if (batchSize === undefined || batchSize === null) {
+      if (nTrain < 100) {
+        // Очень маленький датасет - используем очень маленький batch чтобы избежать OOM
+        batchSize = isGPU ? 32 : 16;
+      } else if (nTrain < 1000) {
+        // Маленький датасет - используем маленький batch
+        batchSize = isGPU ? 128 : 64;
+      } else if (nTrain < 10000) {
+        // Средний датасет - используем средний batch
+        batchSize = isGPU ? 1024 : 512;
+      } else {
+        batchSize = isGPU ? 16384 : 4096;
+      }
+    } else {
+      // Если batchSize указан явно, используем его (но ограничиваем для маленьких датасетов)
+      if (nTrain < 100) {
+        batchSize = Math.min(64, batchSize);  // Максимум 64 для очень маленьких датасетов
+      } else if (nTrain < 1000) {
+        batchSize = isGPU 
+          ? Math.max(32, Math.min(256, batchSize))
+          : Math.max(16, Math.min(128, batchSize));
+      } else if (nTrain < 10000) {
+        batchSize = isGPU 
+          ? Math.max(512, Math.min(4096, batchSize))
+          : Math.max(256, Math.min(2048, batchSize));
+      } else {
+        batchSize = isGPU 
+          ? Math.max(8192, batchSize)
+          : Math.max(2048, Math.min(4096, batchSize));
+      }
+    }
+    
     // Отправляем старт сразу, чтобы клиент знал что запрос получен
     progressCb?.({ type: 'train.start', payload: { epochs, batchSize, nTrain, nVal } });
     
-    console.log('[Train] Ensuring model...');
+    console.log('[Train] Step 1: Ensuring model...');
     progressCb?.({ type: 'train.status', payload: { message: 'Инициализация модели...' } });
     const m = await ensureModel({ forceFresh: true });
+    console.log('[Train] Step 2: Model ensured, loading dataset...');
     
-    console.log('[Train] Loading dataset...');
     progressCb?.({ type: 'train.status', payload: { message: `Генерация датасета (${nTrain + nVal} игр)...` } });
-    const { xCells, xPos, yOneHot, xValCells, xValPos, yVal } = await loadDataset(nTrain, nVal);
+    // НЕ передаем progressCb в loadDataset - но добавим статус перед и после
+    console.log('[Train] Loading dataset...');
+    const { xCells, xPos, yOneHot, xValCells, xValPos, yVal } = await loadDataset(nTrain, nVal, null);
+    console.log('[Train] Dataset loaded, starting fit...');
     
-    console.log('[Train] Starting training...');
     progressCb?.({ type: 'train.status', payload: { message: 'Начало обучения...' } });
     
-    // Оптимизация для M2: используем shuffle для лучшего обучения и verbose для отладки
+    // Подаём тензоры целиком - Keras сам правильно разобьёт по батчам
+    // НЕ указываем stepsPerEpoch/validationSteps - они дают лишний оверхед
+    console.log(`[Train] Starting fit with epochs=${epochs}, batchSize=${batchSize}, data shape=${xCells.shape[0]}`);
     await m.fit([xCells, xPos], yOneHot, {
       epochs, 
-      batchSize,
-      shuffle: true, // Перемешивание данных улучшает обучение
+      batchSize, // Адаптивный batchSize (GPU: 8192-16384, CPU: 2048-4096)
+      shuffle: true,
       validationData: [[xValCells, xValPos], yVal],
-      verbose: 0, // Отключаем verbose для скорости (прогресс идёт через callbacks)
+      verbose: 0, // Без verbose для производительности
+      // НЕ указываем stepsPerEpoch - TensorFlow сам определит из размера тензоров
       callbacks: {
+        onTrainBegin: () => {
+          console.log('[Train] onTrainBegin called');
+          progressCb?.({ type: 'train.status', payload: { message: 'Обучение началось...' } });
+        },
+        onEpochBegin: (epoch) => {
+          console.log(`[Train] onEpochBegin called for epoch ${epoch + 1}/${epochs}`);
+          progressCb?.({ type: 'train.status', payload: { message: `Эпоха ${epoch + 1}/${epochs}...` } });
+        },
         onEpochEnd: (epoch, logs) => {
-          console.log(`[Train] Epoch ${epoch+1}/${epochs}, loss: ${logs.loss}, acc: ${logs.acc}`);
+          console.log(`[Train] onEpochEnd called for epoch ${epoch + 1}/${epochs}, logs:`, logs);
+          // Прогресс ТОЛЬКО в onEpochEnd - без промежуточных колбэков
           progressCb?.({ type:'train.progress',
             payload: {
               epoch: epoch+1, epochs,
@@ -93,21 +150,139 @@ export async function trainWithProgress(progressCb, { epochs=5, batchSize=256, n
             }});
         },
         onTrainEnd: () => {
-          console.log('[Train] Training completed');
+          console.log('[Train] onTrainEnd called');
           progressCb?.({ type:'train.done', payload:{ saved:true } });
         },
       }
     });
-    console.log('[Train] Saving model...');
     await m.save(`file://${_MODEL_DIR}`);
     xCells.dispose(); xPos.dispose(); yOneHot.dispose();
     xValCells.dispose(); xValPos.dispose(); yVal.dispose();
-    console.log('[Train] Done');
   } catch (e) {
     console.error('[Train] Error during training:', e);
     progressCb?.({ type: 'error', error: String(e) });
     throw e;
   }
+}
+
+// Загрузка TTT3 Transformer модели
+let ttt3Model = null;
+let ttt3ModelLoading = false;
+
+async function ensureTTT3Model() {
+  if (ttt3ModelLoading) {
+    while (ttt3ModelLoading) await new Promise(r => setTimeout(r, 25));
+    return ttt3Model;
+  }
+  
+  if (ttt3Model) return ttt3Model;
+  
+  ttt3ModelLoading = true;
+  try {
+    const ttt3ModelPath = path.join(_MODEL_DIR, 'ttt3_transformer', 'model.json');
+    const exists = await fs.stat(ttt3ModelPath).then(() => true).catch(() => false);
+    
+    if (exists) {
+      // Загружаем сохраненную модель
+      ttt3Model = await tf.loadLayersModel(`file://${ttt3ModelPath}`);
+      // Компилируем для инференса (не нужен оптимизатор, но нужны входы/выходы)
+      console.log('[PredictTTT3] Loaded TTT3 Transformer model from', ttt3ModelPath);
+      console.log('[PredictTTT3] Model inputs:', ttt3Model.inputs.map(i => i.shape));
+      console.log('[PredictTTT3] Model outputs:', ttt3Model.outputs.map(o => o.shape));
+    } else {
+      console.log('[PredictTTT3] TTT3 Transformer model not found at', ttt3ModelPath);
+    }
+  } catch (e) {
+    console.error('[PredictTTT3] Error loading model:', e);
+  } finally {
+    ttt3ModelLoading = false;
+  }
+  
+  return ttt3Model;
+}
+
+// Предсказание для TTT3 (3x3) с использованием Transformer модели
+async function predictTTT3Move({ board, current = 1 }) {
+  const { encodePlanes, maskLegalMoves, legalMoves } = await import('./src/game_ttt3.mjs');
+  const { maskLogits } = await import('./src/model_pv_transformer_seq.mjs');
+  const { safePick } = await import('./src/safety.mjs');
+  
+  // Проверяем, что доска правильного размера
+  if (board.length !== 9) {
+    throw new Error(`Invalid board size: expected 9, got ${board.length}`);
+  }
+  
+  // Проверяем, есть ли обученная модель
+  const model = await ensureTTT3Model();
+  
+  if (!model) {
+    // Если модели нет - используем minimax как fallback
+    const { getTeacherValueAndPolicy } = await import('./src/ttt3_minimax.mjs');
+    const { value, policy } = getTeacherValueAndPolicy(
+      new Int8Array(board), 
+      current === 1 ? 1 : -1
+    );
+    
+    const moves = legalMoves(new Int8Array(board));
+    if (moves.length === 0) {
+      return { move: -1, probs: Array(9).fill(0), isRandom: false, mode: 'model', fallback: 'minimax' };
+    }
+    
+    // Применяем safety-правила
+    const move = safePick(new Int8Array(board), current === 1 ? 1 : -1, Array.from(policy));
+    return { 
+      move, 
+      probs: Array.from(policy), 
+      value, 
+      isRandom: false, 
+      mode: 'model', 
+      fallback: 'minimax' 
+    };
+  }
+  
+  // Используем обученную модель
+  const player = current === 1 ? 1 : -1; // Преобразуем 1/2 в 1/-1
+  const planes = encodePlanes(new Int8Array(board), player);
+  const mask = maskLegalMoves(new Int8Array(board));
+  
+  // Создаем тензоры в правильном формате
+  const xFlat = Array.from(planes);
+  const x = tf.tensor3d(xFlat, [1, 9, 3]);
+  const pos = tf.tensor2d([[0, 1, 2, 3, 4, 5, 6, 7, 8]], [1, 9], 'int32');
+  
+  // Предсказание
+  const [logits, valueTensor] = model.predict([x, pos]);
+  const maskedLogits = maskLogits(logits, tf.tensor2d([Array.from(mask)], [1, 9]));
+  const probs = tf.softmax(maskedLogits);
+  
+  const policyArray = Array.from(await probs.data());
+  const value = (await valueTensor.data())[0];
+  
+  // Очистка памяти
+  x.dispose();
+  pos.dispose();
+  logits.dispose();
+  maskedLogits.dispose();
+  probs.dispose();
+  valueTensor.dispose();
+  
+  // Применяем safety-правила
+  const moves = legalMoves(new Int8Array(board));
+  if (moves.length === 0) {
+    return { move: -1, probs: Array(9).fill(0), value, isRandom: false, mode: 'model' };
+  }
+  
+  const move = safePick(new Int8Array(board), player, policyArray);
+  
+  console.log('[PredictTTT3] Move:', move, 'Value:', value.toFixed(4), 'Policy max:', Math.max(...policyArray).toFixed(4));
+  
+  return { 
+    move, 
+    probs: policyArray, 
+    value, 
+    isRandom: false, 
+    mode: 'model' 
+  };
 }
 
 export async function predictMove({ board, current = 1, mode = 'model' }) {
@@ -125,7 +300,17 @@ export async function predictMove({ board, current = 1, mode = 'model' }) {
     return { move: bestMove, probs, mode: 'algorithm' };
   }
   
-  // Режим модели: проверяем, есть ли обученная модель
+  // Для досок 3x3 используем TTT3 Transformer
+  if (board.length === 9) {
+    try {
+      return await predictTTT3Move({ board, current });
+    } catch (e) {
+      console.error('[Predict] Error in TTT3 prediction, falling back to old model:', e);
+      // Fallback к старой логике
+    }
+  }
+  
+  // Режим модели для других размеров досок: проверяем, есть ли обученная модель
   const hasModel = await hasTrainedModel();
   
   if (!hasModel) {
@@ -140,15 +325,15 @@ export async function predictMove({ board, current = 1, mode = 'model' }) {
     return { move: randomMove, probs: Array(9).fill(1/9), isRandom: true, mode: 'model' };
   }
   
-  // Используем обученную модель
+  // Используем обученную модель (для больших досок)
   const m = await ensureModel();
   const rel = relativeCells(board, current);
-  const xCells = tf.tensor2d([rel], [1, 9], 'int32');
-  const pos = tf.tensor2d([Array.from({length:9}, (_,i)=>i)], [1, 9], 'int32');
+  const L = board.length; const xCells = tf.tensor2d([rel], [1, L], 'int32');
+  const pos = tf.tensor2d([Array.from({length:board.length}, (_,i)=>i)], [1, board.length], 'int32');
   const probs = m.predict([xCells, pos]);
   const pa = await probs.data();
   xCells.dispose(); pos.dispose(); probs.dispose();
-  const moves = []; for (let i=0;i<9;i++) if (board[i]===0) moves.push(i);
+  const moves = []; for (let i=0;i<board.length;i++) if (board[i]===0) moves.push(i);
   let best=-1, bestv=-1; for (const mm of moves) if (pa[mm]>bestv){ best=mm; bestv=pa[mm]; }
   console.log('[Predict] Using trained model, move:', best);
   return { move: best, probs: Array.from(pa), isRandom: false, mode: 'model' };
@@ -406,7 +591,7 @@ export function getGameHistoryStats() {
 }
 
 // Дообучение модели на реальных играх
-export async function trainOnGames(progressCb, { epochs = 5, batchSize = 32, focusOnErrors = true } = {}) {
+export async function trainOnGames(progressCb, { epochs = 5, batchSize = 128, focusOnErrors = true } = {}) {
   try {
     if (gameHistory.length < 10) {
       throw new Error(`Недостаточно данных для обучения. Нужно минимум 10 ходов, есть ${gameHistory.length}`);
@@ -474,6 +659,12 @@ export async function trainOnGames(progressCb, { epochs = 5, batchSize = 32, foc
     progressCb?.({ type: 'error', error: String(e) });
     throw e;
   }
+}
+
+// Обучение TTT3 Transformer
+export async function trainTTT3WithProgress(progressCb, { epochs, batchSize, earlyStop = true } = {}) {
+  const { trainTTT3WithProgress: trainTTT3 } = await import('./src/train_ttt3_transformer_service.mjs');
+  return await trainTTT3(progressCb, { epochs, batchSize, earlyStop });
 }
 
 export async function clearModel() {

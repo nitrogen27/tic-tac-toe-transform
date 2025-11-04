@@ -1,0 +1,32 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: tic-tac-toe-server
+    ports:
+      - "8080:8080"
+    volumes:
+      # Монтируем директорию для сохранения моделей
+      - ./server/saved:/app/server/saved
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: tic-tac-toe-client
+    ports:
+      - "5173:5173"
+    volumes:
+      # Монтируем исходный код для hot-reload (опционально)
+      - ./client:/app/client
+      - /app/client/node_modules
+    environment:
+      - VITE_WS_URL=ws://localhost:8080
+    depends_on:
+      - server
+    restart: unless-stopped
+

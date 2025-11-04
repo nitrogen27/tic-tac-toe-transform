@@ -5,10 +5,17 @@
   "private": true,
   "scripts": {
     "start": "node server.mjs",
-    "test": "node -e \"console.log('ok')\""
+    "test": "node -e \"console.log('ok')\"",
+    "test:train": "vitest run tests/train_ttt3_full_cycle.test.mjs",
+    "test:e2e": "vitest run tests/e2e_train_ttt3_websocket.test.mjs",
+    "test:all": "vitest run tests/"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.6",
+    "ws": "^8.18.3"
   },
   "dependencies": {
-    "@tensorflow/tfjs-node": "4.12.0",
-    "ws": "^8.18.0"
+    "@tensorflow/tfjs-node": "^4.22.0",
+    "@tensorflow/tfjs-node-gpu": "^4.22.0"
   }
 }

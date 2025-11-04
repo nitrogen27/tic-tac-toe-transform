@@ -10,9 +10,29 @@
   "scripts": {
     "server": "npm run -w server start",
     "client": "npm run -w client dev",
-    "start": "concurrently -n server,client -c green,blue \"npm:server\" \"npm:client\""
+    "start": "concurrently -n server,client -c green,blue \"npm:server\" \"npm:client\"",
+    "dev": "npm start",
+    "stop": "node scripts/stop-all.js",
+    "restart": "node scripts/restart-all.js",
+    "docker:up": "docker-compose -f docker-compose.gpu.yml up -d --build",
+    "docker:up:gpu-fallback": "bash docker-gpu-up.sh",
+    "docker:down": "docker stop tic-tac-toe-server 2>/dev/null; docker rm tic-tac-toe-server 2>/dev/null; docker-compose -f docker-compose.gpu.yml down",
+    "docker:stop": "docker stop tic-tac-toe-server 2>/dev/null; docker-compose -f docker-compose.gpu.yml stop",
+    "docker:start": "docker start tic-tac-toe-server 2>/dev/null; docker-compose -f docker-compose.gpu.yml start",
+    "docker:restart": "docker restart tic-tac-toe-server 2>/dev/null; docker-compose -f docker-compose.gpu.yml restart",
+    "docker:logs": "docker-compose -f docker-compose.gpu.yml logs -f",
+    "docker:logs:server": "docker logs -f tic-tac-toe-server",
+    "docker:logs:client": "docker-compose -f docker-compose.gpu.yml logs -f client",
+    "docker:ps": "docker-compose -f docker-compose.gpu.yml ps",
+    "docker:up:cpu": "docker-compose -f docker-compose.yml up -d --build",
+    "docker:logs:cpu": "docker-compose -f docker-compose.yml logs -f",
+    "benchmark": "node server/benchmark.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.0.0"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node": "^4.22.0",
+    "@tensorflow/tfjs-node-gpu": "^4.22.0"
   }
 }
