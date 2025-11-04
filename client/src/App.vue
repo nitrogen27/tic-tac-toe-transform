@@ -170,6 +170,9 @@
         <button v-if="gameType === 'auto' && !autoPlaying && !gameOver" @click="startAutoGame">Начать игру</button>
         <button v-if="autoPlaying" @click="stopAutoGame">Остановить</button>
         <span class="status" :class="{ 'game-over': gameOver }">{{ status }}</span>
+        <span v-if="modelConfidence !== null && modelConfidence !== undefined && (gameMode === 'model' || (gameType === 'auto' && current === 1))" class="confidence-indicator" :class="getConfidenceClass(modelConfidence)">
+          Уверенность: {{ (modelConfidence * 100).toFixed(1) }}%
+        </span>
       </div>
     </section>
   </div>
@@ -195,8 +198,8 @@ let autoGameInterval = null
 const historyCount = ref(0) // Количество сохраненных ходов
 const autoTrainAfterGame = ref(false) // Автоматическое дообучение после игры
 // Настройки основного обучения
-const mainTrainingEpochs = ref(1) // Количество эпох для основного обучения
-const mainTrainingBatchSize = ref(4096) // Размер батча для основного обучения
+const mainTrainingEpochs = ref(5) // Количество эпох для основного обучения (оптимизировано для качества)
+const mainTrainingBatchSize = ref(2048) // Размер батча для основного обучения (оптимизировано для баланса)
 // Настройки дообучения
 const trainingEpochs = ref(1) // Количество эпох при дообучении
 const incrementalBatchSize = ref(256) // Размер батча для дообучения
@@ -315,6 +318,7 @@ const gpuAvailable = ref(false)
 const gpuBackend = ref('')
 const datasetProgress = ref(null)
 const backgroundProgress = ref(null) // Прогресс фонового обучения
+const modelConfidence = ref(null) // Уверенность модели (0-1)
 
 function connectWS() {
   // Предотвращаем множественные попытки подключения
@@ -509,6 +513,32 @@ function connectWS() {
           console.log('[WS] Received predict.result, resetting waiting')
           waiting.value = false
           const move = msg.payload.move
+          
+          // Обновляем уверенность модели
+          console.log('[WS] Predict result payload:', { 
+            mode: msg.payload.mode, 
+            confidence: msg.payload.confidence, 
+            hasProbs: !!msg.payload.probs,
+            isRandom: msg.payload.isRandom,
+            currentValue: current.value,
+            gameType: gameType.value,
+            gameMode: gameMode.value
+          })
+          
+          if (msg.payload.mode === 'model' && !msg.payload.isRandom && msg.payload.confidence !== undefined && msg.payload.confidence !== null) {
+            // Уверенность приходит как число от сервера
+            modelConfidence.value = typeof msg.payload.confidence === 'number' ? msg.payload.confidence : parseFloat(msg.payload.confidence)
+            console.log('[WS] ✓ Model confidence set to:', modelConfidence.value, '(', (modelConfidence.value * 100).toFixed(1), '%)')
+          } else if (msg.payload.mode === 'model' && !msg.payload.isRandom && msg.payload.probs && Array.isArray(msg.payload.probs)) {
+            // Вычисляем уверенность как максимальную вероятность если confidence нет
+            const maxProb = Math.max(...msg.payload.probs)
+            modelConfidence.value = maxProb
+            console.log('[WS] ✓ Model confidence computed from probs:', modelConfidence.value, '(', (modelConfidence.value * 100).toFixed(1), '%)')
+          } else {
+            // Для minimax или случайных ходов - скрываем индикатор
+            modelConfidence.value = null
+            console.log('[WS] ✗ No confidence (mode:', msg.payload.mode, 'isRandom:', msg.payload.isRandom, ')')
+          }
           
           // Проверяем, что игра еще не закончилась (может быть состояние изменилось)
           if (gameOver.value) {
@@ -751,8 +781,17 @@ function reset() {
   status.value = gameType.value === 'auto' ? 'Готово к игре' : 'Ваш ход (X)'
   gameOver.value = false
   waiting.value = false // Сбрасываем флаг ожидания
+  modelConfidence.value = null // Сбрасываем уверенность
   currentGameMoves = []
   currentGameId = null
+}
+
+// Определяет класс CSS для уверенности модели
+function getConfidenceClass(confidence) {
+  if (confidence === null || confidence === undefined) return 'confidence-unknown'
+  if (confidence >= 0.7) return 'confidence-high' // Зеленый - высокая уверенность
+  if (confidence >= 0.4) return 'confidence-medium' // Желтый - средняя уверенность
+  return 'confidence-low' // Красный - низкая уверенность
 }
 
 function saveMove(board, move, currentPlayer) {
@@ -1108,6 +1147,31 @@ onMounted(() => {
   font-weight: bold; 
   font-size: 1.1em;
   opacity: 1;
+}
+.confidence-indicator { 
+  display: inline-block; 
+  padding: 4px 12px; 
+  border-radius: 12px; 
+  font-size: 0.85em; 
+  font-weight: 500;
+  margin-left: 8px;
+  transition: all 0.3s ease;
+}
+.confidence-high { 
+  background-color: #4caf50; 
+  color: white; 
+}
+.confidence-medium { 
+  background-color: #ffc107; 
+  color: #333; 
+}
+.confidence-low { 
+  background-color: #f44336; 
+  color: white; 
+}
+.confidence-unknown { 
+  background-color: #9e9e9e; 
+  color: white; 
 }
 .gpu-status {
   display: flex;

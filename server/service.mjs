@@ -343,13 +343,21 @@ async function predictTTT3Move({ board, current = 1 }) {
   }
   
   console.log('[PredictTTT3] Final move:', move);
+  console.log('[PredictTTT3] Model confidence:', {
+    maxProb: policyMax.toFixed(4),
+    maxProbIdx: policyMaxIdx,
+    value: value.toFixed(4),
+    move: move,
+    safetyOverride: wasChangedBySafety
+  });
   
   return { 
     move, 
     probs: policyArray, 
     value, 
     isRandom: false, 
-    mode: 'model' 
+    mode: 'model',
+    confidence: policyMax // Отправляем как число, а не строку
   };
 }
 

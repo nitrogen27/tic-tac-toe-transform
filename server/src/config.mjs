@@ -9,8 +9,8 @@ export const TRANSFORMER_CFG = {
   dropout: 0.0                          // Dropout (0.0 = без dropout)
 };
 export const TRAIN = {
-  batchSize: 4096,                      // Размер батча (оптимизировано для быстрого обучения)
-  epochs: 1,                            // Количество эпох (оптимизировано для быстрого обучения)
+  batchSize: 2048,                      // Размер батча (оптимизировано для баланса скорости и качества)
+  epochs: 5,                             // Количество эпох (оптимизировано для качества игры без ошибок)
   lr: 5e-4,                             // Learning rate
   weightValue: 0.5                       // Вес value loss относительно policy loss
 };

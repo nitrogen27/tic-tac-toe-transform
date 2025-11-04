@@ -105,10 +105,14 @@ export async function trainTTT3WithProgress(progressCb, {
   earlyStop = true 
 } = {}) {
   try {
-    // Убеждаемся, что epochs не больше 2
-    if (epochs > 2) {
-      console.warn(`[TrainTTT3] WARNING: epochs=${epochs} is too high, using 2 instead`);
-      epochs = 2;
+    // Валидируем epochs: максимум 10 (ограничение уже применено в server.mjs)
+    if (epochs > 10) {
+      console.warn(`[TrainTTT3] WARNING: epochs=${epochs} exceeds maximum of 10, using 10 instead`);
+      epochs = 10;
+    }
+    if (epochs < 1) {
+      console.warn(`[TrainTTT3] WARNING: epochs=${epochs} is less than 1, using 1 instead`);
+      epochs = 1;
     }
     console.log('[TrainTTT3] Starting training...');
     console.log('[TrainTTT3] Config:', { epochs, batchSize, ...TRANSFORMER_CFG });
