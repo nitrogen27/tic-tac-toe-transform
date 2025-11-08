@@ -1,5 +1,4 @@
-# Tic-Tac-Toe Transformer Fullstack (M2 Optimized)
-
+# Tic-Tac-Toe Transformer Fullstack
 A full-featured tic-tac-toe application that uses a Transformer model powered by TensorFlow.js.
 
 ## Key Features
