@@ -1,168 +1,168 @@
 # Tic-Tac-Toe Transformer Fullstack (M2 Optimized)
 
-Полнофункциональное приложение для игры в крестики-нолики с использованием Transformer модели на TensorFlow.js.
+A full-featured tic-tac-toe application that uses a Transformer model powered by TensorFlow.js.
 
-## Особенности
+## Key Features
 
-- 🤖 **Transformer модель** на TensorFlow.js для обучения игры
-- 🚀 **Оптимизировано для Apple M2** процессоров
-- 🎮 **Два режима игры**: против модели или против алгоритма minimax
-- 🤖 **Автоматический режим**: модель играет против бота
-- 🔄 **WebSocket** коммуникация для обучения и предсказаний
-- 📊 **Визуальный прогресс** обучения с детальной статистикой
+- 🤖 **Transformer model** built with TensorFlow.js that learns how to play.
+- 🚀 **Optimized for Apple M2** processors.
+- 🎮 **Two opponent modes**: the ML model or a minimax algorithm.
+- 🤖 **Autoplay mode** where the model competes against the bot.
+- 🔄 **WebSocket communication** for live training and inference.
+- 📊 **Training dashboard** with detailed statistics.
 
-## Технологии
+## Tech Stack
 
-- **Frontend**: Vue.js 3, Vite
-- **Backend**: Node.js, WebSocket (ws)
-- **ML**: TensorFlow.js (Node.js backend)
-- **Оптимизация**: Worker threads для генерации датасета
+- **Frontend**: Vue.js 3, Vite.
+- **Backend**: Node.js, WebSocket (`ws`).
+- **Machine Learning**: TensorFlow.js (Node.js backend).
+- **Performance**: Worker threads for dataset generation.
 
-## Установка
+## Installation
 
-### Вариант 1: Docker (рекомендуется) 🐳
+### Option 1: Docker (recommended) 🐳
 
-Самый простой способ запустить проект без проблем с зависимостями:
+The easiest way to run the project without dependency issues.
 
-## Быстрый старт
+## Quick Start
 
-### ⚠️ Важно: GPU vs CPU режим
+### ⚠️ Important: GPU vs CPU mode
 
-**`npm start`** запускает проект **локально** (CPU режим) - GPU недоступен без Docker.
+**`npm start`** runs the project **locally** (CPU mode). GPU acceleration is unavailable without Docker.
 
-**Для GPU режима** используйте:
+**For GPU mode** use:
 ```bash
 npm run docker:up
-# или
+# or
 npm run start:gpu
 ```
 
-### Локальный запуск (CPU режим)
+### Local run (CPU mode)
 
 ```bash
-# Установка зависимостей (первый раз)
+# Install dependencies (first time)
 npm install
 
-# Запуск всего проекта локально (CPU)
+# Start the entire project locally (CPU)
 npm start
 
-# Остановка всех процессов и контейнеров
+# Stop all processes and containers
 npm stop
 
-# Перезапуск проекта
+# Restart the project
 npm restart
 ```
 
-Это запустит:
-- Сервер на порту 8080 (WebSocket) - **CPU режим**  
-- Клиент на порту 5173 (Vite dev server)
+This spins up:
+- Server on port 8080 (WebSocket) — **CPU mode**  
+- Client on port 5173 (Vite dev server)
 
-**Примечание:** 
-- `npm start` - локальный запуск, **только CPU**
-- `npm run docker:up` или `npm run start:gpu` - запуск в Docker с **GPU поддержкой**
-- `npm stop` останавливает все Docker контейнеры и локальные процессы проекта
-- `npm restart` останавливает всё и запускает заново
+**Notes:** 
+- `npm start` — local launch, **CPU only**
+- `npm run docker:up` or `npm run start:gpu` — Docker launch with **GPU support**
+- `npm stop` stops every Docker container and local process related to the project
+- `npm restart` stops everything and starts it again
 
-### Docker запуск
+### Docker run
 
 ```bash
-# Убедитесь, что Docker Desktop запущен
+# Make sure Docker Desktop is running
 docker ps
 
-# GPU версия (требует NVIDIA GPU и nvidia-container-toolkit)
+# GPU build (requires NVIDIA GPU and nvidia-container-toolkit)
 docker-compose -f docker-compose.gpu.yml up --build
 
-# Или CPU версия
+# Or CPU build
 docker-compose up --build
 ```
 
-После запуска:
-- Сервер: `ws://localhost:8080` (WebSocket)
-- Клиент: `http://localhost:5173`
+Services will be available at:
+- Server: `ws://localhost:8080` (WebSocket)
+- Client: `http://localhost:5173`
 
-Подробнее: [QUICK_DOCKER_START.md](QUICK_DOCKER_START.md) или [DOCKER_SETUP.md](DOCKER_SETUP.md)
+See also: [QUICK_DOCKER_START.md](QUICK_DOCKER_START.md) or [DOCKER_SETUP.md](DOCKER_SETUP.md)
 
-## Проверка GPU
+## Verifying GPU usage
 
-При запуске сервера проверьте логи:
+Check server logs on startup:
 ```
 [TFJS] Using tfjs-node-gpu backend (CUDA support)
 [TFJS] Backend: tensorflow (gpu)
 [TrainTTT3] GPU acceleration: ENABLED ✓
 ```
 
-Если GPU недоступен:
+If GPU is unavailable:
 ```
 [TFJS] WARNING: Backend is not GPU! Check NVIDIA/CUDA/cuDNN installation.
 [TrainTTT3] GPU acceleration: DISABLED ✗
 ```
 
-**Все операции TensorFlow.js автоматически выполняются на GPU при использовании `@tensorflow/tfjs-node-gpu`** - тензоры, model.fit(), model.predict() и все операции размещаются на GPU автоматически.
+**All TensorFlow.js operations automatically run on the GPU when `@tensorflow/tfjs-node-gpu` is available**, including tensors, `model.fit()`, and `model.predict()`.
 
-### Вариант 2: Локальная установка
+### Option 2: Local installation
 
-#### Требования
+#### Requirements
 
-- **Node.js v18.x или v20.x** (LTS версии)
-- **Visual Studio Build Tools 2022** с компонентом "Desktop development with C++" (для Windows)
-- **CUDA Toolkit** (опционально, для GPU/CUDA поддержки)
+- **Node.js v18.x or v20.x** (LTS releases)
+- **Visual Studio Build Tools 2022** with the “Desktop development with C++” workload (Windows)
+- **CUDA Toolkit** (optional, for GPU/CUDA support)
 
 ```bash
-# Установка зависимостей
+# Install dependencies
 npm install
 
-# Запуск сервера и клиента одновременно
+# Start server and client together
 npm start
 
-# Или отдельно:
-npm run server  # Сервер на ws://localhost:8080
-npm run client  # Клиент на http://localhost:5173
+# Or separately:
+npm run server  # Server at ws://localhost:8080
+npm run client  # Client at http://localhost:5173
 ```
 
-**Примечание:** Если возникают проблемы с установкой TensorFlow.js на Windows, используйте Docker (Вариант 1).
+**Tip:** Switch to the Docker option if installing TensorFlow.js on Windows causes issues.
 
-### Поддержка CPU и GPU
+### CPU and GPU support
 
-Проект автоматически определяет и использует:
-- **CPU (x86_64)** - через `@tensorflow/tfjs-node`
-- **CUDA GPU** - через `@tensorflow/tfjs-node-gpu` (если доступен)
+The project automatically detects and uses:
+- **CPU (x86_64)** via `@tensorflow/tfjs-node`
+- **CUDA GPU** via `@tensorflow/tfjs-node-gpu` (if available)
 
-При запуске сервера проверьте логи для определения используемого backend.
+Inspect the server logs to confirm the backend that is active.
 
-## Использование
+## Usage
 
-1. **Обучение модели**: Нажмите кнопку "Обучить" для обучения модели с нуля
-2. **Очистка модели**: Используйте "Очистить модель" чтобы удалить сохраненную модель
-3. **Режим игры**: Выберите между "Модель" и "Алгоритм" для выбора противника
-4. **Автоматическая игра**: Включите режим "Автоматическая игра" для наблюдения за игрой модели против бота
+1. **Train the model** — press “Train” to start from scratch.
+2. **Reset the model** — use “Clear Model” to delete the saved state.
+3. **Choose opponent** — switch between “Model” and “Algorithm”.
+4. **Autoplay** — enable “Auto Play” to watch the model play against the bot.
 
-## Структура проекта
+## Project structure
 
 ```
 .
-├── client/          # Vue.js фронтенд
+├── client/          # Vue.js frontend
 │   ├── src/
-│   │   ├── App.vue  # Основной компонент
+│   │   ├── App.vue   # Root component
 │   │   └── main.js
 │   └── package.json
-├── server/          # Node.js бэкенд
+├── server/          # Node.js backend
 │   ├── src/
-│   │   ├── model_transformer.mjs  # Transformer модель
-│   │   ├── dataset.mjs            # Генерация датасета
-│   │   ├── tic_tac_toe.mjs         # Логика игры и minimax
-│   │   └── tf.mjs                  # TensorFlow.js настройка
-│   ├── server.mjs   # WebSocket сервер
-│   └── service.mjs  # Бизнес-логика
+│   │   ├── model_transformer.mjs  # Transformer model
+│   │   ├── dataset.mjs            # Dataset generation
+│   │   ├── tic_tac_toe.mjs        # Game logic and minimax
+│   │   └── tf.mjs                 # TensorFlow.js setup
+│   ├── server.mjs   # WebSocket server
+│   └── service.mjs  # Business logic
 └── package.json
 ```
 
-## Оптимизации для M2
+## M2 optimizations
 
-- Параллельная генерация датасета через worker threads
-- Alpha-beta pruning в алгоритме minimax
-- Оптимизированный batch size и TensorFlow.js настройки
-- Нативные биндинги TensorFlow для ускорения
+- Dataset generation in parallel via worker threads.
+- Alpha-beta pruning in the minimax algorithm.
+- Tuned batch size and TensorFlow.js settings.
+- Native TensorFlow bindings for extra performance.
 
-## Лицензия
+## License
 
-Проект распространяется на условиях лицензии [MIT](LICENSE). Вы можете свободно использовать, модифицировать и распространять код при сохранении уведомления об авторских правах и текста лицензии.
+Distributed under the [MIT License](LICENSE). You may use, copy, modify, and distribute the code as long as you retain the copyright notice and license text.
