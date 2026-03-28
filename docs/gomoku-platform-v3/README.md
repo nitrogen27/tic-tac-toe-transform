@@ -96,13 +96,26 @@ Full PyTorch training pipeline scaffolded and tested.
 
 **Status: SCAFFOLDED** — engine_adapter subprocess stub ready, routes defined.
 
+Осталось: реализовать `call_engine()`, роутеры `/analyze`, `/best-move`, `/suggest`, job queue.
+Подробно: [MVP_ROADMAP.md → Phase 4](MVP_ROADMAP.md#-phase-4--fastapi-gateway)
+
 ### 🔲 Phase 5 — Web MVP (React + TypeScript)
 
 **Status: SCAFFOLDED** — Vite + React 18 + Tailwind project, SVG board component ready.
 
+Осталось: API client, Board SVG логика кликов, Analysis sidebar, Game state hooks.
+Подробно: [MVP_ROADMAP.md → Phase 5](MVP_ROADMAP.md#-phase-5--web-mvp-react--typescript)
+
 ### 🔲 Phase 6 — Self-Play Pipeline
 
 **Status: SKELETON** — player.py, replay_buffer.py, pipeline.py stubs in place.
+
+Осталось: MCTS player с батчингом, replay buffer с сохранением, generate→train→eval loop.
+Подробно: [MVP_ROADMAP.md → Phase 6](MVP_ROADMAP.md#-phase-6--self-play-pipeline)
+
+---
+
+> 📋 Полный план оставшейся работы: **[MVP_ROADMAP.md](MVP_ROADMAP.md)**
 
 ---
 
