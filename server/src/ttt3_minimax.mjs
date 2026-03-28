@@ -171,21 +171,24 @@ export function* teacherBatches({ batchSize = 512 }) {
   const cache = new Map();
   const visited = new Set();
   
-  // Генерируем все достижимые позиции
+  // Генерируем все достижимые НЕтерминальные позиции
+  // (терминальные позиции имеют пустую policy → портят CE loss)
   function* generatePositions(board, player, depth = 0) {
     const canonKey = normalize(board);
     if (visited.has(canonKey)) return;
     visited.add(canonKey);
-    
-    yield { board: cloneBoard(board), player };
-    
+
     if (!isTerminal(board)) {
+      // Yield только нетерминальные позиции (где есть ходы)
+      yield { board: cloneBoard(board), player };
+
       const moves = legalMoves(board);
       for (const move of moves) {
         const newBoard = applyMove(board, move, player);
         yield* generatePositions(newBoard, -player, depth + 1);
       }
     }
+    // Терминальные позиции пропускаем — у них нет ходов
   }
   
   // Собираем все позиции

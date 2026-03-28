@@ -1,6 +1,6 @@
 <template>
   <div class="container">
-    <h1>Трансформер для крестики-нолики 3×3</h1>
+    <h1>Трансформер для крестики-нолики {{ variant === 'ttt5' ? '5×5' : '3×3' }}</h1>
 
     <section class="panel">
       <h2>Тренировка</h2>
@@ -30,22 +30,50 @@
         </div>
         <div class="training-settings">
           <h3>Настройки основного обучения</h3>
-          <div class="setting-row">
-            <label>
-              <span>Количество эпох:</span>
-              <input type="number" v-model.number="mainTrainingEpochs" min="1" max="10" step="1" :disabled="training || clearing" @blur="validateMainTrainingEpochs" @input="validateMainTrainingEpochs" />
-            </label>
-            <span v-if="validationErrors.mainTrainingEpochs" class="validation-error">{{ validationErrors.mainTrainingEpochs }}</span>
+          <!-- Presets -->
+          <div class="preset-row">
+            <button class="preset-btn" :class="{ active: activePreset === 'light' }" :disabled="training || clearing" @click="applyPreset('light')">
+              <span class="preset-icon">⚡</span>
+              <span class="preset-name">Лёгкое</span>
+              <span class="preset-time">~2 мин</span>
+            </button>
+            <button class="preset-btn" :class="{ active: activePreset === 'medium' }" :disabled="training || clearing" @click="applyPreset('medium')">
+              <span class="preset-icon">⚙️</span>
+              <span class="preset-name">Среднее</span>
+              <span class="preset-time">~5 мин</span>
+            </button>
+            <button class="preset-btn" :class="{ active: activePreset === 'deep' }" :disabled="training || clearing" @click="applyPreset('deep')">
+              <span class="preset-icon">🧠</span>
+              <span class="preset-name">Глубокое</span>
+              <span class="preset-time">~15 мин</span>
+            </button>
+            <button class="preset-btn preset-custom" :class="{ active: activePreset === 'custom' }" :disabled="training || clearing" @click="activePreset = 'custom'">
+              <span class="preset-icon">🔧</span>
+              <span class="preset-name">Своё</span>
+            </button>
           </div>
-          <div class="setting-row">
-            <label>
-              <span>Размер батча:</span>
-              <input type="number" v-model.number="mainTrainingBatchSize" min="128" max="4096" step="128" :disabled="training || clearing" @blur="validateMainTrainingBatchSize" @input="validateMainTrainingBatchSize" />
-            </label>
-            <span v-if="validationErrors.mainTrainingBatchSize" class="validation-error">{{ validationErrors.mainTrainingBatchSize }}</span>
+          <!-- Custom settings (always visible but collapsed unless custom) -->
+          <div v-if="activePreset === 'custom'" class="custom-settings">
+            <div class="setting-row">
+              <label>
+                <span>Количество эпох:</span>
+                <input type="number" v-model.number="mainTrainingEpochs" min="1" max="50" step="1" :disabled="training || clearing" @blur="validateMainTrainingEpochs" @input="validateMainTrainingEpochs" />
+              </label>
+              <span v-if="validationErrors.mainTrainingEpochs" class="validation-error">{{ validationErrors.mainTrainingEpochs }}</span>
+            </div>
+            <div class="setting-row">
+              <label>
+                <span>Размер батча:</span>
+                <input type="number" v-model.number="mainTrainingBatchSize" min="32" max="4096" step="32" :disabled="training || clearing" @blur="validateMainTrainingBatchSize" @input="validateMainTrainingBatchSize" />
+              </label>
+              <span v-if="validationErrors.mainTrainingBatchSize" class="validation-error">{{ validationErrors.mainTrainingBatchSize }}</span>
+            </div>
+            <div class="setting-hint">
+              <small>Больше батч = быстрее, но больше памяти GPU</small>
+            </div>
           </div>
-          <div class="setting-hint">
-            <small>Больше батч = быстрее, но больше памяти GPU</small>
+          <div v-else class="preset-summary">
+            <small>{{ presetDescription }}</small>
           </div>
         </div>
         <div class="training-settings">
@@ -93,14 +121,100 @@
             {{ datasetProgress.message || 'Объединение тензоров на GPU...' }}
           </div>
         </div>
-        <!-- Прогресс обучения -->
-        <div class="progress" v-if="progress && !datasetProgress && !backgroundProgress">
+        <!-- TTT5 Interactive Training Panel -->
+        <div v-if="training && ttt5Progress && ttt5Progress.phase && !datasetProgress && !backgroundProgress" class="ttt5-training-panel">
+          <!-- Phase badges -->
+          <div class="phase-badges">
+            <span class="phase-badge"
+                  :class="{
+                    'phase-completed': ttt5Progress.completedPhases && ttt5Progress.completedPhases.includes('tactical'),
+                    'phase-active': ttt5Progress.phase === 'tactical',
+                    'phase-pending': !ttt5Progress.completedPhases?.includes('tactical') && ttt5Progress.phase !== 'tactical'
+                  }">
+              {{ ttt5Progress.completedPhases?.includes('tactical') ? '\u2713 ' : '' }}Tactical
+            </span>
+            <span class="phase-badge"
+                  :class="{
+                    'phase-completed': ttt5Progress.completedPhases && ttt5Progress.completedPhases.includes('bootstrap'),
+                    'phase-active': ttt5Progress.phase === 'bootstrap',
+                    'phase-pending': !ttt5Progress.completedPhases?.includes('bootstrap') && ttt5Progress.phase !== 'bootstrap'
+                  }">
+              {{ ttt5Progress.completedPhases?.includes('bootstrap') ? '\u2713 ' : '' }}Bootstrap
+            </span>
+            <span v-for="i in (ttt5Progress.totalIterations || 1)" :key="'mcts'+i"
+                  class="phase-badge"
+                  :class="{
+                    'phase-completed': ttt5Progress.phase === 'mcts' && ttt5Progress.iteration > i || (ttt5Progress.phase === 'mcts_game' && ttt5Progress.iteration > i) || (ttt5Progress.phase === 'mcts_train' && ttt5Progress.iteration > i),
+                    'phase-active': (ttt5Progress.phase === 'mcts' || ttt5Progress.phase === 'mcts_game' || ttt5Progress.phase === 'mcts_train') && ttt5Progress.iteration === i,
+                    'phase-pending': (!['mcts','mcts_game','mcts_train'].includes(ttt5Progress.phase)) || ttt5Progress.iteration < i,
+                  }">
+              MCTS {{ i }}
+            </span>
+          </div>
+
+          <!-- Overall progress bar -->
+          <div class="progress">
+            <div class="bar ttt5-bar" :style="{ width: (ttt5Progress.percent || 0) + '%' }"></div>
+          </div>
+
+          <!-- Counters row -->
+          <div class="training-counters">
+            <div class="counter" v-if="ttt5Progress.totalGames > 0">
+              <span class="counter-label">Games</span>
+              <span class="counter-value">{{ ttt5Progress.game || 0 }}<span class="counter-total">/{{ ttt5Progress.totalGames }}</span></span>
+            </div>
+            <div class="counter">
+              <span class="counter-label">Positions</span>
+              <span class="counter-value">{{ formatPositionCount(ttt5Progress) }}</span>
+            </div>
+            <div class="counter">
+              <span class="counter-label">Elapsed</span>
+              <span class="counter-value">{{ formatTime(ttt5Progress.elapsed) }}</span>
+            </div>
+            <div class="counter">
+              <span class="counter-label">ETA</span>
+              <span class="counter-value">{{ formatTime(ttt5Progress.eta) }}</span>
+            </div>
+            <div class="counter" v-if="ttt5Progress.speed > 0">
+              <span class="counter-label">Speed</span>
+              <span class="counter-value">{{ ttt5Progress.speed }} <span class="counter-unit">{{ ttt5Progress.speedUnit || 'g/s' }}</span></span>
+            </div>
+          </div>
+
+          <!-- Epoch/batch detail -->
+          <div v-if="ttt5Progress.epoch > 0" class="epoch-detail">
+            <span class="epoch-text">Epoch {{ ttt5Progress.epoch }}/{{ ttt5Progress.totalEpochs }}</span>
+            <span v-if="ttt5Progress.batch > 0" class="batch-text">(batch {{ ttt5Progress.batch }}/{{ ttt5Progress.totalBatches }})</span>
+            <span v-if="ttt5Progress.loss" class="metric-text">loss: {{ ttt5Progress.loss }}</span>
+            <span v-if="ttt5Progress.accuracy" class="metric-text acc-text">acc: {{ ttt5Progress.accuracy }}%</span>
+            <span v-if="ttt5Progress.mae" class="metric-text">MAE: {{ ttt5Progress.mae }}</span>
+          </div>
+
+          <!-- Self-play stats -->
+          <div v-if="ttt5Progress.stage === 'mcts_game' && ttt5Progress.selfPlayStats" class="selfplay-stats">
+            Self-play: <span class="sp-win">W {{ ttt5Progress.selfPlayStats.wins }}</span> /
+            <span class="sp-loss">L {{ ttt5Progress.selfPlayStats.losses }}</span> /
+            <span class="sp-draw">D {{ ttt5Progress.selfPlayStats.draws }}</span>
+          </div>
+
+          <!-- Training Charts (uPlot) -->
+          <div v-if="metricsHistory.length > 1" class="training-charts">
+            <div ref="lossChartEl" class="uplot-chart"></div>
+          </div>
+        </div>
+
+        <!-- Legacy progress (TTT3 or when no structured data) -->
+        <div class="progress" v-if="progress && !ttt5Progress?.phase && !datasetProgress && !backgroundProgress">
           <div class="bar" :style="{ width: (progress.percent||0)+'%' }"></div>
         </div>
-        <div class="logs" v-if="progress && !datasetProgress && !backgroundProgress">
+        <div class="logs" v-if="progress && !ttt5Progress?.phase && !datasetProgress && !backgroundProgress">
           Эпоха {{progress.epoch}} / {{progress.epochs}} ·
           loss: {{progress.loss}} · acc: {{progress.acc}} ·
           <span v-if="progress.accuracy">Accuracy: {{progress.accuracy}}% · MAE: {{progress.mae}}</span>
+          <span v-if="trainingElapsed > 0" class="training-timer">
+            · ⏱ {{ formatTime(trainingElapsed) }}
+            <span v-if="trainingETA > 0"> · осталось ~{{ formatTime(trainingETA) }}</span>
+          </span>
           <span v-else>val_loss: {{progress.val_loss}} · val_acc: {{progress.val_acc}}</span>
         </div>
         <!-- Прогресс фонового дообучения -->
@@ -132,12 +246,22 @@
 
     <section class="panel">
       <h2>Игра</h2>
+      <div class="variant-selector">
+        <label class="mode-label">
+          <input type="radio" v-model="variant" value="ttt3" :disabled="training || clearing || autoPlaying" />
+          <span>3×3 (классика)</span>
+        </label>
+        <label class="mode-label">
+          <input type="radio" v-model="variant" value="ttt5" :disabled="training || clearing || autoPlaying" />
+          <span>5×5 (4 в ряд)</span>
+        </label>
+      </div>
       <div class="game-type-selector">
         <label class="mode-label">
           <input type="radio" v-model="gameType" value="human" :disabled="training || clearing || autoPlaying" />
           <span>Человек vs Бот</span>
         </label>
-        <label class="mode-label">
+        <label class="mode-label" v-if="variant === 'ttt3'">
           <input type="radio" v-model="gameType" value="auto" :disabled="training || clearing || autoPlaying" />
           <span>Модель vs Бот (minimax)</span>
         </label>
@@ -147,7 +271,7 @@
           <input type="radio" v-model="gameMode" value="model" :disabled="training || clearing" />
           <span>Модель</span>
         </label>
-        <label class="mode-label">
+        <label class="mode-label" v-if="variant === 'ttt3'">
           <input type="radio" v-model="gameMode" value="algorithm" :disabled="training || clearing" />
           <span>Алгоритм (minimax)</span>
         </label>
@@ -158,12 +282,20 @@
           <input type="number" v-model.number="pauseMs" :disabled="autoPlaying" min="0" max="5000" step="100" />
         </label>
       </div>
-      <div class="board">
-        <button v-for="(cell, idx) in board" :key="idx" class="cell" 
-                :disabled="cell!==0 || waiting || gameOver || autoPlaying"
+      <div class="board" :style="{ gridTemplateColumns: `repeat(${gridN}, ${cellSize}px)` }">
+        <button v-for="(cell, idx) in board" :key="idx" class="cell"
+                :style="{ width: cellSize + 'px', height: cellSize + 'px', fontSize: variant === 'ttt5' ? '20px' : '28px' }"
+                :disabled="cell!==0 || waiting || gameOver || autoPlaying || training"
                 @click="humanMove(idx)">
           {{ renderCell(cell) }}
         </button>
+      </div>
+      <!-- Policy Heatmap -->
+      <div v-if="lastProbs && !gameOver" class="policy-heatmap-container">
+        <div class="heatmap-label">Policy Heatmap</div>
+        <canvas ref="policyCanvas" class="policy-heatmap"
+          :width="gridN * cellSize" :height="gridN * cellSize"
+          :style="{ width: gridN * cellSize + 'px', height: gridN * cellSize + 'px' }"></canvas>
       </div>
       <div class="row">
         <button @click="reset" :disabled="autoPlaying">Сброс</button>
@@ -179,12 +311,19 @@
 </template>
 
 <script setup>
-import { onMounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, computed, watch, nextTick } from 'vue'
+import uPlot from 'uplot'
+import 'uplot/dist/uPlot.min.css'
 
 const ws = ref(null)
 const training = ref(false)
 const clearing = ref(false)
 const progress = ref(null)
+const variant = ref('ttt3') // 'ttt3' или 'ttt5'
+const boardSize = computed(() => variant.value === 'ttt5' ? 25 : 9)
+const gridN = computed(() => variant.value === 'ttt5' ? 5 : 3)
+const cellSize = computed(() => variant.value === 'ttt5' ? 60 : 80)
+const winLen = computed(() => variant.value === 'ttt5' ? 4 : 3)
 const board = ref(Array(9).fill(0))
 const current = ref(1) // 1 = X (человек/модель), 2 = O (бот/алгоритм)
 const waiting = ref(false) // Флаг ожидания ответа от сервера
@@ -198,12 +337,33 @@ let autoGameInterval = null
 const historyCount = ref(0) // Количество сохраненных ходов
 const autoTrainAfterGame = ref(false) // Автоматическое дообучение после игры
 // Настройки основного обучения
-const mainTrainingEpochs = ref(5) // Количество эпох для основного обучения (оптимизировано для качества)
-const mainTrainingBatchSize = ref(2048) // Размер батча для основного обучения (оптимизировано для баланса)
+const mainTrainingEpochs = ref(30)
+const mainTrainingBatchSize = ref(64)
+const activePreset = ref('medium') // 'light', 'medium', 'deep', 'custom'
+
+const PRESETS = {
+  light:  { epochs: 10, batchSize: 64, bootstrapGames: 50,  mctsIterations: 2, mctsGamesPerIter: 20,  mctsTrainingSims: 80,  label: 'Лёгкое (~2 мин)', desc: '10 эпох · 50 bootstrap · 2×20 MCTS · 80 sims/ход' },
+  medium: { epochs: 25, batchSize: 64, bootstrapGames: 100, mctsIterations: 3, mctsGamesPerIter: 40,  mctsTrainingSims: 100, label: 'Среднее (~5 мин)', desc: '25 эпох · 100 bootstrap · 3×40 MCTS · 100 sims/ход' },
+  deep:   { epochs: 50, batchSize: 64, bootstrapGames: 200, mctsIterations: 5, mctsGamesPerIter: 100, mctsTrainingSims: 200, label: 'Глубокое (~15 мин)', desc: '50 эпох · 200 bootstrap · 5×100 MCTS · 200 sims/ход' },
+}
+
+const presetDescription = computed(() => PRESETS[activePreset.value]?.desc || '')
+
+function applyPreset(name) {
+  activePreset.value = name
+  const p = PRESETS[name]
+  if (p) {
+    mainTrainingEpochs.value = p.epochs
+    mainTrainingBatchSize.value = p.batchSize
+  }
+}
+
+// Init with medium preset
+applyPreset('medium')
 // Настройки дообучения
-const trainingEpochs = ref(1) // Количество эпох при дообучении
+const trainingEpochs = ref(3) // Количество эпох при дообучении
 const incrementalBatchSize = ref(256) // Размер батча для дообучения
-const patternsPerError = ref(1000) // Количество вариаций паттерна для каждой ошибки
+const patternsPerError = ref(100) // Количество вариаций паттерна для каждой ошибки
 
 // Ошибки валидации
 const validationErrors = ref({
@@ -219,18 +379,18 @@ function validateMainTrainingSettings() {
   validationErrors.value.mainTrainingEpochs = null
   validationErrors.value.mainTrainingBatchSize = null
   
-  if (mainTrainingEpochs.value < 1 || mainTrainingEpochs.value > 10 || !Number.isInteger(mainTrainingEpochs.value)) {
-    validationErrors.value.mainTrainingEpochs = 'Количество эпох должно быть от 1 до 10'
+  if (mainTrainingEpochs.value < 1 || mainTrainingEpochs.value > 50 || !Number.isInteger(mainTrainingEpochs.value)) {
+    validationErrors.value.mainTrainingEpochs = 'Количество эпох должно быть от 1 до 50'
     return false
   }
-  
-  if (mainTrainingBatchSize.value < 128 || mainTrainingBatchSize.value > 4096 || !Number.isInteger(mainTrainingBatchSize.value)) {
-    validationErrors.value.mainTrainingBatchSize = 'Размер батча должен быть от 128 до 4096'
+
+  if (mainTrainingBatchSize.value < 32 || mainTrainingBatchSize.value > 4096 || !Number.isInteger(mainTrainingBatchSize.value)) {
+    validationErrors.value.mainTrainingBatchSize = 'Размер батча должен быть от 32 до 4096'
     return false
   }
-  
-  if (mainTrainingBatchSize.value % 128 !== 0) {
-    validationErrors.value.mainTrainingBatchSize = 'Размер батча должен быть кратен 128'
+
+  if (mainTrainingBatchSize.value % 32 !== 0) {
+    validationErrors.value.mainTrainingBatchSize = 'Размер батча должен быть кратен 32'
     return false
   }
   
@@ -274,16 +434,16 @@ function validateIncrementalTrainingSettings() {
 // Валидация при изменении значений
 function validateMainTrainingEpochs() {
   if (mainTrainingEpochs.value < 1) mainTrainingEpochs.value = 1
-  if (mainTrainingEpochs.value > 10) mainTrainingEpochs.value = 10
+  if (mainTrainingEpochs.value > 50) mainTrainingEpochs.value = 50
   if (!Number.isInteger(mainTrainingEpochs.value)) mainTrainingEpochs.value = Math.round(mainTrainingEpochs.value)
   validateMainTrainingSettings()
 }
 
 function validateMainTrainingBatchSize() {
-  if (mainTrainingBatchSize.value < 128) mainTrainingBatchSize.value = 128
+  if (mainTrainingBatchSize.value < 32) mainTrainingBatchSize.value = 32
   if (mainTrainingBatchSize.value > 4096) mainTrainingBatchSize.value = 4096
-  // Округляем до ближайшего кратного 128
-  mainTrainingBatchSize.value = Math.round(mainTrainingBatchSize.value / 128) * 128
+  // Округляем до ближайшего кратного 32
+  mainTrainingBatchSize.value = Math.round(mainTrainingBatchSize.value / 32) * 32
   validateMainTrainingSettings()
 }
 
@@ -319,6 +479,133 @@ const gpuBackend = ref('')
 const datasetProgress = ref(null)
 const backgroundProgress = ref(null) // Прогресс фонового обучения
 const modelConfidence = ref(null) // Уверенность модели (0-1)
+const ttt5Progress = ref(null) // Structured TTT5 training progress
+const trainingStartTime = ref(0) // When training started (ms)
+const trainingElapsed = ref(0) // Elapsed seconds
+const trainingETA = ref(0) // Estimated remaining seconds
+let trainingTimerInterval = null
+
+const metricsHistory = ref([]) // For training charts
+const lossChartEl = ref(null) // uPlot loss chart container
+const accChartEl = ref(null) // uPlot accuracy chart container
+let lossChart = null
+let accChart = null
+const lastProbs = ref(null) // Last policy probabilities from bot
+const policyCanvas = ref(null) // Canvas for policy heatmap
+
+function formatTime(seconds) {
+  if (!seconds || seconds <= 0) return '--:--'
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
+
+function formatPositionCount(progress) {
+  if (!progress) return '0'
+  const base = progress.positions || 0
+  const effective = progress.effectivePositions || 0
+  if (effective > base) return `${base} (${effective})`
+  return String(base)
+}
+
+function getPhaseLabel(name) {
+  const labels = { tactical: 'Tactical', bootstrap: 'Bootstrap', mcts: 'MCTS' }
+  return labels[name] || name
+}
+
+// ===== uPlot Training Charts =====
+function createLossChart() {
+  if (!lossChartEl.value || lossChart) return
+  const opts = {
+    width: lossChartEl.value.offsetWidth || 600,
+    height: 180,
+    title: 'Loss',
+    cursor: { show: true },
+    scales: { x: { time: false }, y: { auto: true } },
+    axes: [
+      { label: 'Epoch', size: 30, stroke: '#888', font: '11px system-ui' },
+      { label: 'Loss', size: 50, stroke: '#888', font: '11px system-ui' },
+    ],
+    series: [
+      { label: 'Epoch' },
+      { label: 'Total', stroke: '#e74c3c', width: 2 },
+      { label: 'Accuracy', stroke: '#4caf50', width: 1.5, scale: 'acc' },
+    ],
+    scales: { x: { time: false }, y: { auto: true }, acc: { auto: true, range: [0, 100] } },
+    axes: [
+      { stroke: '#666', font: '11px system-ui', size: 28 },
+      { stroke: '#e74c3c', font: '11px system-ui', size: 45, label: 'Loss' },
+      { side: 1, scale: 'acc', stroke: '#4caf50', font: '11px system-ui', size: 45, label: 'Acc%', grid: { show: false } },
+    ],
+  }
+  lossChart = new uPlot(opts, [[0], [null], [null]], lossChartEl.value)
+}
+
+function updateCharts() {
+  const data = metricsHistory.value
+  if (!data || data.length < 1) return
+  const epochs = data.map((_, i) => i + 1)
+  const losses = data.map(d => parseFloat(d.loss) || null)
+  const accs = data.map(d => parseFloat(d.acc) || null)
+
+  if (lossChart) {
+    lossChart.setData([epochs, losses, accs])
+  }
+}
+
+function destroyCharts() {
+  if (lossChart) { lossChart.destroy(); lossChart = null }
+  if (accChart) { accChart.destroy(); accChart = null }
+}
+
+// ===== Policy Heatmap =====
+function drawPolicyHeatmap() {
+  const canvas = policyCanvas.value
+  const probs = lastProbs.value
+  if (!canvas || !probs) return
+
+  const N = gridN.value
+  const ctx = canvas.getContext('2d')
+  const cellW = canvas.width / N
+  const cellH = canvas.height / N
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+  const maxProb = Math.max(...probs, 0.01)
+
+  for (let i = 0; i < probs.length; i++) {
+    const col = i % N
+    const row = Math.floor(i / N)
+    const prob = probs[i] || 0
+    const norm = prob / maxProb
+
+    // Color: transparent (low) -> blue -> yellow -> red (high)
+    let r, g, b
+    if (norm < 0.33) {
+      const t = norm / 0.33
+      r = Math.round(50 * t); g = Math.round(100 * t); b = Math.round(200 + 55 * t)
+    } else if (norm < 0.66) {
+      const t = (norm - 0.33) / 0.33
+      r = Math.round(50 + 205 * t); g = Math.round(100 + 155 * t); b = Math.round(255 - 155 * t)
+    } else {
+      const t = (norm - 0.66) / 0.34
+      r = 255; g = Math.round(255 - 200 * t); b = Math.round(100 - 100 * t)
+    }
+
+    const alpha = Math.max(0.15, norm * 0.85)
+    ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`
+    ctx.fillRect(col * cellW + 1, row * cellH + 1, cellW - 2, cellH - 2)
+
+    // Label
+    if (prob > 0.01) {
+      ctx.fillStyle = norm > 0.5 ? '#fff' : '#333'
+      ctx.font = `bold ${Math.round(cellW * 0.28)}px system-ui`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText((prob * 100).toFixed(0) + '%', col * cellW + cellW / 2, row * cellH + cellH / 2)
+    }
+  }
+}
 
 function connectWS() {
   // Предотвращаем множественные попытки подключения
@@ -468,11 +755,31 @@ function connectWS() {
           // Игнорируем прогресс обычного обучения, если идет фоновое
           if (!backgroundProgress.value) {
             progress.value = msg.payload
-            // Для TTT3 Transformer показываем accuracy и MAE если доступны
-            if (msg.payload.accuracy !== undefined) {
-              status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs} - Accuracy: ${msg.payload.accuracy}%, MAE: ${msg.payload.mae}`
+
+            // Structured TTT5 progress
+            if (msg.payload.phase) {
+              ttt5Progress.value = msg.payload
+              if (msg.payload.metricsHistory) {
+                metricsHistory.value = msg.payload.metricsHistory
+              }
+              // Build status text from structured data
+              const p = msg.payload
+              let statusText = ''
+              if (p.phase === 'tactical') statusText = `Tactical curriculum`
+              else if (p.phase === 'bootstrap') statusText = `Bootstrap`
+              else if (p.phase === 'mcts') statusText = `MCTS ${p.iteration || ''}/${p.totalIterations || ''}`
+              if (p.epoch > 0) statusText += ` | Epoch ${p.epoch}/${p.totalEpochs}`
+              if (p.accuracy) statusText += ` | Acc: ${p.accuracy}%`
+              if (p.loss) statusText += ` | Loss: ${p.loss}`
+              status.value = statusText
             } else {
-              status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs}`
+              // Legacy TTT3 progress
+              ttt5Progress.value = null
+              if (msg.payload.accuracy !== undefined) {
+                status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs} - Accuracy: ${msg.payload.accuracy}%, MAE: ${msg.payload.mae}`
+              } else {
+                status.value = `Эпоха ${msg.payload.epoch}/${msg.payload.epochs}`
+              }
             }
           }
         }
@@ -499,10 +806,15 @@ function connectWS() {
           }
           console.log('[WS] Dataset progress updated:', p.generated, '/', p.total, `(${p.percent}%)`)
         }
-      if (msg.type === 'train.done') { 
+      if (msg.type === 'train.done') {
         training.value = false
-        datasetProgress.value = null // Очищаем прогресс датасета после обучения
-        status.value = 'Обучение завершено'
+        datasetProgress.value = null
+        // Stop timer & show final time
+        if (trainingTimerInterval) { clearInterval(trainingTimerInterval); trainingTimerInterval = null }
+        const totalTime = formatTime(Math.floor((Date.now() - trainingStartTime.value) / 1000))
+        ttt5Progress.value = null
+        metricsHistory.value = []
+        status.value = `Обучение завершено за ${totalTime}`
         console.log('[WS] Training completed')
         // Обновляем статистику истории после обучения
         if (ws.value && ws.value.readyState === WebSocket.OPEN) {
@@ -513,6 +825,12 @@ function connectWS() {
           console.log('[WS] Received predict.result, resetting waiting')
           waiting.value = false
           const move = msg.payload.move
+
+          // Store policy probabilities for heatmap
+          if (msg.payload.probs && Array.isArray(msg.payload.probs)) {
+            lastProbs.value = msg.payload.probs
+            nextTick(drawPolicyHeatmap)
+          }
           
           // Обновляем уверенность модели
           console.log('[WS] Predict result payload:', { 
@@ -574,7 +892,9 @@ function connectWS() {
               // Проверяем победу после хода бота
               if (!checkGameOver()) {
                 // Игра продолжается
-                if (msg.payload.mode === 'algorithm') {
+                if (msg.payload.fallback === 'heuristic') {
+                  status.value = '⚠️ Модель не обучена — бот играет по эвристике. Ваш ход (X)'
+                } else if (msg.payload.mode === 'algorithm') {
                   status.value = 'Ход бота (алгоритм minimax) - Ваш ход (X)'
                 } else if (msg.payload.isRandom) {
                   status.value = 'Ход бота (случайный) - Ваш ход (X)'
@@ -597,7 +917,12 @@ function connectWS() {
         if (msg.type === 'clear_model.success') {
           clearing.value = false
           progress.value = null
-          status.value = 'Модель очищена'
+          ttt5Progress.value = null
+          metricsHistory.value = []
+          modelConfidence.value = null
+          // Сбросить игру — старая модель больше не существует
+          reset()
+          status.value = '🗑️ Модель очищена. Обучите новую модель для игры.'
           console.log('[WS] Model cleared:', msg.payload)
         }
         if (msg.type === 'move.saved') {
@@ -671,18 +996,37 @@ function startTrain() {
   }
   
   training.value = true
-  status.value = 'Отправка запроса на обучение TTT3 Transformer...'
+  trainingStartTime.value = Date.now()
+  trainingElapsed.value = 0
+  trainingETA.value = 0
+  // Start timer
+  if (trainingTimerInterval) clearInterval(trainingTimerInterval)
+  trainingTimerInterval = setInterval(() => {
+    trainingElapsed.value = Math.floor((Date.now() - trainingStartTime.value) / 1000)
+    // Estimate ETA from progress percent
+    const pct = progress.value?.percent || ttt5Progress.value?.percent || 0
+    if (pct > 2 && trainingElapsed.value > 3) {
+      trainingETA.value = Math.floor(trainingElapsed.value * (100 - pct) / pct)
+    }
+  }, 1000)
+  const trainType = variant.value === 'ttt5' ? 'train_ttt5' : 'train_ttt3'
+  status.value = `Отправка запроса на обучение ${variant.value === 'ttt5' ? 'TTT5' : 'TTT3'} Transformer...`
   try {
-    // Используем настройки из UI (после валидации)
-    ws.value.send(JSON.stringify({ 
-      type: 'train_ttt3', 
-      payload: { 
-        epochs: mainTrainingEpochs.value, // Используем настройку из UI
-        batchSize: mainTrainingBatchSize.value, // Используем настройку из UI
-        earlyStop: true 
-      } 
-    }))
-    console.log(`[Train] TTT3 Transformer training request sent: epochs=${mainTrainingEpochs.value}, batchSize=${mainTrainingBatchSize.value}`)
+    const preset = PRESETS[activePreset.value]
+    const payload = {
+      epochs: mainTrainingEpochs.value,
+      batchSize: mainTrainingBatchSize.value,
+      earlyStop: true,
+    }
+    // Pass preset-specific params for TTT5
+    if (variant.value === 'ttt5' && preset) {
+      payload.bootstrapGames = preset.bootstrapGames
+      payload.mctsIterations = preset.mctsIterations
+      payload.mctsGamesPerIter = preset.mctsGamesPerIter
+      payload.mctsTrainingSims = preset.mctsTrainingSims
+    }
+    ws.value.send(JSON.stringify({ type: trainType, payload }))
+    console.log(`[Train] ${trainType} sent:`, payload)
   } catch (e) {
     console.error('[Train] Send error:', e)
     training.value = false
@@ -705,8 +1049,8 @@ function clearModel() {
   clearing.value = true
   status.value = 'Очистка модели...'
   try {
-    ws.value.send(JSON.stringify({ type: 'clear_model' }))
-    console.log('[Clear] Clear model request sent')
+    ws.value.send(JSON.stringify({ type: 'clear_model', payload: { variant: variant.value } }))
+    console.log(`[Clear] Clear model request sent (variant=${variant.value})`)
   } catch (e) {
     console.error('[Clear] Send error:', e)
     clearing.value = false
@@ -716,16 +1060,25 @@ function clearModel() {
 
 // Проверка победы (скопировано с сервера)
 function getWinner(board) {
-  const lines = [
-    [0,1,2],[3,4,5],[6,7,8],
-    [0,3,6],[1,4,7],[2,5,8],
-    [0,4,8],[2,4,6],
-  ];
-  for (const [a,b,c] of lines) {
-    if (board[a] && board[a] === board[b] && board[b] === board[c]) return board[a];
+  const N = gridN.value
+  const wLen = winLen.value
+  const DIRS = [[1,0],[0,1],[1,1],[1,-1]]
+
+  for (let r = 0; r < N; r++) {
+    for (let c = 0; c < N; c++) {
+      const who = board[r * N + c]
+      if (!who) continue
+      for (const [dr, dc] of DIRS) {
+        let k = 1, rr = r + dr, cc = c + dc
+        while (rr >= 0 && cc >= 0 && rr < N && cc < N && board[rr * N + cc] === who) {
+          k++; rr += dr; cc += dc
+          if (k >= wLen) return who
+        }
+      }
+    }
   }
-  if (board.every(v => v !== 0)) return 0; // Ничья
-  return null; // Игра продолжается
+  if (board.every(v => v !== 0)) return 0 // Ничья
+  return null // Игра продолжается
 }
 
 function checkGameOver() {
@@ -776,12 +1129,12 @@ function renderCell(v) { return v===0?'·':(v===1?'X':'O') }
 
 function reset() {
   stopAutoGame()
-  board.value = Array(9).fill(0)
+  board.value = Array(boardSize.value).fill(0)
   current.value = 1
   status.value = gameType.value === 'auto' ? 'Готово к игре' : 'Ваш ход (X)'
   gameOver.value = false
-  waiting.value = false // Сбрасываем флаг ожидания
-  modelConfidence.value = null // Сбрасываем уверенность
+  waiting.value = false
+  modelConfidence.value = null
   currentGameMoves = []
   currentGameId = null
 }
@@ -800,7 +1153,7 @@ function saveMove(board, move, currentPlayer) {
     if (ws.value && ws.value.readyState === WebSocket.OPEN) {
       ws.value.send(JSON.stringify({
         type: 'save_move',
-        payload: { board: [...board], move, current: currentPlayer, gameId: currentGameId }
+        payload: { board: [...board], move, current: currentPlayer, gameId: currentGameId, variant: variant.value }
       }))
       currentGameMoves.push({ board: [...board], move, current: currentPlayer })
     } else {
@@ -815,7 +1168,7 @@ function startGameTracking() {
     try {
       ws.value.send(JSON.stringify({ 
         type: 'start_game', 
-        payload: { playerRole: 2 } // Модель играет за O (2)
+        payload: { playerRole: 2, variant: variant.value } // Модель играет за O (2)
       }))
       console.log('[GameTracking] Start game request sent')
     } catch (e) {
@@ -834,7 +1187,8 @@ function finishGameTracking(winner) {
                 winner,
                 patternsPerError: patternsPerError.value, // Передаем настройку количества паттернов
                 autoTrain: autoTrainAfterGame.value, // Передаем флаг автоматического обучения
-                incrementalBatchSize: incrementalBatchSize.value // Передаем настройку batch size для дообучения
+                incrementalBatchSize: incrementalBatchSize.value, // Передаем настройку batch size для дообучения
+                variant: variant.value
               }
             }))
   }
@@ -878,7 +1232,8 @@ function trainOnGames() {
         epochs: trainingEpochs.value, // Используем настройку из UI
         batchSize: incrementalBatchSize.value, // Используем настройку из UI
         focusOnErrors: true, // Включаем автоматическое увеличение эпох для паттернов ошибок
-        patternsPerError: patternsPerError.value // Передаем настройку количества паттернов
+        patternsPerError: patternsPerError.value, // Передаем настройку количества паттернов
+        variant: variant.value
       } 
     }))
     console.log(`[TrainOnGames] Request sent: epochs=${trainingEpochs.value}, batchSize=${incrementalBatchSize.value}, patternsPerError=${patternsPerError.value}`)
@@ -912,7 +1267,7 @@ async function startAutoGame() {
   if (gameType.value !== 'auto') return
   
   // Сбрасываем игру
-  board.value = Array(9).fill(0)
+  board.value = Array(boardSize.value).fill(0)
   current.value = 1
   gameOver.value = false
   autoPlaying.value = true
@@ -935,13 +1290,14 @@ async function makeAutoMove() {
     waiting.value = true
     
     try {
-      ws.value.send(JSON.stringify({ 
-        type: 'predict', 
-        payload: { 
-          board: board.value, 
-          current: 1, 
-          mode: 'model' 
-        } 
+      ws.value.send(JSON.stringify({
+        type: 'predict',
+        payload: {
+          board: board.value,
+          current: 1,
+          mode: 'model',
+          variant: variant.value,
+        }
       }))
     } catch (e) {
       console.error('[Auto] Error making model move:', e)
@@ -951,15 +1307,16 @@ async function makeAutoMove() {
     // Ход алгоритма (O)
     status.value = 'Ход бота (O, minimax)...'
     waiting.value = true
-    
+
     try {
-      ws.value.send(JSON.stringify({ 
-        type: 'predict', 
-        payload: { 
-          board: board.value, 
-          current: 2, 
-          mode: 'algorithm' 
-        } 
+      ws.value.send(JSON.stringify({
+        type: 'predict',
+        payload: {
+          board: board.value,
+          current: 2,
+          mode: 'algorithm',
+          variant: variant.value,
+        }
       }))
     } catch (e) {
       console.error('[Auto] Error making algorithm move:', e)
@@ -1025,13 +1382,14 @@ function humanMove(idx) {
   waiting.value = true
   status.value = 'Ожидание хода бота...'
   try {
-    ws.value.send(JSON.stringify({ 
-      type: 'predict', 
-      payload: { 
-        board: board.value, 
-        current: 2, 
-        mode: gameMode.value 
-      } 
+    ws.value.send(JSON.stringify({
+      type: 'predict',
+      payload: {
+        board: board.value,
+        current: 2,
+        mode: gameMode.value,
+        variant: variant.value,
+      }
     }))
     console.log('[HumanMove] Predict request sent')
   } catch (e) {
@@ -1045,6 +1403,56 @@ function humanMove(idx) {
 watch(gameType, () => {
   stopAutoGame()
   reset()
+})
+
+// Update training charts when metrics arrive
+watch(metricsHistory, () => {
+  if (metricsHistory.value.length > 0) {
+    nextTick(() => {
+      if (!lossChart && lossChartEl.value) createLossChart()
+      updateCharts()
+    })
+  }
+}, { deep: true })
+
+// Clear heatmap on board reset
+watch(board, () => {
+  if (board.value.every(v => v === 0)) {
+    lastProbs.value = null
+    const canvas = policyCanvas.value
+    if (canvas) {
+      canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height)
+    }
+  }
+})
+
+// Destroy charts when training ends
+watch(training, (val) => {
+  if (!val) {
+    setTimeout(destroyCharts, 500)
+  }
+})
+
+onUnmounted(() => {
+  destroyCharts()
+})
+
+// Сбрасываем игру и настройки при смене варианта
+watch(variant, (newVariant) => {
+  stopAutoGame()
+  // При переключении на TTT5 отключаем minimax
+  if (newVariant === 'ttt5') {
+    gameMode.value = 'model'
+    gameType.value = 'human'
+  }
+  board.value = Array(newVariant === 'ttt5' ? 25 : 9).fill(0)
+  current.value = 1
+  gameOver.value = false
+  waiting.value = false
+  modelConfidence.value = null
+  currentGameMoves = []
+  currentGameId = null
+  status.value = 'Ваш ход (X)'
 })
 
 onMounted(() => {
@@ -1121,8 +1529,9 @@ onMounted(() => {
   font-size: 12px; 
   color: #666;
 }
-.board { display: grid; grid-template-columns: repeat(3, 80px); grid-gap: 8px; margin: 12px 0; }
-.cell { width: 80px; height: 80px; font-size: 28px; border: 1px solid #ccc; border-radius: 8px; background: white; cursor: pointer; }
+.board { display: grid; grid-gap: 8px; margin: 12px 0; }
+.cell { border: 1px solid #ccc; border-radius: 8px; background: white; cursor: pointer; }
+.variant-selector { display: flex; gap: 16px; margin-bottom: 12px; padding: 8px; background: #e8f5e9; border-radius: 8px; border: 1px solid #a5d6a7; }
 .cell:disabled { background: #f3f3f3; cursor: not-allowed; }
 .row { display:flex; align-items:center; gap: 12px; }
 .history-info { display: flex; align-items: center; gap: 12px; margin-top: 8px; padding: 8px; background: #f0f0f0; border-radius: 4px; font-size: 0.9em; }
@@ -1203,5 +1612,261 @@ onMounted(() => {
   font-size: 0.85em;
   opacity: 0.8;
   font-family: monospace;
+}
+
+/* ===== TTT5 Interactive Training Panel ===== */
+.ttt5-training-panel {
+  margin-top: 12px;
+  padding: 14px;
+  background: linear-gradient(135deg, #f8f9ff 0%, #f0f4ff 100%);
+  border-radius: 10px;
+  border: 1px solid #c5cae9;
+}
+
+.phase-badges {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.phase-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 14px;
+  font-size: 0.8em;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  transition: all 0.3s ease;
+  white-space: nowrap;
+}
+
+.phase-pending {
+  background: #e0e0e0;
+  color: #999;
+}
+
+.phase-active {
+  background: #1976d2;
+  color: white;
+  animation: pulseBadge 1.5s ease-in-out infinite;
+  box-shadow: 0 0 8px rgba(25, 118, 210, 0.4);
+}
+
+.phase-completed {
+  background: #4caf50;
+  color: white;
+}
+
+@keyframes pulseBadge {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.85; transform: scale(1.03); }
+}
+
+.ttt5-bar {
+  background: linear-gradient(90deg, #1976d2, #42a5f5) !important;
+  transition: width 0.4s ease;
+}
+
+.training-counters {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.counter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 56px;
+}
+
+.counter-label {
+  font-size: 0.7em;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #888;
+  margin-bottom: 2px;
+}
+
+.counter-value {
+  font-size: 1.05em;
+  font-weight: 700;
+  color: #333;
+  font-variant-numeric: tabular-nums;
+}
+
+.counter-total {
+  font-weight: 400;
+  color: #999;
+  font-size: 0.9em;
+}
+
+.counter-unit {
+  font-weight: 400;
+  font-size: 0.8em;
+  color: #888;
+}
+
+.epoch-detail {
+  margin-top: 8px;
+  padding: 6px 10px;
+  background: rgba(255,255,255,0.7);
+  border-radius: 6px;
+  font-size: 0.88em;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.epoch-text {
+  font-weight: 600;
+  color: #333;
+}
+
+.batch-text {
+  color: #777;
+}
+
+.metric-text {
+  color: #555;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 0.95em;
+}
+
+.acc-text {
+  color: #2e7d32;
+  font-weight: 600;
+}
+
+.selfplay-stats {
+  margin-top: 8px;
+  padding: 5px 10px;
+  background: rgba(255,255,255,0.7);
+  border-radius: 6px;
+  font-size: 0.88em;
+  color: #555;
+}
+
+.sp-win { color: #2e7d32; font-weight: 600; }
+.sp-loss { color: #c62828; font-weight: 600; }
+.sp-draw { color: #f57c00; font-weight: 600; }
+
+.sparkline-container {
+  margin-top: 10px;
+}
+
+.sparkline-legend {
+  display: flex;
+  gap: 14px;
+  font-size: 0.72em;
+  color: #888;
+  margin-bottom: 4px;
+}
+
+.legend-acc { color: #4caf50; }
+.legend-loss { color: #f44336; }
+
+.sparkline-canvas {
+  display: block;
+  width: 320px;
+  height: 50px;
+  background: rgba(255,255,255,0.5);
+  border-radius: 4px;
+  border: 1px solid #e0e0e0;
+}
+
+.logs {
+  margin-top: 8px;
+  font-size: 0.9em;
+  color: #555;
+}
+
+/* Training Charts */
+.training-charts {
+  margin-top: 10px;
+  padding: 8px;
+  background: white;
+  border-radius: 8px;
+  border: 1px solid #e0e0e0;
+}
+.uplot-chart {
+  width: 100%;
+  max-width: 640px;
+}
+
+/* Policy Heatmap */
+.policy-heatmap-container {
+  margin-top: 8px;
+  text-align: center;
+}
+.heatmap-label {
+  font-size: 11px;
+  color: #999;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+.policy-heatmap {
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  display: block;
+  margin: 0 auto;
+}
+
+/* Training Presets */
+.preset-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.preset-btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 4px;
+  border: 2px solid #e0e0e0;
+  border-radius: 10px;
+  background: white;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.preset-btn:hover:not(:disabled) {
+  border-color: #4caf50;
+  background: #f8fff8;
+}
+.preset-btn.active {
+  border-color: #4caf50;
+  background: #e8f5e9;
+  box-shadow: 0 0 0 1px #4caf50;
+}
+.preset-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.preset-icon { font-size: 18px; }
+.preset-name { font-size: 12px; font-weight: 600; color: #333; }
+.preset-time { font-size: 10px; color: #888; }
+.preset-custom .preset-name { color: #666; }
+.preset-summary {
+  padding: 6px 10px;
+  background: #f5f5f5;
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+.preset-summary small { color: #666; }
+.custom-settings {
+  padding: 8px 0;
+}
+
+/* Training timer */
+.training-timer {
+  color: #1976d2;
+  font-weight: 500;
 }
 </style>

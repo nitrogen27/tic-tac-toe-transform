@@ -1,160 +1,179 @@
 // PV Transformer для последовательности из 9 токенов (крестики-нолики 3×3)
 // Вход: [B, 9, inDim=3] где inDim=3 (my/op/empty)
+// Настоящий Multi-Head Attention с reshape на головы
 import tfpkg from './tf.mjs';
 const tf = tfpkg;
 import { TRANSFORMER_CFG } from './config.mjs';
 
-// Кастомный слой для Scaled Dot-Product Attention с правильной сериализацией
-// Определяем глобально, чтобы можно было зарегистрировать для десериализации
-class ScaledDotProductAttention extends tf.layers.Layer {
+// ===== Кастомный слой: настоящий Multi-Head Self-Attention =====
+// Проецирует Q,K,V → reshape на головы → scaled dot-product per head → concat
+class MultiHeadAttentionLayer extends tf.layers.Layer {
   constructor(config) {
     super(config);
-    this.scale = config.scale || 1.0;
+    this.numHeads = config.numHeads;
+    this.keyDim = config.keyDim;
+    this.dModel = this.numHeads * this.keyDim;
   }
-  
+
+  build(inputShape) {
+    // inputShape в functional API:
+    //   single input: [null, seqLen, dModel] — inputShape[0] is null (not array)
+    //   array input: [[null, seqLen, dModel]] — inputShape[0] is array
+    let shape = inputShape;
+    if (Array.isArray(shape[0])) {
+      shape = shape[0]; // unwrap nested array
+    }
+    // shape = [null, seqLen, dModel]
+    const inputDim = shape[shape.length - 1];
+
+    // Проекции Q, K, V и выходная проекция — trainable weights
+    this.wQ = this.addWeight('wQ', [inputDim, this.dModel], 'float32', tf.initializers.glorotUniform());
+    this.wK = this.addWeight('wK', [inputDim, this.dModel], 'float32', tf.initializers.glorotUniform());
+    this.wV = this.addWeight('wV', [inputDim, this.dModel], 'float32', tf.initializers.glorotUniform());
+    this.wO = this.addWeight('wO', [this.dModel, this.dModel], 'float32', tf.initializers.glorotUniform());
+
+    this.built = true;
+  }
+
+  call(inputs) {
+    // НЕ используем tf.tidy() — он уничтожает промежуточные тензоры,
+    // которые нужны для backward pass (вычисления градиентов).
+    // Фреймворк сам управляет lifecycle тензоров при model.fit() и predict().
+    const x = Array.isArray(inputs) ? inputs[0] : inputs;
+    // x shape: [B, seqLen, dModel]
+
+    const seqLen = x.shape[1];
+
+    // Проекции: [B, seqLen, dModel] @ [dModel, dModel] → [B, seqLen, dModel]
+    const wQ = this.wQ.read();
+    const wK = this.wK.read();
+    const wV = this.wV.read();
+    const wO = this.wO.read();
+
+    // Для 3D тензоров: reshape → matMul → reshape back
+    const xFlat = x.reshape([-1, this.dModel]); // [B*seqLen, dModel]
+    let q = tf.matMul(xFlat, wQ).reshape([-1, seqLen, this.dModel]);
+    let k = tf.matMul(xFlat, wK).reshape([-1, seqLen, this.dModel]);
+    let v = tf.matMul(xFlat, wV).reshape([-1, seqLen, this.dModel]);
+
+    // Reshape to multi-head: [B, seqLen, numHeads, keyDim]
+    q = q.reshape([-1, seqLen, this.numHeads, this.keyDim]);
+    k = k.reshape([-1, seqLen, this.numHeads, this.keyDim]);
+    v = v.reshape([-1, seqLen, this.numHeads, this.keyDim]);
+
+    // Transpose to [B, numHeads, seqLen, keyDim]
+    q = q.transpose([0, 2, 1, 3]);
+    k = k.transpose([0, 2, 1, 3]);
+    v = v.transpose([0, 2, 1, 3]);
+
+    // Scaled dot-product attention per head
+    const scale = 1.0 / Math.sqrt(this.keyDim);
+    const scores = tf.matMul(q, k, false, true).mul(scale);
+    const attn = tf.softmax(scores, -1);
+
+    // Apply attention to values: [B, numHeads, seqLen, keyDim]
+    let out = tf.matMul(attn, v);
+
+    // Transpose back: [B, seqLen, numHeads, keyDim]
+    out = out.transpose([0, 2, 1, 3]);
+
+    // Reshape to [B, seqLen, dModel]
+    out = out.reshape([-1, seqLen, this.dModel]);
+
+    // Output projection: [B*seqLen, dModel] @ [dModel, dModel]
+    const outFlat = out.reshape([-1, this.dModel]);
+    const result = tf.matMul(outFlat, wO).reshape([-1, seqLen, this.dModel]);
+
+    return result;
+  }
+
+  computeOutputShape(inputShape) {
+    // single input: [null, seqLen, dModel]
+    // array input: [[null, seqLen, dModel]]
+    if (Array.isArray(inputShape[0])) {
+      return inputShape[0]; // unwrap nested
+    }
+    return inputShape; // already the shape
+  }
+
   getConfig() {
     const config = super.getConfig();
-    config.scale = this.scale;
+    config.numHeads = this.numHeads;
+    config.keyDim = this.keyDim;
     return config;
   }
-  
+
   static get className() {
-    return 'ScaledDotProductAttention';
-  }
-  
-  call(inputs) {
-    // inputs это массив [q, k, v] или один тензор
-    // В call() мы получаем реальные тензоры, не SymbolicTensor
-    return tf.tidy(() => {
-      let q, k, v;
-      if (Array.isArray(inputs)) {
-        [q, k, v] = inputs;
-      } else {
-        // Если один тензор, это ошибка
-        throw new Error('ScaledDotProductAttention expects array of 3 tensors [q, k, v]');
-      }
-      
-      // Q @ K^T
-      const scores = tf.matMul(q, k, false, true);
-      // Scale
-      const scaled = scores.mul(this.scale);
-      // Softmax
-      const attn = tf.softmax(scaled, -1);
-      // Apply to V
-      return tf.matMul(attn, v);
-    });
-  }
-  
-  computeOutputShape(inputShapes) {
-    // inputShapes это массив форм входов
-    if (Array.isArray(inputShapes) && inputShapes.length >= 1) {
-      return inputShapes[0]; // [B, seqLen, dModel]
-    }
-    return inputShapes;
+    return 'MultiHeadAttentionLayer';
   }
 }
 
-// Регистрируем кастомный слой для десериализации (выполняется один раз при импорте)
+// Регистрируем кастомный слой для десериализации
 try {
-  tf.serialization.registerClass(ScaledDotProductAttention);
+  tf.serialization.registerClass(MultiHeadAttentionLayer);
 } catch (e) {
-  // Игнорируем ошибку, если уже зарегистрирован
   if (!e.message.includes('already registered')) {
-    console.warn('[MHA] Could not register ScaledDotProductAttention:', e.message);
+    console.warn('[MHA] Could not register MultiHeadAttentionLayer:', e.message);
   }
 }
 
-// Синусоидальное позиционное кодирование для 9 позиций
-function sinusoidalPositionalEmbedding(seqLen, dModel) {
-  const embeddings = [];
-  for (let pos = 0; pos < seqLen; pos++) {
-    const emb = new Array(dModel).fill(0);
-    for (let i = 0; i < dModel; i += 2) {
-      const div = Math.pow(10000, (2 * i) / dModel);
-      emb[i] = Math.sin(pos / div);
-      if (i + 1 < dModel) {
-        emb[i + 1] = Math.cos(pos / div);
-      }
-    }
-    embeddings.push(emb);
-  }
-  return tf.tensor2d(embeddings, [seqLen, dModel]);
-}
-
-// Multi-Head Self-Attention блок
-// Реализация собственного MHA, так как tf.layers.multiHeadAttention недоступен в tfjs-node
+// Multi-Head Self-Attention блок (обертка для функционального API)
 function mhaBlock(x, dModel, numHeads, dropout, namePrefix = 'mha') {
   const keyDim = dModel / numHeads;
-  
-  // Проекции для Q, K, V с уникальными именами
-  const qProj = tf.layers.dense({ units: dModel, useBias: false, name: `${namePrefix}_q` });
-  const kProj = tf.layers.dense({ units: dModel, useBias: false, name: `${namePrefix}_k` });
-  const vProj = tf.layers.dense({ units: dModel, useBias: false, name: `${namePrefix}_v` });
-  
-  // Применяем проекции
-  const q = qProj.apply(x);
-  const k = kProj.apply(x);
-  const v = vProj.apply(x);
-  
-  // Scaled dot-product attention: Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
-  // Используем прямые тензорные операции вместо lambda (который недоступен в tfjs-node)
-  
-  // Scaled dot-product attention: Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
-  // Используем кастомный слой с правильной сериализацией
-  const scale = 1.0 / Math.sqrt(keyDim);
-  
-  // Используем зарегистрированный кастомный слой
-  const attentionLayer = new ScaledDotProductAttention({ 
-    scale, 
-    name: `${namePrefix}_attention` 
+
+  const mha = new MultiHeadAttentionLayer({
+    numHeads,
+    keyDim,
+    name: `${namePrefix}_mha`
   });
-  
-  // Применяем слой к [q, k, v] - слой правильно обработает SymbolicTensor
-  const attnOutput = attentionLayer.apply([q, k, v]);
-  
-  // Output projection
-  const outProj = tf.layers.dense({ units: dModel, useBias: false, name: `${namePrefix}_out` });
-  const output = outProj.apply(attnOutput);
-  
+
+  let output = mha.apply(x);
+
+  if (dropout > 0) {
+    output = tf.layers.dropout({ rate: dropout, name: `${namePrefix}_drop` }).apply(output);
+  }
+
   return output;
 }
 
 // Feed-Forward Network
-function ffnBlock(x, dModel, dropout) {
+function ffnBlock(x, dModel, dropout, namePrefix = 'ffn') {
   let h = tf.layers.dense({
     units: dModel * 4,
     activation: 'relu',
-    kernelInitializer: 'glorotUniform'
+    kernelInitializer: 'glorotUniform',
+    name: `${namePrefix}_expand`
   }).apply(x);
   if (dropout > 0) {
-    h = tf.layers.dropout({ rate: dropout }).apply(h);
+    h = tf.layers.dropout({ rate: dropout, name: `${namePrefix}_drop` }).apply(h);
   }
   h = tf.layers.dense({
     units: dModel,
-    kernelInitializer: 'glorotUniform'
+    kernelInitializer: 'glorotUniform',
+    name: `${namePrefix}_contract`
   }).apply(h);
   return h;
 }
 
-// Transformer блок: LN → MHA → residual → LN → FFN → residual
+// Transformer блок: LN → MHA → residual → LN → FFN → residual (Pre-LN)
 function transformerBlock(x, dModel, numHeads, dropout, name) {
   // LayerNorm перед MHA
   const ln1 = tf.layers.layerNormalization({ epsilon: 1e-6, name: `${name}_ln1` }).apply(x);
   const attn = mhaBlock(ln1, dModel, numHeads, dropout, `${name}_mha`);
   const x1 = tf.layers.add({ name: `${name}_add1` }).apply([x, attn]);
-  
+
   // LayerNorm перед FFN
   const ln2 = tf.layers.layerNormalization({ epsilon: 1e-6, name: `${name}_ln2` }).apply(x1);
-  const ffn = ffnBlock(ln2, dModel, dropout);
+  const ffn = ffnBlock(ln2, dModel, dropout, `${name}_ffn`);
   const x2 = tf.layers.add({ name: `${name}_add2` }).apply([x1, ffn]);
-  
+
   return x2;
 }
 
 // Построение PV Transformer модели
-export function buildPVTransformerSeq({ 
-  dModel = TRANSFORMER_CFG.dModel, 
-  numLayers = TRANSFORMER_CFG.numLayers, 
+export function buildPVTransformerSeq({
+  dModel = TRANSFORMER_CFG.dModel,
+  numLayers = TRANSFORMER_CFG.numLayers,
   heads = TRANSFORMER_CFG.heads,
   dropout = TRANSFORMER_CFG.dropout,
   seqLen = 9,
@@ -162,43 +181,49 @@ export function buildPVTransformerSeq({
 } = {}) {
   // Вход: [B, 9, 3]
   const inp = tf.input({ shape: [seqLen, inDim], name: 'input' });
-  
-  // Embedding: линейный до dModel
+
+  // Token embedding: линейная проекция 3 → dModel
   const tokenEmbedding = tf.layers.dense({
     units: dModel,
     useBias: true,
     kernelInitializer: 'glorotUniform',
     name: 'token_embedding'
   }).apply(inp);
-  
-  // Позиционное кодирование: используем trainable embedding
-  // Создаем второй вход для позиций (0..8)
+
+  // Позиционное кодирование: trainable embedding
   const posIdx = tf.input({ shape: [seqLen], dtype: 'int32', name: 'pos_idx' });
   const posEmbedding = tf.layers.embedding({
     inputDim: seqLen,
     outputDim: dModel,
     name: 'positional_embedding'
   }).apply(posIdx);
-  
+
   // Складываем token и positional embeddings
   let x = tf.layers.add({ name: 'add_embeddings' }).apply([tokenEmbedding, posEmbedding]);
-  
+
   // Transformer блоки
   for (let i = 0; i < numLayers; i++) {
     x = transformerBlock(x, dModel, heads, dropout, `transformer_${i}`);
   }
-  
-  // Policy head: применяем dense к каждому токену и суммируем или берем глобальный pooling
-  // Используем GlobalMaxPooling1d для получения агрегированного представления
-  const policyPool = tf.layers.globalMaxPooling1d({ name: 'policy_pool' }).apply(x);
-  const policyLogits = tf.layers.dense({
-    units: seqLen, // 9
+
+  // Финальный LayerNorm
+  x = tf.layers.layerNormalization({ epsilon: 1e-6, name: 'final_ln' }).apply(x);
+
+  // ===== Policy head: per-token scoring (сохраняет позиционную информацию) =====
+  // Dense(1) применяется к каждому токену → [B, 9, 1] → reshape → [B, 9]
+  const policyPerToken = tf.layers.dense({
+    units: 1,
     useBias: true,
     kernelInitializer: 'glorotUniform',
+    name: 'policy_per_token'
+  }).apply(x); // [B, 9, 1]
+
+  const policyLogits = tf.layers.reshape({
+    targetShape: [seqLen],
     name: 'policy_logits'
-  }).apply(policyPool);
-  
-  // Value head: GlobalAveragePooling по токенам → MLP → tanh
+  }).apply(policyPerToken); // [B, 9]
+
+  // ===== Value head: GlobalAveragePooling → MLP → tanh =====
   let value = tf.layers.globalAveragePooling1d({ name: 'value_pool' }).apply(x);
   value = tf.layers.dense({
     units: dModel,
@@ -212,10 +237,14 @@ export function buildPVTransformerSeq({
     kernelInitializer: 'glorotUniform',
     name: 'value_output'
   }).apply(value);
-  
-  // Модель возвращает [policyLogits, value]
-  // Маскирование нелегальных ходов будет применено снаружи
-  return tf.model({ inputs: [inp, posIdx], outputs: [policyLogits, value], name: 'pv_transformer_seq' });
+
+  const model = tf.model({ inputs: [inp, posIdx], outputs: [policyLogits, value], name: 'pv_transformer_seq' });
+
+  // Логируем архитектуру
+  const totalParams = model.countParams();
+  console.log(`[PVTransformer] Built model: dModel=${dModel}, layers=${numLayers}, heads=${heads}, params=${totalParams}`);
+
+  return model;
 }
 
 // Вспомогательная функция для маскирования логитов

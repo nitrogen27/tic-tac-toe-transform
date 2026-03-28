@@ -5,6 +5,7 @@ import { buildPVTransformerSeq, maskLogits } from './model_pv_transformer_seq.mj
 import { teacherBatches, getTeacherValueAndPolicy } from './ttt3_minimax.mjs';
 import { TRAIN, TRANSFORMER_CFG, SEED } from './config.mjs';
 import { maskLegalMoves, encodePlanes, winner, legalMoves, applyMove, emptyBoard, cloneBoard } from './game_ttt3.mjs';
+import { SYMMETRY_MAPS, transformPlanes, transformPolicy } from './ttt3_symmetry.mjs';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -20,129 +21,206 @@ if (tf.util && tf.util.setSeed) {
   console.warn('[Train] tf.util.setSeed not available, reproducibility may be limited');
 }
 
-// Создание валидационного набора позиций
-function createValidationSet() {
-  const positions = [];
-  const visited = new Set();
-  
-  function generatePositions(board, player, depth = 0) {
-    const key = Array.from(board).join(',');
-    if (visited.has(key) || depth > 9) return;
-    visited.add(key);
-    
-    const w = winner(board);
-    if (w !== null || depth >= 5) { // Берем позиции до глубины 5
-      positions.push({ board: cloneBoard(board), player });
-    }
-    
-    if (w === null) {
-      const moves = legalMoves(board);
-      for (const move of moves.slice(0, 3)) { // Ограничиваем для скорости
-        const newBoard = applyMove(board, move, player);
-        generatePositions(newBoard, -player, depth + 1);
-      }
-    }
-  }
-  
-  generatePositions(emptyBoard(), 1);
-  return positions.slice(0, 100); // Берем первые 100 позиций
+// ===== Кастомная loss: softmax cross-entropy из логитов =====
+// Модель выдаёт RAW LOGITS, а categoricalCrossentropy ожидает probabilities!
+// Использование categoricalCrossentropy с логитами → clip(logits, eps, 1-eps)
+// → все логиты > 1 маппятся в ~1 → loss ≈ 0 → нет градиента → модель не учится.
+// Правильный подход: logSoftmax → cross entropy
+function policyLossFromLogits(yTrue, yPred) {
+  // yTrue: [B, 9] target probability distribution (from minimax)
+  // yPred: [B, 9] raw logits from model
+  const logProbs = tf.logSoftmax(yPred, -1); // numerically stable log(softmax(x))
+  return tf.neg(tf.sum(tf.mul(yTrue, logProbs), -1)).mean();
 }
 
-// Оценка качества модели на валидационном наборе (все операции на GPU)
-async function evaluateModel(model, validationSet, progressCb) {
-  // Все операции predict выполняются на GPU автоматически
+// Fisher-Yates shuffle
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function augmentSampleBySymmetry(planes, policy, value) {
+  return SYMMETRY_MAPS.map(({ map }) => ({
+    planes: transformPlanes(planes, map),
+    policy: transformPolicy(policy, map),
+    value,
+  }));
+}
+
+function getEffectiveBatchSize(requestedBatchSize, totalSamples) {
+  let maxUsefulBatch = 256;
+
+  if (totalSamples <= 8192) {
+    maxUsefulBatch = 64;
+  } else if (totalSamples <= 32768) {
+    maxUsefulBatch = 128;
+  }
+
+  return Math.max(32, Math.min(requestedBatchSize, maxUsefulBatch, totalSamples));
+}
+
+function buildLrPhases(baseLR, epochs) {
+  if (epochs <= 8) {
+    return [
+      { fraction: 0.8, lr: baseLR },
+      { fraction: 0.2, lr: baseLR / 4 },
+    ];
+  }
+
+  if (epochs <= 20) {
+    return [
+      { fraction: 0.6, lr: baseLR },
+      { fraction: 0.3, lr: baseLR / 4 },
+      { fraction: 0.1, lr: baseLR / 10 },
+    ];
+  }
+
+  return [
+    { fraction: 0.4, lr: baseLR },
+    { fraction: 0.3, lr: baseLR / 4 },
+    { fraction: 0.3, lr: baseLR / 20 },
+  ];
+}
+
+// Создание валидационного набора — стратифицированная выборка из ВСЕХ позиций
+function createValidationSet() {
+  const allPositions = [];
+
+  // Собираем ВСЕ уникальные позиции через teacherBatches
+  for (const batch of teacherBatches({ batchSize: 10000 })) {
+    for (let i = 0; i < batch.count; i++) {
+      const planes = batch.x.slice(i * 27, (i + 1) * 27);
+      const policy = batch.yPolicy.slice(i * 9, (i + 1) * 9);
+      const value = batch.yValue[i];
+      allPositions.push(...augmentSampleBySymmetry(planes, policy, value));
+    }
+  }
+
+  console.log(`[TrainTTT3] Total positions for validation pool: ${allPositions.length}`);
+
+  // Перемешиваем и берём 500 позиций (или 10%, что меньше)
+  shuffleArray(allPositions);
+  const valSize = Math.min(500, Math.floor(allPositions.length * 0.1));
+  return allPositions.slice(0, valSize);
+}
+
+// Оценка качества модели на валидационном наборе
+async function evaluateModel(model, validationSet) {
   let correctMoves = 0;
   let valueError = 0;
   let totalPositions = 0;
-  
-  for (const { board, player } of validationSet) {
-    const planes = encodePlanes(board, player);
-    const mask = maskLegalMoves(board);
-    const { value: teacherValue, policy: teacherPolicy } = getTeacherValueAndPolicy(board, player);
-    
-    // Инференс модели
-    const posIndices = tf.tensor2d([Array.from({ length: 9 }, (_, i) => i)], [1, 9], 'int32');
-    // planes это Float32Array(27), преобразуем в плоский массив
-    const xFlat = Array.from(planes);
-    const x = tf.tensor3d(xFlat, [1, 9, 3]);
-    const [logits, value] = model.predict([x, posIndices]);
-    const masked = maskLogits(logits, tf.tensor2d([Array.from(mask)], [1, 9]));
-    const probs = tf.softmax(masked);
-    
-    const policyArray = Array.from(await probs.data());
-    const valueArray = await value.data();
-    
-    // Проверяем совпадение оптимальных ходов
-    const teacherOptimal = teacherPolicy.findIndex(p => p > 0.01);
-    const modelOptimal = policyArray.indexOf(Math.max(...policyArray));
-    
-    if (teacherPolicy[modelOptimal] > 0.01) {
+
+  // Батчевый инференс для скорости
+  const N = validationSet.length;
+  const planesArr = new Float32Array(N * 27);
+  const posArr = new Int32Array(N * 9);
+
+  for (let i = 0; i < N; i++) {
+    planesArr.set(validationSet[i].planes, i * 27);
+    for (let j = 0; j < 9; j++) {
+      posArr[i * 9 + j] = j;
+    }
+  }
+
+  const x = tf.tensor3d(Array.from(planesArr), [N, 9, 3]);
+  const pos = tf.tensor2d(Array.from(posArr), [N, 9], 'int32');
+
+  // Оборачиваем predict в tidy для очистки промежуточных тензоров MHA
+  const { logitsData, valueData } = tf.tidy(() => {
+    const [logits, valueTensor] = model.predict([x, pos]);
+    return {
+      logitsData: logits.dataSync(),
+      valueData: valueTensor.dataSync()
+    };
+  });
+
+  x.dispose();
+  pos.dispose();
+
+  for (let i = 0; i < N; i++) {
+    const teacherPolicy = validationSet[i].policy;
+    const teacherValue = validationSet[i].value;
+
+    // Получаем policy модели для этой позиции
+    const modelLogits = logitsData.slice(i * 9, (i + 1) * 9);
+
+    // Маскируем нелегальные ходы (где teacherPolicy > 0 — легальные оптимальные)
+    // Но нужна маска легальных ходов — восстановим из planes
+    const planes = validationSet[i].planes;
+    const mask = new Float32Array(9);
+    for (let j = 0; j < 9; j++) {
+      // planes[j*3 + 2] = 1.0 если клетка пустая
+      mask[j] = planes[j * 3 + 2];
+    }
+
+    // Argmax модели среди легальных ходов
+    let bestModelMove = -1;
+    let bestModelLogit = -Infinity;
+    for (let j = 0; j < 9; j++) {
+      if (mask[j] > 0.5 && modelLogits[j] > bestModelLogit) {
+        bestModelLogit = modelLogits[j];
+        bestModelMove = j;
+      }
+    }
+
+    // Проверяем, выбрала ли модель оптимальный ход (teacher даёт prob > 0 для оптимальных)
+    if (bestModelMove >= 0 && teacherPolicy[bestModelMove] > 0.01) {
       correctMoves++;
     }
-    
+
     // Ошибка value
-    valueError += Math.abs(valueArray[0] - teacherValue);
+    valueError += Math.abs(valueData[i] - teacherValue);
     totalPositions++;
-    
-    x.dispose();
-    posIndices.dispose();
-    logits.dispose();
-    value.dispose();
-    masked.dispose();
-    probs.dispose();
   }
-  
-  const accuracy = correctMoves / totalPositions;
-  const mae = valueError / totalPositions;
-  
+
+  const accuracy = totalPositions > 0 ? correctMoves / totalPositions : 0;
+  const mae = totalPositions > 0 ? valueError / totalPositions : 0;
+
   return { accuracy, mae };
 }
 
 // Основная функция обучения с прогрессом через callback
-export async function trainTTT3WithProgress(progressCb, { 
-  epochs = TRAIN.epochs, 
+export async function trainTTT3WithProgress(progressCb, {
+  epochs = TRAIN.epochs,
   batchSize = TRAIN.batchSize,
-  earlyStop = true 
+  earlyStop = true
 } = {}) {
   try {
-    // Валидируем epochs: максимум 10 (ограничение уже применено в server.mjs)
-    if (epochs > 10) {
-      console.warn(`[TrainTTT3] WARNING: epochs=${epochs} exceeds maximum of 10, using 10 instead`);
-      epochs = 10;
+    // Валидируем epochs: максимум 50
+    if (epochs > 50) {
+      console.warn(`[TrainTTT3] WARNING: epochs=${epochs} exceeds maximum of 50, using 50 instead`);
+      epochs = 50;
     }
     if (epochs < 1) {
       console.warn(`[TrainTTT3] WARNING: epochs=${epochs} is less than 1, using 1 instead`);
       epochs = 1;
     }
+
     console.log('[TrainTTT3] Starting training...');
     console.log('[TrainTTT3] Config:', { epochs, batchSize, ...TRANSFORMER_CFG });
-    console.log('[TrainTTT3] TRAIN.epochs from config:', TRAIN.epochs);
-    
-    // Проверяем GPU и явно проверяем backend
+
+    // Проверяем GPU
     const { getGpuInfo } = await import('./tf.mjs');
     const gpuInfo = getGpuInfo();
     const backend = tf.getBackend();
     const isGPU = backend === 'tensorflow' && gpuInfo.available;
-    
-    console.log('[TrainTTT3] GPU Info:', gpuInfo);
+
     console.log('[TrainTTT3] TensorFlow backend:', backend);
     console.log('[TrainTTT3] GPU acceleration:', isGPU ? 'ENABLED ✓' : 'DISABLED ✗');
-    
+
     if (!isGPU) {
-      const warning = 'WARNING: GPU not available! Training will be slow on CPU.';
-      console.warn(`[TrainTTT3] ${warning}`);
-      console.warn(`[TrainTTT3] Backend: ${backend}, GPU available: ${gpuInfo.available}`);
-      progressCb?.({ type: 'train.status', payload: { message: warning } });
+      progressCb?.({ type: 'train.status', payload: { message: 'CPU режим (GPU недоступен)' } });
     } else {
-      console.log('[TrainTTT3] GPU acceleration enabled ✓');
-      console.log('[TrainTTT3] All tensor operations will run on GPU');
       progressCb?.({ type: 'train.status', payload: { message: 'GPU ускорение активно ✓' } });
     }
-    
+
     // Отправляем старт
     progressCb?.({ type: 'train.start', payload: { epochs, batchSize, modelType: 'ttt3_transformer', gpu: gpuInfo.available } });
     progressCb?.({ type: 'train.status', payload: { message: 'Инициализация модели...' } });
-    
+
     // Создаем модель
     const model = buildPVTransformerSeq({
       dModel: TRANSFORMER_CFG.dModel,
@@ -150,127 +228,131 @@ export async function trainTTT3WithProgress(progressCb, {
       heads: TRANSFORMER_CFG.heads,
       dropout: TRANSFORMER_CFG.dropout
     });
-    
-    // Компилируем модель
-    const optimizer = tf.train.adam(TRAIN.lr);
-    model.compile({
-      optimizer,
-      loss: ['categoricalCrossentropy', 'meanSquaredError'],
-      lossWeights: [1.0, TRAIN.weightValue]
-    });
-    
+
+    // Multi-phase LR schedule:
+    // Phase 1 (40% эпох): LR = baseLR → быстрая конвергенция
+    // Phase 2 (30% эпох): LR = baseLR/4 → точная настройка
+    // Phase 3 (30% эпох): LR = baseLR/20 → финальная полировка
+    const baseLR = TRAIN.lr;
+    const lrPhases = buildLrPhases(baseLR, epochs);
+
+    function getLRForEpoch(epoch) {
+      let accumulated = 0;
+      for (const phase of lrPhases) {
+        accumulated += Math.round(phase.fraction * epochs);
+        if (epoch < accumulated) return phase.lr;
+      }
+      return lrPhases[lrPhases.length - 1].lr;
+    }
+
+    // Начальная компиляция
+    function compileWithLR(lr) {
+      model.compile({
+        optimizer: tf.train.adam(lr),
+        loss: [policyLossFromLogits, 'meanSquaredError'],
+        lossWeights: [1.0, TRAIN.weightValue]
+      });
+    }
+
+    let currentLR = baseLR;
+    compileWithLR(currentLR);
+    console.log(`[TrainTTT3] LR schedule: ${lrPhases.map(p => `${Math.round(p.fraction*100)}%@${p.lr}`).join(' → ')}`);
+
     progressCb?.({ type: 'train.status', payload: { message: 'Создание валидационного набора...' } });
-    
-    // Создаем валидационный набор
+
+    // Создаем валидационный набор (500 позиций)
     const validationSet = createValidationSet();
     console.log(`[TrainTTT3] Validation set size: ${validationSet.length}`);
-    
-    // Генерируем батчи для обучения
+
+    // Генерируем ВСЕ обучающие данные из minimax
     progressCb?.({ type: 'train.status', payload: { message: 'Генерация датасета из всех позиций...' } });
-    const batchGen = teacherBatches({ batchSize });
-    
-    let step = 0;
+    const batchGen = teacherBatches({ batchSize: 100000 }); // один большой батч
+
+    // Собираем все данные в один набор
+    const allX = [];
+    const allYPolicy = [];
+    const allYValue = [];
+    let totalSamples = 0;
+
+    for (const batch of batchGen) {
+      for (let i = 0; i < batch.count; i++) {
+        const planes = batch.x.slice(i * 27, (i + 1) * 27);
+        const policy = batch.yPolicy.slice(i * 9, (i + 1) * 9);
+        const value = batch.yValue[i];
+        const augmented = augmentSampleBySymmetry(planes, policy, value);
+
+        for (const sample of augmented) {
+          allX.push(...sample.planes);
+          allYPolicy.push(...sample.policy);
+          allYValue.push(sample.value);
+          totalSamples++;
+        }
+      }
+    }
+
+    console.log(`[TrainTTT3] Total training samples: ${totalSamples}`);
+    const effectiveBatchSize = getEffectiveBatchSize(batchSize, totalSamples);
+    console.log(`[TrainTTT3] Effective batch size: ${effectiveBatchSize} (requested: ${batchSize})`);
+
+    // Создаём тензоры
+    const xTensor = tf.tensor3d(new Float32Array(allX), [totalSamples, 9, 3]);
+    const posTensor = tf.tensor2d(
+      Array.from({ length: totalSamples }, () => [0, 1, 2, 3, 4, 5, 6, 7, 8]).flat(),
+      [totalSamples, 9],
+      'int32'
+    );
+    const yPolicyTensor = tf.tensor2d(new Float32Array(allYPolicy), [totalSamples, 9]);
+    const yValueTensor = tf.tensor2d(new Float32Array(allYValue), [totalSamples, 1]);
+
+    const saveDir = path.join(__dirname, '..', 'saved', 'ttt3_transformer');
+    await fs.mkdir(saveDir, { recursive: true });
+
+    progressCb?.({
+      type: 'train.status',
+      payload: {
+        message: `Начало обучения (${totalSamples} позиций, ${epochs} эпох, batch ${effectiveBatchSize})...`
+      }
+    });
+
     let bestAccuracy = 0;
     let bestMae = Infinity;
-    const saveDir = path.join(__dirname, '..', 'saved', 'ttt3_transformer');
-    
-    // Создаем директорию для сохранения
-    await fs.mkdir(saveDir, { recursive: true });
-    
-    progressCb?.({ type: 'train.status', payload: { message: 'Начало обучения...' } });
-    
-    let totalBatches = 0;
-    const batches = [];
-    for (const batch of batchGen) {
-      batches.push(batch);
-      totalBatches++;
-    }
-    
-    console.log(`[TrainTTT3] Total batches: ${totalBatches}`);
-    
+
+    // Обучение через model.fit — Keras правильно разобьёт на батчи
     for (let epoch = 0; epoch < epochs; epoch++) {
-      progressCb?.({ type: 'train.status', payload: { message: `Эпоха ${epoch + 1}/${epochs}...` } });
-      
-      let epochLoss = 0;
-      let batchCount = 0;
-      
-      for (const batch of batches) {
-        // Преобразуем batch в тензоры
-        const batchSize_actual = batch.count;
-        // batch.x это Float32Array с batchSize_actual * 27 элементами (27 = 9*3)
-        // Преобразуем в плоский массив и создаем tensor3d напрямую
-        const xFlat = Array.from(batch.x); // Преобразуем Float32Array в обычный массив
-        const x = tf.tensor3d(xFlat, [batchSize_actual, 9, 3]);
-        
-        const posIndices = tf.tensor2d(
-          Array.from({ length: batchSize_actual }, () => 
-            Array.from({ length: 9 }, (_, i) => i)
-          ),
-          [batchSize_actual, 9],
-          'int32'
-        );
-        
-        const yPolicy = tf.tensor2d(
-          Array.from({ length: batchSize_actual }, (_, i) => 
-            Array.from(batch.yPolicy.slice(i * 9, (i + 1) * 9))
-          ),
-          [batchSize_actual, 9]
-        );
-        
-        const yValue = tf.tensor2d(
-          Array.from(batch.yValue),
-          [batchSize_actual, 1]
-        );
-        
-        // Обучение шага (все операции выполняются на GPU автоматически через tfjs-node-gpu)
-        // TensorFlow.js автоматически размещает тензоры и операции на GPU если доступен
-        const history = await model.fit(
-          [x, posIndices],
-          [yPolicy, yValue],
-          {
-            epochs: 1,
-            batchSize: batchSize_actual,
-            verbose: 0
-          }
-        );
-        
-        // Проверяем, что операции действительно на GPU (для логирования)
-        if (step % 50 === 0) {
-          const currentBackend = tf.getBackend();
-          const isGpuBackend = currentBackend === 'tensorflow';
-          if (isGpuBackend) {
-            console.log(`[TrainTTT3] Step ${step}: ✓ Operations running on GPU (backend: ${currentBackend})`);
-          } else {
-            console.warn(`[TrainTTT3] Step ${step}: ⚠ Operations running on ${currentBackend} (not GPU!)`);
-          }
-        }
-        
-        const loss = history.history.loss[0];
-        epochLoss += loss;
-        batchCount++;
-        
-        // Очистка памяти
-        x.dispose();
-        posIndices.dispose();
-        yPolicy.dispose();
-        yValue.dispose();
-        
-        step++;
+      // Обновляем LR при переходе между фазами
+      const epochLR = getLRForEpoch(epoch);
+      if (Math.abs(epochLR - currentLR) > 1e-8) {
+        currentLR = epochLR;
+        compileWithLR(currentLR);
+        console.log(`[TrainTTT3] LR changed to ${currentLR} at epoch ${epoch + 1}`);
       }
-      
-      const avgLoss = epochLoss / batchCount;
-      
-      // Оценка каждую эпоху
+
+      progressCb?.({ type: 'train.status', payload: { message: `Эпоха ${epoch + 1}/${epochs} (LR: ${currentLR.toExponential(1)})...` } });
+
+      const history = await model.fit(
+        [xTensor, posTensor],
+        [yPolicyTensor, yValueTensor],
+        {
+          epochs: 1,
+          batchSize: effectiveBatchSize,
+          shuffle: true,
+          verbose: 0
+        }
+      );
+
+      const loss = history.history.loss[0];
+
+      // Оценка на валидационном наборе
       progressCb?.({ type: 'train.status', payload: { message: `Оценка модели (эпоха ${epoch + 1})...` } });
-      const { accuracy, mae } = await evaluateModel(model, validationSet, progressCb);
-      
+      const { accuracy, mae } = await evaluateModel(model, validationSet);
+
       // Отправляем прогресс
-      progressCb?.({ 
+      progressCb?.({
         type: 'train.progress',
         payload: {
           epoch: epoch + 1,
           epochs,
-          loss: avgLoss.toFixed(4),
+          loss: Number(loss).toFixed(4),
           acc: (accuracy * 100).toFixed(2),
           val_loss: mae.toFixed(4),
           val_acc: (accuracy * 100).toFixed(2),
@@ -279,24 +361,28 @@ export async function trainTTT3WithProgress(progressCb, {
           mae: mae.toFixed(4)
         }
       });
-      
-      console.log(`[TrainTTT3] Epoch ${epoch + 1}/${epochs} - Loss: ${avgLoss.toFixed(4)}, Accuracy: ${(accuracy * 100).toFixed(2)}%, MAE: ${mae.toFixed(4)}`);
-      
+
+      console.log(`[TrainTTT3] Epoch ${epoch + 1}/${epochs} - Loss: ${Number(loss).toFixed(4)}, Accuracy: ${(accuracy * 100).toFixed(2)}%, MAE: ${mae.toFixed(4)}`);
+
       // Ранний стоп: accuracy >= 99.9% и MAE <= 1e-3
       if (earlyStop && accuracy >= 0.999 && mae <= 1e-3) {
         console.log('[TrainTTT3] Early stopping: model reached perfection!');
         await model.save(`file://${saveDir}`);
         progressCb?.({ type: 'train.status', payload: { message: 'Модель достигла идеальности! Сохранение...' } });
-        
-        // Перезагружаем модель в памяти после сохранения
+
         const { reloadTTT3Model } = await import('../service.mjs');
         reloadTTT3Model();
-        console.log('[TrainTTT3] Model reloaded in memory after early stop');
-        
+
         progressCb?.({ type: 'train.done', payload: { saved: true, earlyStop: true, accuracy, mae } });
+
+        // Cleanup
+        xTensor.dispose();
+        posTensor.dispose();
+        yPolicyTensor.dispose();
+        yValueTensor.dispose();
         return;
       }
-      
+
       // Сохраняем лучший чекпоинт
       if (accuracy > bestAccuracy || (Math.abs(accuracy - bestAccuracy) < 1e-6 && mae < bestMae)) {
         bestAccuracy = accuracy;
@@ -305,18 +391,21 @@ export async function trainTTT3WithProgress(progressCb, {
         console.log(`[TrainTTT3] Best checkpoint saved (acc: ${(accuracy * 100).toFixed(2)}%, mae: ${mae.toFixed(4)})`);
       }
     }
-    
+
+    // Cleanup тензоров
+    xTensor.dispose();
+    posTensor.dispose();
+    yPolicyTensor.dispose();
+    yValueTensor.dispose();
+
     // Сохраняем финальную модель
     await model.save(`file://${saveDir}`);
     progressCb?.({ type: 'train.status', payload: { message: 'Обучение завершено! Сохранение модели...' } });
-    
-    // Перезагружаем модель в памяти после сохранения
+
     const { reloadTTT3Model } = await import('../service.mjs');
     reloadTTT3Model();
-    console.log('[TrainTTT3] Model reloaded in memory after training');
-    
+
     progressCb?.({ type: 'train.done', payload: { saved: true, accuracy: bestAccuracy, mae: bestMae } });
-    
     console.log('[TrainTTT3] Training completed!');
   } catch (e) {
     console.error('[TrainTTT3] Error during training:', e);

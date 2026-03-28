@@ -1,8 +1,9 @@
 services:
   server:
+    platform: linux/amd64
     build:
       context: .
-      dockerfile: Dockerfile.server
+      dockerfile: Dockerfile.server.cpu
     container_name: tic-tac-toe-server
     ports:
       - "8080:8080"
@@ -29,4 +30,3 @@ services:
     depends_on:
       - server
     restart: unless-stopped
-

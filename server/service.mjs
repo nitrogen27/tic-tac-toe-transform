@@ -3,173 +3,38 @@ const tf = tfpkg;
 import fs from 'fs/promises';
 import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { buildModel } from './src/model_transformer.mjs';
-import { BOARD_N, TRANSFORMER_CFG } from './src/config.mjs';
-import { loadDataset } from './src/dataset.mjs';
-import { relativeCells } from './src/tic_tac_toe.mjs';
+import { TRAIN, TRANSFORMER_CFG, TTT5_TRANSFORMER_CFG, TTT5_MCTS, TTT5_WIN_LEN } from './src/config.mjs';
+import { SYMMETRY_MAPS, transformBoard, inverseTransformPolicy } from './src/ttt3_symmetry.mjs';
+import { SYMMETRY_MAPS_5, transformBoard as transformBoard5, inverseTransformPolicy as inverseTransformPolicy5 } from './src/ttt5_symmetry.mjs';
+import { createGameAdapter } from './src/game_adapter.mjs';
+import { inferencePolicy } from './src/inference_policy.mjs';
+import { createGomokuEngine, GOMOKU_VARIANTS } from './src/engine/index.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 export const _MODEL_DIR = path.resolve(__dirname, 'saved');
 
-let model = null;
-let building = false;
-
-// Хранилище игровой истории для дообучения
+// ===== Хранилище игровой истории для дообучения =====
+// TTT3: { planes: Float32Array(27), policy: Float32Array(9), value: number }
 let gameHistory = [];
-const MAX_HISTORY_SIZE = 10000; // Максимум сохраненных ходов
+const MAX_HISTORY_SIZE = 10000;
+
+// TTT5: { planes: Float32Array(75), policy: Float32Array(25), value: number }
+let ttt5GameHistory = [];
+const MAX_TTT5_HISTORY = 10000;
 
 // Хранилище полных игр для анализа ошибок
-let gameSequences = []; // [{ moves: [{board, move, current}], winner, playerRole }]
-const MAX_GAME_SEQUENCES = 100; // Храним последние 100 игр
+let gameSequences = [];
+const MAX_GAME_SEQUENCES = 100;
 
 async function ensureDir(p) { try { await fs.mkdir(p, { recursive: true }); } catch {} }
 
-// Проверяет, существует ли обученная модель
-export async function hasTrainedModel() {
-  try {
-    const modelPath = path.join(_MODEL_DIR, 'model.json');
-    await fs.access(modelPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export async function ensureModel({ forceFresh = false } = {}) {
-  const force = !!forceFresh;
-  if (building) { while (building) await new Promise(r => setTimeout(r, 25)); return model; }
-  building = true;
-  try {
-    if (force && model) { model.dispose?.(); model = null; }
-    await ensureDir(_MODEL_DIR);
-    if (!model) {
-      const exists = await fs.stat(path.join(_MODEL_DIR, 'model.json')).then(()=>true).catch(()=>false);
-      if (exists) {
-        model = await tf.loadLayersModel(`file://${_MODEL_DIR}/model.json`);
-        model.compile({ optimizer: tf.train.adam(1e-3), loss: 'categoricalCrossentropy', metrics: ['accuracy'] });
-      } else {
-        const useBig = process.env.USE_GPU_BIG === '1';
-        model = buildModel({  dModel: useBig ? 512 : 64, numLayers: useBig ? 8 : 2 , seqLen: (BOARD_N*BOARD_N), vocabSize: 3 });
-        console.log(`[Model] Using ${useBig ? 'BIG GPU' : 'small CPU'} model: dModel=${useBig ? 512 : 64}, numLayers=${useBig ? 8 : 2}`);
-      }
-    }
-    return model;
-  } finally { building = false; }
-}
-
-// Оптимальные параметры для GPU/CPU: адаптивный batchSize
-export async function trainWithProgress(progressCb, { epochs=5, batchSize, nTrain=50000, nVal=5000 } = {}) {
-  try {
-    // Определяем оптимальный batchSize в зависимости от backend
-    const { getGpuInfo } = await import('./src/tf.mjs');
-    const gpuInfo = getGpuInfo();
-    const isGPU = gpuInfo.available && gpuInfo.backend === 'gpu';
-    
-    // Адаптивный batchSize: GPU - 8192-16384, CPU - 2048-4096
-    // Но для маленьких датасетов (nTrain < 10000) используем меньший batch
-    if (batchSize === undefined || batchSize === null) {
-      if (nTrain < 100) {
-        // Очень маленький датасет - используем очень маленький batch чтобы избежать OOM
-        batchSize = isGPU ? 32 : 16;
-      } else if (nTrain < 1000) {
-        // Маленький датасет - используем маленький batch
-        batchSize = isGPU ? 128 : 64;
-      } else if (nTrain < 10000) {
-        // Средний датасет - используем средний batch
-        batchSize = isGPU ? 1024 : 512;
-      } else {
-        batchSize = isGPU ? 16384 : 4096;
-      }
-    } else {
-      // Если batchSize указан явно, используем его (но ограничиваем для маленьких датасетов)
-      if (nTrain < 100) {
-        batchSize = Math.min(64, batchSize);  // Максимум 64 для очень маленьких датасетов
-      } else if (nTrain < 1000) {
-        batchSize = isGPU 
-          ? Math.max(32, Math.min(256, batchSize))
-          : Math.max(16, Math.min(128, batchSize));
-      } else if (nTrain < 10000) {
-        batchSize = isGPU 
-          ? Math.max(512, Math.min(4096, batchSize))
-          : Math.max(256, Math.min(2048, batchSize));
-      } else {
-        batchSize = isGPU 
-          ? Math.max(8192, batchSize)
-          : Math.max(2048, Math.min(4096, batchSize));
-      }
-    }
-    
-    // Отправляем старт сразу, чтобы клиент знал что запрос получен
-    progressCb?.({ type: 'train.start', payload: { epochs, batchSize, nTrain, nVal } });
-    
-    console.log('[Train] Step 1: Ensuring model...');
-    progressCb?.({ type: 'train.status', payload: { message: 'Инициализация модели...' } });
-    const m = await ensureModel({ forceFresh: true });
-    console.log('[Train] Step 2: Model ensured, loading dataset...');
-    
-    progressCb?.({ type: 'train.status', payload: { message: `Генерация датасета (${nTrain + nVal} игр)...` } });
-    // НЕ передаем progressCb в loadDataset - но добавим статус перед и после
-    console.log('[Train] Loading dataset...');
-    const { xCells, xPos, yOneHot, xValCells, xValPos, yVal } = await loadDataset(nTrain, nVal, null);
-    console.log('[Train] Dataset loaded, starting fit...');
-    
-    progressCb?.({ type: 'train.status', payload: { message: 'Начало обучения...' } });
-    
-    // Подаём тензоры целиком - Keras сам правильно разобьёт по батчам
-    // НЕ указываем stepsPerEpoch/validationSteps - они дают лишний оверхед
-    console.log(`[Train] Starting fit with epochs=${epochs}, batchSize=${batchSize}, data shape=${xCells.shape[0]}`);
-    await m.fit([xCells, xPos], yOneHot, {
-      epochs, 
-      batchSize, // Адаптивный batchSize (GPU: 8192-16384, CPU: 2048-4096)
-      shuffle: true,
-      validationData: [[xValCells, xValPos], yVal],
-      verbose: 0, // Без verbose для производительности
-      // НЕ указываем stepsPerEpoch - TensorFlow сам определит из размера тензоров
-      callbacks: {
-        onTrainBegin: () => {
-          console.log('[Train] onTrainBegin called');
-          progressCb?.({ type: 'train.status', payload: { message: 'Обучение началось...' } });
-        },
-        onEpochBegin: (epoch) => {
-          console.log(`[Train] onEpochBegin called for epoch ${epoch + 1}/${epochs}`);
-          progressCb?.({ type: 'train.status', payload: { message: `Эпоха ${epoch + 1}/${epochs}...` } });
-        },
-        onEpochEnd: (epoch, logs) => {
-          console.log(`[Train] onEpochEnd called for epoch ${epoch + 1}/${epochs}, logs:`, logs);
-          // Прогресс ТОЛЬКО в onEpochEnd - без промежуточных колбэков
-          progressCb?.({ type:'train.progress',
-            payload: {
-              epoch: epoch+1, epochs,
-              loss: Number(logs.loss ?? 0).toFixed(4),
-              acc: Number(logs.acc ?? 0).toFixed(4),
-              val_loss: Number(logs.val_loss ?? 0).toFixed(4),
-              val_acc: Number(logs.val_acc ?? 0).toFixed(4),
-              percent: Math.round(((epoch+1)/epochs)*100),
-            }});
-        },
-        onTrainEnd: () => {
-          console.log('[Train] onTrainEnd called');
-          progressCb?.({ type:'train.done', payload:{ saved:true } });
-        },
-      }
-    });
-    await m.save(`file://${_MODEL_DIR}`);
-    xCells.dispose(); xPos.dispose(); yOneHot.dispose();
-    xValCells.dispose(); xValPos.dispose(); yVal.dispose();
-  } catch (e) {
-    console.error('[Train] Error during training:', e);
-    progressCb?.({ type: 'error', error: String(e) });
-    throw e;
-  }
-}
-
-// Загрузка TTT3 Transformer модели
+// ===== TTT3 Transformer Model =====
 let ttt3Model = null;
 let ttt3ModelLoading = false;
 
-// Экспортируем функцию для принудительной перезагрузки модели
+// Перезагрузка модели (сброс кеша)
 export function reloadTTT3Model() {
   console.log('[PredictTTT3] Reloading model: clearing cache...');
   if (ttt3Model) {
@@ -183,365 +48,644 @@ export function reloadTTT3Model() {
   ttt3ModelLoading = false;
 }
 
+// Загрузка TTT3 Transformer модели
 async function ensureTTT3Model() {
   if (ttt3ModelLoading) {
     while (ttt3ModelLoading) await new Promise(r => setTimeout(r, 25));
     return ttt3Model;
   }
-  
-  // Если модель уже загружена, возвращаем её
+
   if (ttt3Model) {
-    console.log('[PredictTTT3] Using cached TTT3 model from memory');
     return ttt3Model;
   }
-  
-  // Логируем попытку загрузки для отладки
-  console.log('[PredictTTT3] Model not in cache, attempting to load from disk...');
-  
+
   ttt3ModelLoading = true;
   try {
     const ttt3ModelPath = path.join(_MODEL_DIR, 'ttt3_transformer', 'model.json');
     const exists = await fs.stat(ttt3ModelPath).then(() => true).catch(() => false);
-    
+
     if (exists) {
-      // Загружаем сохраненную модель
-      // ВАЖНО: Модель с кастомными слоями может не загрузиться
-      // Если загрузка не удалась, нужно переобучить модель
       try {
         ttt3Model = await tf.loadLayersModel(`file://${ttt3ModelPath}`);
-        // Компилируем для инференса (не нужен оптимизатор, но нужны входы/выходы)
-        console.log('[PredictTTT3] ✓ Loaded TTT3 Transformer model from', ttt3ModelPath);
+        console.log('[PredictTTT3] ✓ Loaded TTT3 Transformer model');
         console.log('[PredictTTT3] Model inputs:', ttt3Model.inputs.map(i => i.shape));
         console.log('[PredictTTT3] Model outputs:', ttt3Model.outputs.map(o => o.shape));
       } catch (loadError) {
         console.error('[PredictTTT3] ❌ Failed to load model:', loadError.message);
-        console.error('[PredictTTT3] Model file exists but cannot be loaded.');
-        console.error('[PredictTTT3] This usually means the model was saved with custom layers that cannot be deserialized.');
         console.error('[PredictTTT3] Solution: Delete the model (click "Clear Model") and retrain.');
-        console.error('[PredictTTT3] Will use random moves as fallback');
         ttt3Model = null;
       }
     } else {
-      console.log('[PredictTTT3] TTT3 Transformer model not found at', ttt3ModelPath);
-      console.log('[PredictTTT3] Will use random moves as fallback');
+      console.log('[PredictTTT3] TTT3 model not found. Use "Train" button to train from scratch.');
     }
   } catch (e) {
     console.error('[PredictTTT3] Error loading model:', e);
-    console.log('[PredictTTT3] Will use random moves as fallback');
     ttt3Model = null;
   } finally {
     ttt3ModelLoading = false;
   }
-  
-  return ttt3Model; // null если модель не найдена
+
+  return ttt3Model;
 }
 
-// Предсказание для TTT3 (3x3) с использованием Transformer модели
+// Проверяет, существует ли обученная модель
+export async function hasTrainedModel() {
+  try {
+    const modelPath = path.join(_MODEL_DIR, 'ttt3_transformer', 'model.json');
+    await fs.access(modelPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ===== TTT5 Transformer Model =====
+let ttt5Model = null;
+let ttt5ModelLoading = false;
+const ttt5Adapter = createGameAdapter({ variant: 'ttt5', winLen: TTT5_WIN_LEN });
+
+export function reloadTTT5Model() {
+  console.log('[PredictTTT5] Reloading model: clearing cache...');
+  if (ttt5Model) {
+    try { ttt5Model.dispose(); } catch (e) { console.warn('[PredictTTT5] Error disposing:', e.message); }
+  }
+  ttt5Model = null;
+  ttt5ModelLoading = false;
+}
+
+async function ensureTTT5Model() {
+  if (ttt5ModelLoading) {
+    while (ttt5ModelLoading) await new Promise(r => setTimeout(r, 25));
+    return ttt5Model;
+  }
+  if (ttt5Model) return ttt5Model;
+
+  ttt5ModelLoading = true;
+  try {
+    const ttt5ModelPath = path.join(_MODEL_DIR, 'ttt5_transformer', 'model.json');
+    const exists = await fs.stat(ttt5ModelPath).then(() => true).catch(() => false);
+    if (exists) {
+      try {
+        ttt5Model = await tf.loadLayersModel(`file://${ttt5ModelPath}`);
+        console.log('[PredictTTT5] Loaded TTT5 Transformer model');
+      } catch (loadError) {
+        console.error('[PredictTTT5] Failed to load model:', loadError.message);
+        ttt5Model = null;
+      }
+    } else {
+      console.log('[PredictTTT5] TTT5 model not found. Train first.');
+    }
+  } catch (e) {
+    console.error('[PredictTTT5] Error loading model:', e);
+    ttt5Model = null;
+  } finally {
+    ttt5ModelLoading = false;
+  }
+  return ttt5Model;
+}
+
+// ===== Конвертация доски из WebSocket {0,1,2} в игровой формат {0,+1,-1} =====
+// WebSocket: 0=empty, 1=player1(X), 2=player2(O)
+// Игровой движок: 0=empty, +1=X, -1=O
+function convertBoard(board) {
+  return new Int8Array(board.map(v => v === 2 ? -1 : v));
+}
+
+function countFilledCells(board) {
+  let filled = 0;
+  for (let i = 0; i < board.length; i++) {
+    if (board[i] !== 0) filled++;
+  }
+  return filled;
+}
+
+function getDynamicTTT5Simulations(board) {
+  const base = TTT5_MCTS.inferenceSimulations;
+  const filled = countFilledCells(board);
+  if (filled < 4) return Math.max(base, 80);
+  if (filled < 10) return Math.max(base, 120);
+  return Math.max(base, 180);
+}
+
+function chooseTTT5FallbackMove(board, player) {
+  // Без обученной модели бот играет случайно (только базовая безопасность)
+  const legal = ttt5Adapter.legalMoves(board);
+  if (legal.length === 0) return -1;
+
+  // Только самые базовые проверки: не проиграть в 1 ход
+  const winMove = ttt5Adapter.findImmediateWin(board, player);
+  if (winMove >= 0) return winMove;
+  const blockMove = ttt5Adapter.findImmediateBlock(board, player);
+  if (blockMove >= 0) return blockMove;
+
+  // Без модели — случайный ход из легальных
+  return legal[Math.floor(Math.random() * legal.length)];
+}
+
+// ===== Предсказание хода =====
 async function predictTTT3Move({ board, current = 1 }) {
   const { encodePlanes, maskLegalMoves, legalMoves } = await import('./src/game_ttt3.mjs');
   const { maskLogits } = await import('./src/model_pv_transformer_seq.mjs');
   const { safePick } = await import('./src/safety.mjs');
-  
-  // Проверяем, что доска правильного размера
+
   if (board.length !== 9) {
     throw new Error(`Invalid board size: expected 9, got ${board.length}`);
   }
-  
-  // Проверяем, есть ли обученная модель
+
+  // КРИТИЧНО: конвертируем из {0,1,2} → {0,+1,-1}
+  // Без этого encodePlanes не видит фигуры оппонента (2 ≠ -1),
+  // blockingMove не может симулировать ходы оппонента
+  const boardInt = convertBoard(board);
+
   const model = await ensureTTT3Model();
-  
+
   if (!model) {
-    // Если модели нет - можно играть, используя случайные ходы или minimax
-    // Для удобства используем случайные ходы (можно переключить на minimax)
-    const moves = legalMoves(new Int8Array(board));
+    // Нет обученной модели — случайные ходы
+    const moves = legalMoves(boardInt);
     if (moves.length === 0) {
       return { move: -1, probs: Array(9).fill(0), isRandom: true, mode: 'model', fallback: 'random' };
     }
-    
-    // Выбираем случайный ход из доступных
-    // Модель можно обучить с нуля, нажав "Обучить"
     const randomMove = moves[Math.floor(Math.random() * moves.length)];
     const probs = Array(9).fill(0);
     probs[randomMove] = 1.0;
-    
-    console.log('[PredictTTT3] No trained model, using RANDOM move. Use "Train" button to train from scratch.');
-    return { 
-      move: randomMove, 
-      probs, 
-      value: 0, 
-      isRandom: true, 
-      mode: 'model', 
-      fallback: 'random' 
-    };
+    console.log('[PredictTTT3] No trained model, using RANDOM move.');
+    return { move: randomMove, probs, value: 0, isRandom: true, mode: 'model', fallback: 'random' };
   }
-  
+
   // Используем обученную модель
-  const player = current === 1 ? 1 : -1; // Преобразуем 1/2 в 1/-1
-  const planes = encodePlanes(new Int8Array(board), player);
-  const mask = maskLegalMoves(new Int8Array(board));
-  
-  // Создаем тензоры в правильном формате
-  const xFlat = Array.from(planes);
-  const x = tf.tensor3d(xFlat, [1, 9, 3]);
-  const pos = tf.tensor2d([[0, 1, 2, 3, 4, 5, 6, 7, 8]], [1, 9], 'int32');
-  
-  // Предсказание
-  const [logits, valueTensor] = model.predict([x, pos]);
-  const maskedLogits = maskLogits(logits, tf.tensor2d([Array.from(mask)], [1, 9]));
-  const probs = tf.softmax(maskedLogits);
-  
-  const policyArray = Array.from(await probs.data());
-  const value = (await valueTensor.data())[0];
-  
-  // Очистка памяти
+  const player = current === 1 ? 1 : -1;
+  const symmetryBoards = SYMMETRY_MAPS.map(({ map }) => transformBoard(boardInt, map));
+  const xInput = new Float32Array(symmetryBoards.length * 27);
+  const maskInput = new Float32Array(symmetryBoards.length * 9);
+  const posInput = new Int32Array(symmetryBoards.length * 9);
+
+  for (let i = 0; i < symmetryBoards.length; i++) {
+    const planes = encodePlanes(symmetryBoards[i], player);
+    const mask = maskLegalMoves(symmetryBoards[i]);
+    xInput.set(planes, i * 27);
+    maskInput.set(mask, i * 9);
+    for (let j = 0; j < 9; j++) {
+      posInput[i * 9 + j] = j;
+    }
+  }
+
+  const x = tf.tensor3d(xInput, [symmetryBoards.length, 9, 3]);
+  const pos = tf.tensor2d(posInput, [symmetryBoards.length, 9], 'int32');
+  const maskTensor = tf.tensor2d(maskInput, [symmetryBoards.length, 9]);
+
+  const { probsData, valuesData } = tf.tidy(() => {
+    const [logits, valueTensor] = model.predict([x, pos]);
+    const maskedLogits = maskLogits(logits, maskTensor);
+    const probs = tf.softmax(maskedLogits);
+    return {
+      probsData: probs.dataSync(),
+      valuesData: valueTensor.dataSync()
+    };
+  });
+
   x.dispose();
   pos.dispose();
-  logits.dispose();
-  maskedLogits.dispose();
-  probs.dispose();
-  valueTensor.dispose();
-  
-  // Применяем safety-правила
-  const moves = legalMoves(new Int8Array(board));
+  maskTensor.dispose();
+
+  const averagedPolicy = new Float32Array(9);
+  let valueSum = 0;
+
+  for (let i = 0; i < SYMMETRY_MAPS.length; i++) {
+    const start = i * 9;
+    const transformedPolicy = probsData.slice(start, start + 9);
+    const restoredPolicy = inverseTransformPolicy(transformedPolicy, SYMMETRY_MAPS[i].map);
+
+    for (let j = 0; j < 9; j++) {
+      averagedPolicy[j] += restoredPolicy[j];
+    }
+    valueSum += valuesData[i];
+  }
+
+  const policyArray = Array.from(averagedPolicy, v => v / SYMMETRY_MAPS.length);
+  const value = valueSum / SYMMETRY_MAPS.length;
+
+  // Safety rules — используем boardInt (формат {-1,0,+1})
+  const moves = legalMoves(boardInt);
   if (moves.length === 0) {
     return { move: -1, probs: Array(9).fill(0), value, isRandom: false, mode: 'model' };
   }
-  
-  // Детальное логирование для отладки
+
   const policyMax = Math.max(...policyArray);
   const policyMaxIdx = policyArray.indexOf(policyMax);
-  
-  // Проверяем safety-правила ДО вызова safePick для логирования
+
   const { winningMove, blockingMove } = await import('./src/safety.mjs');
-  const winMove = winningMove(new Int8Array(board), player);
-  const blockMove = blockingMove(new Int8Array(board), player);
-  
-  console.log('[PredictTTT3] Model prediction BEFORE safety:', {
-    board: Array.from(board),
-    player,
-    policyMax: policyMax.toFixed(4),
-    policyMaxIdx,
-    value: value.toFixed(4),
-    hasWinningMove: winMove >= 0,
-    hasBlockingMove: blockMove >= 0,
-    policy: policyArray.map((p, i) => `${i}:${p.toFixed(3)}`).join(' ')
-  });
-  
-  const move = safePick(new Int8Array(board), player, policyArray);
-  
-  // Проверяем, был ли ход изменен safety-правилами
+  const winMove = winningMove(boardInt, player);
+  const blockMove = blockingMove(boardInt, player);
+
+  const move = safePick(boardInt, player, policyArray);
+
   const wasChangedBySafety = move !== policyMaxIdx;
   if (wasChangedBySafety) {
-    console.log('[PredictTTT3] ⚠️ Move changed by safety rules!', {
-      modelPrediction: policyMaxIdx,
-      modelPolicy: policyArray[policyMaxIdx].toFixed(4),
-      safetyMove: move,
+    console.log('[PredictTTT3] ⚠️ Safety override:', {
+      model: policyMaxIdx,
+      safety: move,
       reason: winMove >= 0 ? 'winning' : (blockMove >= 0 ? 'blocking' : 'unknown')
     });
-  } else {
-    console.log('[PredictTTT3] ✓ Using model prediction (no safety override)');
   }
-  
-  console.log('[PredictTTT3] Final move:', move);
-  console.log('[PredictTTT3] Model confidence:', {
-    maxProb: policyMax.toFixed(4),
-    maxProbIdx: policyMaxIdx,
-    value: value.toFixed(4),
-    move: move,
-    safetyOverride: wasChangedBySafety
-  });
-  
-  return { 
-    move, 
-    probs: policyArray, 
-    value, 
-    isRandom: false, 
+
+  return {
+    move,
+    probs: policyArray,
+    value,
+    isRandom: false,
     mode: 'model',
-    confidence: policyMax // Отправляем как число, а не строку
+    confidence: policyMax
   };
 }
 
-export async function predictMove({ board, current = 1, mode = 'model' }) {
-  // Если выбран режим алгоритма - используем minimax
+// ===== Предсказание хода TTT5 (5x5, 4-in-a-row) =====
+async function predictTTT5Move({ board, current = 1 }) {
+  const { maskLogits } = await import('./src/model_pv_transformer_seq.mjs');
+
+  if (board.length !== 25) {
+    throw new Error(`Invalid board size for TTT5: expected 25, got ${board.length}`);
+  }
+
+  const boardInt = convertBoard(board);
+  const model = await ensureTTT5Model();
+  const player = current === 1 ? 1 : -1;
+
+  if (!model) {
+    const move = chooseTTT5FallbackMove(boardInt, player);
+    if (move < 0) {
+      return { move: -1, probs: Array(25).fill(0), isRandom: true, mode: 'model', fallback: 'random' };
+    }
+    const probs = Array(25).fill(0);
+    probs[move] = 1;
+    return { move, probs, value: 0, isRandom: false, mode: 'model', fallback: 'heuristic' };
+  }
+
+  // Create nnEval callback for inference policy
+  const nnEval = async (b, p) => {
+    const symmetryBoards = SYMMETRY_MAPS_5.map(({ map }) => transformBoard5(b, map));
+    const xInput = new Float32Array(symmetryBoards.length * 75);
+    const posInput = new Int32Array(symmetryBoards.length * 25);
+    const maskInput = new Float32Array(symmetryBoards.length * 25);
+
+    for (let i = 0; i < symmetryBoards.length; i++) {
+      const planes = ttt5Adapter.encodePlanes(symmetryBoards[i], p);
+      const mask = ttt5Adapter.maskLegalMoves(symmetryBoards[i]);
+      xInput.set(planes, i * 75);
+      maskInput.set(mask, i * 25);
+      for (let j = 0; j < 25; j++) posInput[i * 25 + j] = j;
+    }
+
+    const x = tf.tensor3d(xInput, [symmetryBoards.length, 25, 3]);
+    const posIndices = tf.tensor2d(posInput, [symmetryBoards.length, 25], 'int32');
+    const maskTensor = tf.tensor2d(maskInput, [symmetryBoards.length, 25]);
+
+    const { probsData, valueData } = tf.tidy(() => {
+      const [logits, valueTensor] = model.predict([x, posIndices]);
+      const masked = maskLogits(logits, maskTensor);
+      const probs = tf.softmax(masked, -1);
+      return {
+        probsData: probs.dataSync(),
+        valueData: valueTensor.dataSync(),
+      };
+    });
+
+    x.dispose();
+    posIndices.dispose();
+    maskTensor.dispose();
+
+    const averagedPolicy = new Float32Array(25);
+    let valueSum = 0;
+    for (let i = 0; i < SYMMETRY_MAPS_5.length; i++) {
+      const start = i * 25;
+      const transformedPolicy = probsData.slice(start, start + 25);
+      const restoredPolicy = inverseTransformPolicy5(transformedPolicy, SYMMETRY_MAPS_5[i].map);
+      for (let j = 0; j < 25; j++) averagedPolicy[j] += restoredPolicy[j];
+      valueSum += valueData[i];
+    }
+
+    for (let i = 0; i < 25; i++) averagedPolicy[i] /= SYMMETRY_MAPS_5.length;
+
+    return {
+      policy: averagedPolicy,
+      value: valueSum / SYMMETRY_MAPS_5.length,
+    };
+  };
+
+  // Use InferencePolicy with MCTS for stable play
+  const result = await inferencePolicy({
+    adapter: ttt5Adapter,
+    nnEval,
+    board: boardInt,
+    player,
+    useMCTS: true,
+    mctsSimulations: getDynamicTTT5Simulations(boardInt),
+    mctsCpuct: TTT5_MCTS.cpuct,
+    temperature: TTT5_MCTS.inferenceTemperature,
+  });
+
+  return {
+    move: result.move,
+    probs: result.policy,
+    value: result.value,
+    isRandom: false,
+    mode: 'model',
+    source: result.source,
+    confidence: Math.max(...result.policy),
+  };
+}
+
+// ===== Gomoku Engine V2 (7x7 — 16x16, 5-in-a-row) =====
+const gomokuEngines = new Map(); // cache engines by variant
+
+function getGomokuEngine(variant) {
+  if (gomokuEngines.has(variant)) return gomokuEngines.get(variant);
+
+  const config = GOMOKU_VARIANTS[variant];
+  if (!config) {
+    // Parse from variant name: gomokuN -> N
+    const N = parseInt(variant.replace('gomoku', ''), 10);
+    if (!N || N < 7 || N > 16) throw new Error(`Unknown gomoku variant: ${variant}`);
+    const engine = createGomokuEngine({ N, winLen: 5 });
+    gomokuEngines.set(variant, engine);
+    return engine;
+  }
+
+  const engine = createGomokuEngine({ N: config.N, winLen: config.winLen });
+  gomokuEngines.set(variant, engine);
+  return engine;
+}
+
+function inferGomokuVariant(boardLen) {
+  const N = Math.round(Math.sqrt(boardLen));
+  if (N * N !== boardLen || N < 7 || N > 16) return null;
+  return `gomoku${N}`;
+}
+
+async function predictGomokuMove({ board, current = 1, variant }) {
+  const boardInt = convertBoard(board);
+  const player = current === 1 ? 1 : -1;
+  const engine = getGomokuEngine(variant);
+
+  console.log(`[PredictGomoku] variant=${variant}, N=${engine.N}, player=${player}, board.length=${board.length}`);
+
+  const result = engine.bestMove(boardInt, player, {
+    timeLimitMs: 3000,
+  });
+
+  console.log(`[PredictGomoku] move=${result.move}, value=${result.value?.toFixed(3)}, source=${result.source}, depth=${result.depth}, nodes=${result.nodesSearched}`);
+
+  return {
+    move: result.move,
+    probs: result.policy ? Array.from(result.policy) : Array(board.length).fill(0),
+    value: result.value,
+    isRandom: false,
+    mode: 'engine',
+    source: result.source,
+    confidence: result.policy ? Math.max(...result.policy) : 1.0,
+    depth: result.depth,
+    nodesSearched: result.nodesSearched,
+  };
+}
+
+export async function predictMove({ board, current = 1, mode = 'model', variant = 'ttt3' }) {
+  // Gomoku engine routing (7x7 — 16x16)
+  if (variant.startsWith('gomoku') || (board.length > 25 && inferGomokuVariant(board.length))) {
+    const gomokuVariant = variant.startsWith('gomoku') ? variant : inferGomokuVariant(board.length);
+    try {
+      return await predictGomokuMove({ board, current, variant: gomokuVariant });
+    } catch (e) {
+      console.error('[Predict] Error in Gomoku prediction:', e);
+      // Fallback: center move
+      const N = Math.round(Math.sqrt(board.length));
+      const mid = Math.floor(N / 2) * N + Math.floor(N / 2);
+      return { move: mid, probs: Array(board.length).fill(0), isRandom: true, mode: 'engine' };
+    }
+  }
+
+  // TTT5 routing
+  if (variant === 'ttt5' || board.length === 25) {
+    if (mode === 'algorithm') {
+      // No minimax for 5x5 — use model+MCTS instead
+      console.log('[Predict] TTT5 algorithm mode → using model+MCTS');
+    }
+    try {
+      return await predictTTT5Move({ board, current });
+    } catch (e) {
+      console.error('[Predict] Error in TTT5 prediction:', e);
+      const moves = ttt5Adapter.legalMoves(convertBoard(board));
+      const randomMove = moves.length > 0 ? moves[Math.floor(Math.random() * moves.length)] : -1;
+      return { move: randomMove, probs: Array(25).fill(0), isRandom: true, mode: 'model' };
+    }
+  }
+
+  // ===== TTT3 routing below =====
+
+  // Режим алгоритма — minimax (только для 3x3)
   if (mode === 'algorithm') {
-    const { teacherBestMove, legalMoves } = await import('./src/tic_tac_toe.mjs');
-    const moves = legalMoves(board);
+    const { getTeacherValueAndPolicy } = await import('./src/ttt3_minimax.mjs');
+    const { legalMoves } = await import('./src/game_ttt3.mjs');
+
+    const player = current === 1 ? 1 : -1;
+    const boardInt8 = convertBoard(board); // {0,1,2} → {0,+1,-1}
+    const moves = legalMoves(boardInt8);
     if (moves.length === 0) {
       return { move: -1, probs: Array(9).fill(0), mode: 'algorithm' };
     }
-    const bestMove = teacherBestMove(board, current);
-    const probs = Array(9).fill(0);
-    probs[bestMove] = 1;
+
+    const { policy } = getTeacherValueAndPolicy(boardInt8, player);
+    let bestMove = -1;
+    let bestProb = -1;
+    for (const m of moves) {
+      if (policy[m] > bestProb) {
+        bestProb = policy[m];
+        bestMove = m;
+      }
+    }
+
     console.log('[Predict] Using algorithm (minimax), move:', bestMove);
-    return { move: bestMove, probs, mode: 'algorithm' };
+    return { move: bestMove, probs: Array.from(policy), mode: 'algorithm' };
   }
-  
-  // Для досок 3x3 используем TTT3 Transformer
+
+  // Режим модели (TTT3)
   if (board.length === 9) {
     try {
       return await predictTTT3Move({ board, current });
     } catch (e) {
-      console.error('[Predict] Error in TTT3 prediction, falling back to old model:', e);
-      // Fallback к старой логике
+      console.error('[Predict] Error in TTT3 prediction:', e);
     }
   }
-  
-  // Режим модели для других размеров досок: проверяем, есть ли обученная модель
-  const hasModel = await hasTrainedModel();
-  
-  if (!hasModel) {
-    // Если модели нет - возвращаем случайный ход
-    const { legalMoves: getLegalMoves } = await import('./src/tic_tac_toe.mjs');
-    const moves = getLegalMoves(board);
-    if (moves.length === 0) {
-      return { move: -1, probs: Array(9).fill(0), isRandom: true, mode: 'model' };
-    }
-    const randomMove = moves[Math.floor(Math.random() * moves.length)];
-    console.log('[Predict] No trained model, using random move:', randomMove);
-    return { move: randomMove, probs: Array(9).fill(1/9), isRandom: true, mode: 'model' };
+
+  // Fallback — случайный ход
+  const { legalMoves: getLegalMoves } = await import('./src/game_ttt3.mjs');
+  const boardInt8 = convertBoard(board); // {0,1,2} → {0,+1,-1}
+  const moves = getLegalMoves(boardInt8);
+  if (moves.length === 0) {
+    return { move: -1, probs: Array(9).fill(0), isRandom: true, mode: 'model' };
   }
-  
-  // Используем обученную модель (для больших досок)
-  const m = await ensureModel();
-  const rel = relativeCells(board, current);
-  const L = board.length; const xCells = tf.tensor2d([rel], [1, L], 'int32');
-  const pos = tf.tensor2d([Array.from({length:board.length}, (_,i)=>i)], [1, board.length], 'int32');
-  const probs = m.predict([xCells, pos]);
-  const pa = await probs.data();
-  xCells.dispose(); pos.dispose(); probs.dispose();
-  const moves = []; for (let i=0;i<board.length;i++) if (board[i]===0) moves.push(i);
-  let best=-1, bestv=-1; for (const mm of moves) if (pa[mm]>bestv){ best=mm; bestv=pa[mm]; }
-  console.log('[Predict] Using trained model, move:', best);
-  return { move: best, probs: Array.from(pa), isRandom: false, mode: 'model' };
+  const randomMove = moves[Math.floor(Math.random() * moves.length)];
+  return { move: randomMove, probs: Array(9).fill(1 / 9), isRandom: true, mode: 'model' };
 }
 
-// Сохраняет ход игры в историю для дообучения
-export function saveGameMove({ board, move, current, gameId }) {
+// ===== Игровая история =====
+
+// Сохраняет ход для TTT3 или TTT5.
+export async function saveGameMove({ board, move, current, gameId, variant }) {
   try {
-    const rel = relativeCells(board, current);
-    const pos = [0, 1, 2, 3, 4, 5, 6, 7, 8];
-    const onehot = new Array(9).fill(0);
-    if (move >= 0 && move < 9) {
-      onehot[move] = 1;
-    }
-    
-    gameHistory.push({ X: rel, P: pos, Y: onehot });
-    
-    // Также сохраняем в последовательность игры, если указан gameId
+    const inferredVariant = variant || (board?.length === 25 ? 'ttt5' : 'ttt3');
+
+    const player = current === 1 ? 1 : -1;
+    const boardInt8 = convertBoard(board);
+
+    // Сохраняем в последовательность игры (для обоих вариантов)
     if (gameId !== undefined) {
       const gameSeq = gameSequences.find(g => g.id === gameId);
       if (gameSeq) {
         gameSeq.moves.push({ board: [...board], move, current });
       }
     }
-    
-    // Ограничиваем размер истории
-    if (gameHistory.length > MAX_HISTORY_SIZE) {
-      gameHistory = gameHistory.slice(-MAX_HISTORY_SIZE);
+
+    if (inferredVariant === 'ttt5' && board.length === 25) {
+      // TTT5: сохраняем с uniform policy (без minimax — учитель будет MCTS при анализе)
+      const planes = ttt5Adapter.encodePlanes(boardInt8, player);
+      const uniformPolicy = new Float32Array(25).fill(1 / 25);
+
+      ttt5GameHistory.push({
+        planes: new Float32Array(planes),
+        policy: uniformPolicy,
+        value: 0
+      });
+
+      if (ttt5GameHistory.length > MAX_TTT5_HISTORY) {
+        ttt5GameHistory = ttt5GameHistory.slice(-MAX_TTT5_HISTORY);
+      }
+
+      console.log(`[TTT5 GameHistory] Saved move, total: ${ttt5GameHistory.length}`);
+    } else if (inferredVariant === 'ttt3' && board.length === 9) {
+      // TTT3: сохраняем с minimax teacher
+      const { encodePlanes } = await import('./src/game_ttt3.mjs');
+      const { getTeacherValueAndPolicy } = await import('./src/ttt3_minimax.mjs');
+
+      const planes = encodePlanes(boardInt8, player);
+      const { value, policy } = getTeacherValueAndPolicy(boardInt8, player);
+
+      gameHistory.push({
+        planes: new Float32Array(planes),
+        policy: new Float32Array(policy),
+        value
+      });
+
+      if (gameHistory.length > MAX_HISTORY_SIZE) {
+        gameHistory = gameHistory.slice(-MAX_HISTORY_SIZE);
+      }
+
+      console.log(`[GameHistory] Saved move (TTT3), total: ${gameHistory.length}`);
     }
-    
-    console.log(`[GameHistory] Saved move, total: ${gameHistory.length}`);
   } catch (e) {
     console.error('[GameHistory] Error saving move:', e);
   }
 }
 
-// Начинает новую игру (для отслеживания последовательности)
-export function startNewGame({ playerRole = 1 } = {}) {
+// Начинает новую игру
+export function startNewGame({ playerRole = 1, variant = 'ttt3' } = {}) {
   const gameId = Date.now() + Math.random();
   gameSequences.push({
     id: gameId,
     moves: [],
     winner: null,
-    playerRole, // 1 = модель играет за X, 2 = модель играет за O
+    playerRole,
+    variant,
   });
-  
-  // Ограничиваем размер
+
   if (gameSequences.length > MAX_GAME_SEQUENCES) {
     gameSequences = gameSequences.slice(-MAX_GAME_SEQUENCES);
   }
-  
+
   return gameId;
 }
 
-// Завершает игру и анализирует ошибки
-// Флаг для отслеживания фонового обучения
+// ===== Анализ ошибок и генерация коррекций =====
 let backgroundTraining = false;
 let backgroundTrainingPromise = null;
-let backgroundTrainingProgressCb = null; // Callback для отправки прогресса
 
-export async function finishGame({ gameId, winner, patternsPerError = 1000, autoTrain = false, progressCb = null, incrementalBatchSize = 256 }) {
+export async function finishGame({ gameId, winner, patternsPerError = 100, autoTrain = false, progressCb = null, incrementalBatchSize = 256 }) {
   const gameSeq = gameSequences.find(g => g.id === gameId);
   if (!gameSeq) return;
-  
+
   gameSeq.winner = winner;
-  
-  // Сохраняем количество паттернов до анализа ошибок
-  const patternsBefore = gameHistory.length;
-  
-  // Если модель проиграла, анализируем ошибки
-  if ((gameSeq.playerRole === 1 && winner === 2) || (gameSeq.playerRole === 2 && winner === 1)) {
-    console.log(`[ErrorDetection] Model lost game ${gameId}, analyzing mistakes...`);
-    await analyzeAndGenerateCorrections(gameSeq, patternsPerError);
-  }
-  
-  // Подсчитываем количество новых навыков (новых паттернов)
-  const patternsAfter = gameHistory.length;
-  const newSkillsCount = patternsAfter - patternsBefore;
-  
-  // Если включен авто-режим обучения, запускаем фоновое обучение
-  if (autoTrain && !backgroundTraining) {
-    console.log('[FinishGame] Auto-train enabled, starting background training...');
-    startBackgroundTraining(progressCb, newSkillsCount, incrementalBatchSize);
+  const isTTT5 = gameSeq.variant === 'ttt5';
+
+  // Модель проиграла?
+  const modelLost = (gameSeq.playerRole === 1 && winner === 2) || (gameSeq.playerRole === 2 && winner === 1);
+
+  if (isTTT5) {
+    // ===== TTT5 Online Learning =====
+    const patternsBefore = ttt5GameHistory.length;
+
+    if (modelLost) {
+      console.log(`[TTT5 ErrorDetection] Model lost game ${gameId}, analyzing mistakes...`);
+      await analyzeTTT5Errors(gameSeq, patternsPerError);
+    }
+
+    const newSkillsCount = ttt5GameHistory.length - patternsBefore;
+
+    if (autoTrain && !backgroundTraining) {
+      console.log('[TTT5 FinishGame] Auto-train enabled, starting TTT5 background training...');
+      startTTT5BackgroundTraining(progressCb, newSkillsCount, incrementalBatchSize);
+    }
+  } else if (!gameSeq.variant || gameSeq.variant === 'ttt3') {
+    // ===== TTT3 Online Learning (original) =====
+    const patternsBefore = gameHistory.length;
+
+    if (modelLost) {
+      console.log(`[ErrorDetection] Model lost game ${gameId}, analyzing mistakes...`);
+      await analyzeAndGenerateCorrections(gameSeq, patternsPerError);
+    }
+
+    const newSkillsCount = gameHistory.length - patternsBefore;
+
+    if (autoTrain && !backgroundTraining) {
+      console.log('[FinishGame] Auto-train enabled, starting background training...');
+      startBackgroundTraining(progressCb, newSkillsCount, incrementalBatchSize);
+    }
   }
 }
 
-// Анализирует ошибки и генерирует обучающие паттерны
-async function analyzeAndGenerateCorrections(gameSeq, patternsPerError = 1000) {
+// Анализирует ошибки и генерирует ЛЕГАЛЬНЫЕ обучающие паттерны
+async function analyzeAndGenerateCorrections(gameSeq, patternsPerError = 100) {
   try {
-    const { teacherBestMove, legalMoves, getWinner } = await import('./src/tic_tac_toe.mjs');
+    const { encodePlanes, legalMoves, winner: getWinner, emptyBoard, applyMove } = await import('./src/game_ttt3.mjs');
+    const { getTeacherValueAndPolicy } = await import('./src/ttt3_minimax.mjs');
     const corrections = [];
-    
-    // Анализируем каждый ход модели
+
     for (let i = 0; i < gameSeq.moves.length; i++) {
-      const move = gameSeq.moves[i];
-      
+      const moveData = gameSeq.moves[i];
+
       // Проверяем, это ход модели?
-      const isModelMove = (gameSeq.playerRole === 1 && move.current === 1) || 
-                         (gameSeq.playerRole === 2 && move.current === 2);
-      
+      const isModelMove = (gameSeq.playerRole === 1 && moveData.current === 1) ||
+                          (gameSeq.playerRole === 2 && moveData.current === 2);
       if (!isModelMove) continue;
-      
-      // Проверяем, был ли это правильный ход (сравниваем с minimax)
-      const correctMove = teacherBestMove(move.board, move.current);
-      
-      if (correctMove !== move.move) {
+
+      const player = moveData.current === 1 ? 1 : -1;
+      const boardInt8 = convertBoard(moveData.board); // {0,1,2} → {0,+1,-1}
+
+      // Получаем оптимальный ход от minimax
+      const { policy: teacherPolicy } = getTeacherValueAndPolicy(boardInt8, player);
+
+      // Проверяем, совпал ли ход модели с оптимальным
+      if (teacherPolicy[moveData.move] < 0.01) {
         // Модель сделала ошибку!
-        console.log(`[ErrorDetection] Found mistake at move ${i}: model chose ${move.move}, should be ${correctMove}`);
-        
-        // Генерируем вариации этого паттерна (количество из настроек)
-        const variations = await generateBoardVariations(move.board, move.current, patternsPerError);
-        
-        for (const variant of variations) {
-          const bestMove = teacherBestMove(variant.board, variant.current);
-          const rel = relativeCells(variant.board, variant.current);
-          const pos = [0, 1, 2, 3, 4, 5, 6, 7, 8];
-          const onehot = new Array(9).fill(0);
-          if (bestMove >= 0 && bestMove < 9) {
-            onehot[bestMove] = 1;
-          }
-          
-          corrections.push({ X: rel, P: pos, Y: onehot });
-        }
+        console.log(`[ErrorDetection] Mistake at move ${i}: model chose ${moveData.move}, optimal: ${teacherPolicy.map((p, j) => p > 0.01 ? j : '').filter(Boolean).join(',')}`);
+
+        // Генерируем легальные вариации из дерева игры
+        const variations = await generateLegalVariations(boardInt8, player, patternsPerError);
+        corrections.push(...variations);
       }
     }
-    
-    // Добавляем исправления в историю
+
     if (corrections.length > 0) {
       console.log(`[ErrorDetection] Generated ${corrections.length} correction patterns`);
       gameHistory.push(...corrections);
-      
-      // Ограничиваем размер истории
+
       if (gameHistory.length > MAX_HISTORY_SIZE) {
         gameHistory = gameHistory.slice(-MAX_HISTORY_SIZE);
       }
@@ -551,243 +695,351 @@ async function analyzeAndGenerateCorrections(gameSeq, patternsPerError = 1000) {
   }
 }
 
-// Генерирует вариации доски для обучения на ошибках
-async function generateBoardVariations(board, current, count = 1000) {
+// Генерирует ЛЕГАЛЬНЫЕ вариации позиции из дерева игры
+async function generateLegalVariations(targetBoard, targetPlayer, count = 100) {
+  const { encodePlanes, legalMoves, winner: getWinner, emptyBoard, applyMove } = await import('./src/game_ttt3.mjs');
+  const { getTeacherValueAndPolicy } = await import('./src/ttt3_minimax.mjs');
+
   const variations = [];
-  const { legalMoves, getWinner } = await import('./src/tic_tac_toe.mjs');
-  
-  // Базовый паттерн
-  variations.push({ board: [...board], current });
-  
-  // Генерируем вариации:
-  // 1. Разные комбинации заполнения незанятых клеток (сохраняя структуру)
-  const emptyIndices = [];
-  for (let i = 0; i < 9; i++) {
-    if (board[i] === 0) emptyIndices.push(i);
-  }
-  
-  // Если слишком мало свободных клеток, просто дублируем базовый паттерн
-  if (emptyIndices.length <= 2) {
-    for (let i = 0; i < count - 1; i++) {
-      variations.push({ board: [...board], current });
+  const visited = new Set();
+
+  // Добавляем саму ошибочную позицию
+  const { value, policy } = getTeacherValueAndPolicy(targetBoard, targetPlayer);
+  variations.push({
+    planes: new Float32Array(encodePlanes(targetBoard, targetPlayer)),
+    policy: new Float32Array(policy),
+    value
+  });
+  visited.add(Array.from(targetBoard).join(','));
+
+  // Подсчитываем глубину целевой позиции (количество заполненных клеток)
+  const targetDepth = Array.from(targetBoard).filter(v => v !== 0).length;
+
+  // Обходим дерево игры, собираем позиции на похожей глубине
+  function collect(board, player, depth) {
+    if (variations.length >= count) return;
+
+    const key = Array.from(board).join(',');
+    if (visited.has(key)) return;
+    visited.add(key);
+
+    const w = getWinner(board);
+    if (w !== null) return; // Терминальное состояние — пропускаем
+
+    const filled = Array.from(board).filter(v => v !== 0).length;
+
+    // Берём позиции на похожей глубине (±1 ход)
+    if (Math.abs(filled - targetDepth) <= 1 && filled > 0) {
+      const { value: v, policy: pol } = getTeacherValueAndPolicy(board, player);
+      variations.push({
+        planes: new Float32Array(encodePlanes(board, player)),
+        policy: new Float32Array(pol),
+        value: v
+      });
     }
-    return variations;
-  }
-  
-  // Генерируем вариации несколькими способами для разнообразия
-  const maxAttempts = count * 3; // Увеличено для генерации 1000 уникальных вариантов
-  const seenBoards = new Set();
-  seenBoards.add(board.join(''));
-  
-  console.log(`[GenerateVariations] Generating ${count} variations from board with ${emptyIndices.length} empty cells`);
-  
-  for (let i = 0; i < maxAttempts && variations.length < count; i++) {
-    const variant = [...board];
-    
-    // Разные стратегии генерации вариаций для разнообразия
-    const strategy = i % 5; // Используем 5 стратегий вместо 3
-    
-    if (strategy === 0) {
-      // Стратегия 1: Меняем одну клетку (консервативно)
-      if (emptyIndices.length > 0) {
-        const idx = emptyIndices[Math.floor(Math.random() * emptyIndices.length)];
-        variant[idx] = current === 1 ? 2 : 1;
+
+    // Продолжаем обход только если ещё нужны вариации
+    if (variations.length < count) {
+      const moves = legalMoves(board);
+      // Перемешиваем для разнообразия
+      for (let i = moves.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [moves[i], moves[j]] = [moves[j], moves[i]];
       }
-    } else if (strategy === 1) {
-      // Стратегия 2: Меняем 2 клетки
-      const numChanges = Math.min(2, emptyIndices.length);
-      const indicesToChange = [];
-      const available = [...emptyIndices];
-      
-      for (let j = 0; j < numChanges && available.length > 0; j++) {
-        const idx = Math.floor(Math.random() * available.length);
-        indicesToChange.push(available.splice(idx, 1)[0]);
-      }
-      
-      for (const idx of indicesToChange) {
-        variant[idx] = current === 1 ? 2 : 1;
-      }
-    } else if (strategy === 2) {
-      // Стратегия 3: Меняем 3 клетки
-      const numChanges = Math.min(3, emptyIndices.length);
-      const indicesToChange = [];
-      const available = [...emptyIndices];
-      
-      for (let j = 0; j < numChanges && available.length > 0; j++) {
-        const idx = Math.floor(Math.random() * available.length);
-        indicesToChange.push(available.splice(idx, 1)[0]);
-      }
-      
-      for (const idx of indicesToChange) {
-        variant[idx] = current === 1 ? 2 : 1;
-      }
-    } else if (strategy === 3) {
-      // Стратегия 4: Меняем 4 клетки
-      const numChanges = Math.min(4, emptyIndices.length);
-      const indicesToChange = [];
-      const available = [...emptyIndices];
-      
-      for (let j = 0; j < numChanges && available.length > 0; j++) {
-        const idx = Math.floor(Math.random() * available.length);
-        indicesToChange.push(available.splice(idx, 1)[0]);
-      }
-      
-      for (const idx of indicesToChange) {
-        variant[idx] = current === 1 ? 2 : 1;
-      }
-    } else {
-      // Стратегия 5: Меняем случайное количество (1-5)
-      const numChanges = Math.min(Math.max(1, Math.floor(Math.random() * 5) + 1), emptyIndices.length);
-      const indicesToChange = [];
-      const available = [...emptyIndices];
-      
-      for (let j = 0; j < numChanges && available.length > 0; j++) {
-        const idx = Math.floor(Math.random() * available.length);
-        indicesToChange.push(available.splice(idx, 1)[0]);
-      }
-      
-      for (const idx of indicesToChange) {
-        variant[idx] = current === 1 ? 2 : 1;
-      }
-    }
-    
-    // Проверяем уникальность и валидность
-    const variantKey = variant.join('');
-    if (!seenBoards.has(variantKey)) {
-      if (getWinner(variant) === null && legalMoves(variant).length > 0) {
-        variations.push({ board: variant, current });
-        seenBoards.add(variantKey);
+      for (const move of moves) {
+        if (variations.length >= count) return;
+        collect(applyMove(board, move, player), -player, depth + 1);
       }
     }
   }
-  
-  // Дополняем до нужного количества базовым паттерном (если не удалось сгенерировать достаточно уникальных)
-  const uniqueCount = new Set(variations.map(v => v.board.join(''))).size;
-  console.log(`[GenerateVariations] Generated ${variations.length} variations (${uniqueCount} unique, ${variations.length - uniqueCount} duplicates)`);
-  
-  while (variations.length < count) {
-    variations.push({ board: [...board], current });
-  }
-  
+
+  collect(emptyBoard(), 1, 0);
   return variations.slice(0, count);
 }
 
-// Очищает историю игр
-export function clearGameHistory() {
-  gameHistory = [];
-  console.log('[GameHistory] Cleared');
-  return { success: true, count: 0 };
-}
-
-// Получает статистику истории
-export function getGameHistoryStats() {
-  return { count: gameHistory.length, maxSize: MAX_HISTORY_SIZE };
-}
-
-// Дообучение модели на реальных играх
-export async function trainOnGames(progressCb, { epochs = 1, batchSize = 256, focusOnErrors = true } = {}) {
+// ===== TTT5 Error Analysis (uses MCTS as teacher) =====
+async function analyzeTTT5Errors(gameSeq, patternsPerError = 20) {
   try {
+    const { maskLogits } = await import('./src/model_pv_transformer_seq.mjs');
+    const model = await ensureTTT5Model();
+    const corrections = [];
+
+    // Создаём nnEval для MCTS (если модель загружена)
+    let nnEval = null;
+    if (model) {
+      nnEval = async (b, p) => {
+        const symmetryBoards = SYMMETRY_MAPS_5.map(({ map }) => transformBoard5(b, map));
+        const xInput = new Float32Array(symmetryBoards.length * 75);
+        const posInput = new Int32Array(symmetryBoards.length * 25);
+        const maskInput = new Float32Array(symmetryBoards.length * 25);
+
+        for (let i = 0; i < symmetryBoards.length; i++) {
+          const planes = ttt5Adapter.encodePlanes(symmetryBoards[i], p);
+          const mask = ttt5Adapter.maskLegalMoves(symmetryBoards[i]);
+          xInput.set(planes, i * 75);
+          maskInput.set(mask, i * 25);
+          for (let j = 0; j < 25; j++) posInput[i * 25 + j] = j;
+        }
+
+        const x = tf.tensor3d(xInput, [symmetryBoards.length, 25, 3]);
+        const posIndices = tf.tensor2d(posInput, [symmetryBoards.length, 25], 'int32');
+        const maskTensor = tf.tensor2d(maskInput, [symmetryBoards.length, 25]);
+
+        const { probsData, valueData } = tf.tidy(() => {
+          const [logits, valueTensor] = model.predict([x, posIndices]);
+          const masked = maskLogits(logits, maskTensor);
+          const probs = tf.softmax(masked, -1);
+          return { probsData: probs.dataSync(), valueData: valueTensor.dataSync() };
+        });
+
+        x.dispose(); posIndices.dispose(); maskTensor.dispose();
+
+        const averagedPolicy = new Float32Array(25);
+        let valueSum = 0;
+        for (let i = 0; i < SYMMETRY_MAPS_5.length; i++) {
+          const start = i * 25;
+          const transformedPolicy = probsData.slice(start, start + 25);
+          const restoredPolicy = inverseTransformPolicy5(transformedPolicy, SYMMETRY_MAPS_5[i].map);
+          for (let j = 0; j < 25; j++) averagedPolicy[j] += restoredPolicy[j];
+          valueSum += valueData[i];
+        }
+        for (let i = 0; i < 25; i++) averagedPolicy[i] /= SYMMETRY_MAPS_5.length;
+
+        return { policy: averagedPolicy, value: valueSum / SYMMETRY_MAPS_5.length };
+      };
+    }
+
+    for (let i = 0; i < gameSeq.moves.length; i++) {
+      const moveData = gameSeq.moves[i];
+
+      // Проверяем, это ход модели?
+      const isModelMove = (gameSeq.playerRole === 1 && moveData.current === 1) ||
+                          (gameSeq.playerRole === 2 && moveData.current === 2);
+      if (!isModelMove) continue;
+
+      const player = moveData.current === 1 ? 1 : -1;
+      const boardInt8 = convertBoard(moveData.board);
+
+      if (nnEval) {
+        // Используем MCTS для получения "учительской" политики
+        try {
+          const result = await inferencePolicy({
+            adapter: ttt5Adapter,
+            nnEval,
+            board: boardInt8,
+            player,
+            useMCTS: true,
+            mctsSimulations: 200, // Глубокий поиск для учителя
+            mctsCpuct: TTT5_MCTS.cpuct,
+            temperature: 0.3,
+          });
+
+          const teacherPolicy = result.policy;
+
+          // Если MCTS сильно не согласен с ходом модели
+          if (teacherPolicy[moveData.move] < 0.05) {
+            console.log(`[TTT5 ErrorDetection] Mistake at move ${i}: model chose ${moveData.move}, MCTS best: ${teacherPolicy.indexOf(Math.max(...teacherPolicy))}`);
+
+            // Добавляем коррекцию — позицию с MCTS policy
+            const planes = ttt5Adapter.encodePlanes(boardInt8, player);
+            corrections.push({
+              planes: new Float32Array(planes),
+              policy: new Float32Array(teacherPolicy),
+              value: result.value,
+            });
+          }
+        } catch (e) {
+          console.warn(`[TTT5 ErrorDetection] MCTS failed for move ${i}:`, e.message);
+        }
+      } else {
+        // Без модели — сохраняем позицию с heuristic safety-based policy
+        const planes = ttt5Adapter.encodePlanes(boardInt8, player);
+        const winMove = ttt5Adapter.findImmediateWin(boardInt8, player);
+        const blockMove = ttt5Adapter.findImmediateBlock(boardInt8, player);
+
+        if (winMove >= 0 && moveData.move !== winMove) {
+          const policy = new Float32Array(25);
+          policy[winMove] = 1.0;
+          corrections.push({ planes: new Float32Array(planes), policy, value: 1.0 });
+          console.log(`[TTT5 ErrorDetection] Missed win at move ${i}`);
+        } else if (blockMove >= 0 && moveData.move !== blockMove) {
+          const policy = new Float32Array(25);
+          policy[blockMove] = 1.0;
+          corrections.push({ planes: new Float32Array(planes), policy, value: -0.3 });
+          console.log(`[TTT5 ErrorDetection] Missed block at move ${i}`);
+        }
+      }
+    }
+
+    if (corrections.length > 0) {
+      console.log(`[TTT5 ErrorDetection] Generated ${corrections.length} correction patterns`);
+      ttt5GameHistory.push(...corrections);
+
+      if (ttt5GameHistory.length > MAX_TTT5_HISTORY) {
+        ttt5GameHistory = ttt5GameHistory.slice(-MAX_TTT5_HISTORY);
+      }
+    }
+  } catch (e) {
+    console.error('[TTT5 ErrorDetection] Error:', e);
+  }
+}
+
+// Fisher-Yates shuffle
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function getEffectiveBatchSize(requestedBatchSize, totalSamples) {
+  let maxUsefulBatch = 256;
+
+  if (totalSamples <= 8192) {
+    maxUsefulBatch = 64;
+  } else if (totalSamples <= 32768) {
+    maxUsefulBatch = 128;
+  }
+
+  return Math.max(32, Math.min(requestedBatchSize, maxUsefulBatch, totalSamples));
+}
+
+// ===== Дообучение на играх (с experience replay) =====
+export async function trainOnGames(progressCb, { epochs = 1, batchSize = 256, variant = 'ttt3' } = {}) {
+  try {
+    // TTT5 routing
+    if (variant === 'ttt5') {
+      return await trainTTT5OnGames(progressCb, { epochs, batchSize });
+    }
+
+    if (variant !== 'ttt3') {
+      throw new Error(`Incremental training is supported only for ttt3/ttt5 (got ${variant})`);
+    }
+
     if (gameHistory.length < 10) {
       throw new Error(`Недостаточно данных для обучения. Нужно минимум 10 ходов, есть ${gameHistory.length}`);
     }
-    
-    // Используем указанное количество эпох (оптимизировано: 1 эпоха для быстрого дообучения)
-    let actualEpochs = epochs;
-    
-    progressCb?.({ type: 'train.start', payload: { epochs: actualEpochs, batchSize, nTrain: gameHistory.length, nVal: 0 } });
-    
-    console.log(`[TrainOnGames] Training on ${gameHistory.length} game moves with ${actualEpochs} epochs...`);
-    progressCb?.({ type: 'train.status', payload: { message: `Подготовка данных (${gameHistory.length} ходов, ${actualEpochs} эпох)...` } });
-    
-    const m = await ensureModel({ forceFresh: false }); // Не пересоздаем модель, продолжаем обучение
-    
-    // Подготавливаем данные из истории
-    const X = gameHistory.map(h => h.X);
-    const P = gameHistory.map(h => h.P);
-    const Y = gameHistory.map(h => h.Y);
-    
-    console.log(`[TrainOnGames] Creating tensors from ${X.length} moves...`);
-    const xCells = tf.tensor2d(X, [X.length, 9], 'int32');
-    const xPos = tf.tensor2d(P, [P.length, 9], 'int32');
-    const yOneHot = tf.tensor2d(Y, [Y.length, 9], 'float32');
-    
-    progressCb?.({ type: 'train.status', payload: { message: 'Начало дообучения (интенсивное обучение на ошибках)...' } });
-    
-    // Подсчитываем количество батчей для промежуточных обновлений
-    const totalSamples = X.length;
-    const batchesPerEpoch = Math.ceil(totalSamples / batchSize);
-    let currentBatch = 0;
-    let lastProgressUpdate = 0;
-    
-    await m.fit([xCells, xPos], yOneHot, {
+
+    // Загружаем TTT3 модель (ту же, которая делает предсказания!)
+    const model = await ensureTTT3Model();
+    if (!model) {
+      throw new Error('TTT3 модель не найдена. Сначала обучите модель с нуля.');
+    }
+
+    // Кастомная loss: softmax cross-entropy из логитов
+    // Модель выдаёт raw logits, а categoricalCrossentropy ожидает probabilities!
+    function policyLossFromLogits(yTrue, yPred) {
+      const logProbs = tf.logSoftmax(yPred, -1);
+      return tf.neg(tf.sum(tf.mul(yTrue, logProbs), -1)).mean();
+    }
+
+    // Компилируем для обучения
+    model.compile({
+      optimizer: tf.train.adam(TRAIN.lr * 0.5), // Пониженный LR для дообучения
+      loss: [policyLossFromLogits, 'meanSquaredError'],
+      lossWeights: [1.0, TRAIN.weightValue]
+    });
+
+    // ===== Experience Replay =====
+    // Смешиваем новые паттерны (ошибки) с данными из minimax (3:1 ratio)
+    const { teacherBatches } = await import('./src/ttt3_minimax.mjs');
+    const replayTarget = Math.max(gameHistory.length * 3, 1000);
+    const replayData = [];
+
+    for (const batch of teacherBatches({ batchSize: replayTarget })) {
+      for (let i = 0; i < batch.count && replayData.length < replayTarget; i++) {
+        replayData.push({
+          planes: new Float32Array(batch.x.slice(i * 27, (i + 1) * 27)),
+          policy: new Float32Array(batch.yPolicy.slice(i * 9, (i + 1) * 9)),
+          value: batch.yValue[i]
+        });
+      }
+      if (replayData.length >= replayTarget) break;
+    }
+
+    // Объединяем и перемешиваем
+    const combined = [...gameHistory, ...replayData];
+    shuffleArray(combined);
+
+    const N = combined.length;
+    const actualEpochs = epochs;
+    const effectiveBatchSize = getEffectiveBatchSize(batchSize, N);
+
+    progressCb?.({ type: 'train.start', payload: { epochs: actualEpochs, batchSize, nTrain: N, nVal: 0 } });
+    progressCb?.({
+      type: 'train.status',
+      payload: {
+        message: `Подготовка данных (${gameHistory.length} ошибок + ${replayData.length} replay = ${N}, batch ${effectiveBatchSize})...`
+      }
+    });
+
+    console.log(`[TrainOnGames] Training on ${N} samples (${gameHistory.length} errors + ${replayData.length} replay)`);
+
+    // Создаём тензоры
+    const planesArr = new Float32Array(N * 27);
+    const posArr = new Int32Array(N * 9);
+    const policyArr = new Float32Array(N * 9);
+    const valueArr = new Float32Array(N);
+
+    for (let i = 0; i < N; i++) {
+      planesArr.set(combined[i].planes, i * 27);
+      policyArr.set(combined[i].policy, i * 9);
+      valueArr[i] = combined[i].value;
+      for (let j = 0; j < 9; j++) {
+        posArr[i * 9 + j] = j;
+      }
+    }
+
+    const xTensor = tf.tensor3d(Array.from(planesArr), [N, 9, 3]);
+    const posTensor = tf.tensor2d(Array.from(posArr), [N, 9], 'int32');
+    const yPolicyTensor = tf.tensor2d(Array.from(policyArr), [N, 9]);
+    const yValueTensor = tf.tensor2d(Array.from(valueArr), [N, 1]);
+
+    progressCb?.({ type: 'train.status', payload: { message: 'Дообучение с experience replay...' } });
+
+    await model.fit([xTensor, posTensor], [yPolicyTensor, yValueTensor], {
       epochs: actualEpochs,
-      batchSize,
+      batchSize: effectiveBatchSize,
       shuffle: true,
       verbose: 0,
       callbacks: {
-        onBatchEnd: (batch, logs) => {
-          // Обновляем прогресс каждые 10% или каждые 5 батчей, в зависимости от того, что меньше
-          currentBatch++;
-          const progressUpdateInterval = Math.max(1, Math.floor(batchesPerEpoch / 10)); // Обновляем ~10 раз за эпоху
-          
-          if (currentBatch % progressUpdateInterval === 0 || currentBatch === batchesPerEpoch) {
-            const batchProgress = Math.round((currentBatch / batchesPerEpoch) * 100);
-            const epochProgress = Math.round(((batchProgress / 100) + lastProgressUpdate) / actualEpochs * 100);
-            
-            progressCb?.({ 
-              type: 'train.progress',
-              payload: {
-                epoch: lastProgressUpdate + 1, 
-                epochs: actualEpochs,
-                loss: Number(logs.loss ?? 0).toFixed(4),
-                acc: Number(logs.acc ?? 0).toFixed(4),
-                val_loss: 0,
-                val_acc: 0,
-                percent: Math.min(epochProgress, 99), // Не показываем 100% до завершения эпохи
-                batchProgress: batchProgress, // Дополнительный прогресс внутри эпохи
-                batchesPerEpoch: batchesPerEpoch,
-                currentBatch: currentBatch
-              }
-            });
-          }
-        },
-        onEpochBegin: (epoch) => {
-          lastProgressUpdate = epoch;
-          currentBatch = 0;
-          console.log(`[TrainOnGames] Starting epoch ${epoch+1}/${actualEpochs}...`);
-        },
         onEpochEnd: (epoch, logs) => {
-          console.log(`[TrainOnGames] Epoch ${epoch+1}/${actualEpochs}, loss: ${logs.loss}, acc: ${logs.acc}`);
-          lastProgressUpdate = epoch + 1;
-          progressCb?.({ 
-            type:'train.progress',
+          console.log(`[TrainOnGames] Epoch ${epoch + 1}/${actualEpochs}, loss: ${logs.loss?.toFixed(4)}`);
+          progressCb?.({
+            type: 'train.progress',
             payload: {
-              epoch: epoch+1, 
+              epoch: epoch + 1,
               epochs: actualEpochs,
               loss: Number(logs.loss ?? 0).toFixed(4),
-              acc: Number(logs.acc ?? 0).toFixed(4),
-              val_loss: 0,
-              val_acc: 0,
-              percent: Math.round(((epoch+1)/actualEpochs)*100),
+              acc: '0',
+              val_loss: '0',
+              val_acc: '0',
+              percent: Math.round(((epoch + 1) / actualEpochs) * 100),
             }
           });
         },
         onTrainEnd: () => {
-          console.log('[TrainOnGames] Training completed');
-          progressCb?.({ type:'train.done', payload:{ saved:true } });
+          progressCb?.({ type: 'train.done', payload: { saved: true } });
         },
       }
     });
-    
-    console.log('[TrainOnGames] Saving model...');
-    await m.save(`file://${_MODEL_DIR}`);
-    
-    // Перезагружаем модель в памяти после сохранения
+
+    // Сохраняем в TTT3 директорию
+    const saveDir = path.join(_MODEL_DIR, 'ttt3_transformer');
+    await ensureDir(saveDir);
+    await model.save(`file://${saveDir}`);
+
+    // Перезагружаем модель
     reloadTTT3Model();
-    console.log('[TrainOnGames] Model reloaded in memory after training');
-    
-    xCells.dispose(); xPos.dispose(); yOneHot.dispose();
-    console.log('[TrainOnGames] Done');
+    console.log('[TrainOnGames] Model saved and reloaded');
+
+    // Cleanup
+    xTensor.dispose();
+    posTensor.dispose();
+    yPolicyTensor.dispose();
+    yValueTensor.dispose();
+
   } catch (e) {
     console.error('[TrainOnGames] Error:', e);
     progressCb?.({ type: 'error', error: String(e) });
@@ -795,236 +1047,330 @@ export async function trainOnGames(progressCb, { epochs = 1, batchSize = 256, fo
   }
 }
 
-// Обучение TTT3 Transformer
-export async function trainTTT3WithProgress(progressCb, { epochs, batchSize, earlyStop = true, fromScratch = false } = {}) {
-  const { trainTTT3WithProgress: trainTTT3 } = await import('./src/train_ttt3_transformer_service.mjs');
-  return await trainTTT3(progressCb, { epochs, batchSize, earlyStop, fromScratch });
-}
-
-// Фоновое мини-обучение после игры (быстрое, не блокирующее)
+// ===== Фоновое мини-обучение после игры =====
 async function startBackgroundTraining(progressCb = null, newSkillsCount = 0, incrementalBatchSize = 256) {
   if (backgroundTraining) {
     console.log('[BackgroundTrain] Training already in progress, skipping...');
     return;
   }
-  
-  // Проверяем, есть ли данные для обучения
+
   const stats = getGameHistoryStats();
   if (stats.count < 10) {
     console.log(`[BackgroundTrain] Not enough data (${stats.count} moves), skipping...`);
     return;
   }
-  
+
   backgroundTraining = true;
-  backgroundTrainingProgressCb = progressCb;
   console.log('[BackgroundTrain] Starting background training...');
-  
-  // Отправляем старт фонового обучения
+
   const totalSkills = stats.count;
-  progressCb?.({ 
-    type: 'background_train.start', 
-    payload: { 
+  progressCb?.({
+    type: 'background_train.start',
+    payload: {
       newSkills: newSkillsCount,
       totalSkills: totalSkills,
-      epochs: 1, // Одна эпоха для быстрого усвоения нового навыка
-      message: `Новые навыки: ${newSkillsCount} из ${totalSkills} (${Math.round(newSkillsCount / totalSkills * 100)}%)`
-    } 
+      epochs: 1,
+      message: `Новые навыки: ${newSkillsCount} из ${totalSkills}`
+    }
   });
-  
-  // Запускаем в фоне без блокировки
+
   backgroundTrainingPromise = (async () => {
     try {
-      // Мини-обучение: меньше эпох, меньше батч, без early stopping
       await trainOnGames(
         (ev) => {
-          // Преобразуем события обычного обучения в события фонового обучения
-          if (ev.type === 'train.start') {
-            progressCb?.({ 
-              type: 'background_train.start', 
-              payload: { 
-                newSkills: newSkillsCount,
-                totalSkills: totalSkills,
+          if (ev.type === 'train.progress') {
+            progressCb?.({
+              type: 'background_train.progress',
+              payload: {
+                epoch: ev.payload?.epoch || 0,
                 epochs: ev.payload?.epochs || 1,
-                newSkillsPercent: Math.round(newSkillsCount / totalSkills * 100),
-                message: `Начало обучения: ${newSkillsCount} новых навыков (${Math.round(newSkillsCount / totalSkills * 100)}%)`
-              } 
-            });
-          } else if (ev.type === 'train.progress') {
-            // Отправляем прогресс с информацией о новых навыках
-            const epoch = ev.payload?.epoch || 0;
-            const epochs = ev.payload?.epochs || 1;
-            // Используем percent из payload, если есть, иначе вычисляем
-            const percent = ev.payload?.percent || Math.round((epoch / epochs) * 100);
-            const epochPercent = percent;
-            const newSkillsPercent = Math.round(newSkillsCount / totalSkills * 100);
-            
-            // Добавляем информацию о батчах, если есть
-            const batchInfo = ev.payload?.batchProgress ? 
-              ` · Батч ${ev.payload.currentBatch}/${ev.payload.batchesPerEpoch} (${ev.payload.batchProgress}%)` : 
-              '';
-            
-            progressCb?.({ 
-              type: 'background_train.progress', 
-              payload: { 
-                epoch,
-                epochs,
-                epochPercent: percent, // Используем вычисленный percent
+                epochPercent: ev.payload?.percent || 0,
                 newSkills: newSkillsCount,
                 totalSkills: totalSkills,
-                newSkillsPercent,
                 loss: ev.payload?.loss,
-                acc: ev.payload?.acc,
-                batchProgress: ev.payload?.batchProgress,
-                currentBatch: ev.payload?.currentBatch,
-                batchesPerEpoch: ev.payload?.batchesPerEpoch,
-                message: `Эпоха ${epoch}/${epochs} (${percent}%)${batchInfo} · Новые навыки: ${newSkillsCount} (${newSkillsPercent}%)`
-              } 
+                message: `Эпоха ${ev.payload?.epoch}/${ev.payload?.epochs} · Навыки: ${newSkillsCount}`
+              }
             });
           } else if (ev.type === 'train.done') {
-              // Перезагружаем модель после фонового обучения
-              reloadTTT3Model();
-              console.log('[BackgroundTrain] Model reloaded in memory after background training');
-              
-              progressCb?.({ 
-                type: 'background_train.done', 
-                payload: { 
-                  newSkills: newSkillsCount,
-                  totalSkills: totalSkills,
-                  newSkillsPercent: Math.round(newSkillsCount / totalSkills * 100),
-                  message: `Обучение завершено: ${newSkillsCount} новых навыков усвоено`
-                } 
-              });
+            progressCb?.({
+              type: 'background_train.done',
+              payload: {
+                newSkills: newSkillsCount,
+                totalSkills: totalSkills,
+                message: `Обучение завершено: ${newSkillsCount} навыков усвоено`
+              }
+            });
           } else if (ev.type === 'error') {
-            progressCb?.({ 
-              type: 'background_train.error', 
+            progressCb?.({
+              type: 'background_train.error',
               error: ev.error,
-              payload: { message: `Ошибка обучения: ${ev.error}` }
+              payload: { message: `Ошибка: ${ev.error}` }
             });
           }
         },
         {
-          epochs: 1, // Одна эпоха для быстрого усвоения нового навыка (фоновое обучение всегда 1 эпоха)
-          batchSize: incrementalBatchSize, // Используем переданный batch size из настроек
-          focusOnErrors: true
+          epochs: 1,
+          batchSize: incrementalBatchSize,
         }
       );
       console.log('[BackgroundTrain] Background training completed');
     } catch (e) {
-      console.error('[BackgroundTrain] Error during background training:', e);
-      progressCb?.({ 
-        type: 'background_train.error', 
+      console.error('[BackgroundTrain] Error:', e);
+      progressCb?.({
+        type: 'background_train.error',
         error: String(e),
         payload: { message: `Ошибка: ${e.message}` }
       });
     } finally {
       backgroundTraining = false;
       backgroundTrainingPromise = null;
-      backgroundTrainingProgressCb = null;
     }
   })();
 }
 
-// Экспортируем функцию для проверки статуса фонового обучения
 export function isBackgroundTraining() {
   return backgroundTraining;
 }
 
-export async function clearModel() {
+// ===== TTT5 Incremental Training on Games =====
+async function trainTTT5OnGames(progressCb, { epochs = 1, batchSize = 256 } = {}) {
+  if (ttt5GameHistory.length < 5) {
+    throw new Error(`Недостаточно данных TTT5. Нужно минимум 5 ходов, есть ${ttt5GameHistory.length}`);
+  }
+
+  const model = await ensureTTT5Model();
+  if (!model) {
+    throw new Error('TTT5 модель не найдена. Сначала обучите модель с нуля.');
+  }
+
+  function policyLossFromLogits(yTrue, yPred) {
+    const logProbs = tf.logSoftmax(yPred, -1);
+    return tf.neg(tf.sum(tf.mul(yTrue, logProbs), -1)).mean();
+  }
+
+  const { TTT5_TRAIN } = await import('./src/config.mjs');
+
+  model.compile({
+    optimizer: tf.train.adam((TTT5_TRAIN?.lr || 1e-3) * 0.3),
+    loss: [policyLossFromLogits, 'meanSquaredError'],
+    lossWeights: [1.0, TTT5_TRAIN?.weightValue || 0.5]
+  });
+
+  // Self-distillation replay: old entries serve as replay buffer
+  const combined = shuffleArray([...ttt5GameHistory]);
+  const N = combined.length;
+  const effectiveBatchSize = getEffectiveBatchSize(batchSize, N);
+
+  progressCb?.({ type: 'train.start', payload: { epochs, batchSize, nTrain: N, nVal: 0, variant: 'ttt5' } });
+  progressCb?.({
+    type: 'train.status',
+    payload: { message: `TTT5: ${N} позиций, batch ${effectiveBatchSize}...` }
+  });
+
+  console.log(`[TTT5 TrainOnGames] Training on ${N} samples`);
+
+  const planesArr = new Float32Array(N * 75);
+  const posArr = new Int32Array(N * 25);
+  const policyArr = new Float32Array(N * 25);
+  const valueArr = new Float32Array(N);
+
+  for (let i = 0; i < N; i++) {
+    planesArr.set(combined[i].planes, i * 75);
+    policyArr.set(combined[i].policy, i * 25);
+    valueArr[i] = combined[i].value;
+    for (let j = 0; j < 25; j++) posArr[i * 25 + j] = j;
+  }
+
+  const xTensor = tf.tensor3d(Array.from(planesArr), [N, 25, 3]);
+  const posTensor = tf.tensor2d(Array.from(posArr), [N, 25], 'int32');
+  const yPolicyTensor = tf.tensor2d(Array.from(policyArr), [N, 25]);
+  const yValueTensor = tf.tensor2d(Array.from(valueArr), [N, 1]);
+
+  await model.fit([xTensor, posTensor], [yPolicyTensor, yValueTensor], {
+    epochs,
+    batchSize: effectiveBatchSize,
+    shuffle: true,
+    verbose: 0,
+    callbacks: {
+      onEpochEnd: (epoch, logs) => {
+        console.log(`[TTT5 TrainOnGames] Epoch ${epoch + 1}/${epochs}, loss: ${logs.loss?.toFixed(4)}`);
+        progressCb?.({
+          type: 'train.progress',
+          payload: {
+            epoch: epoch + 1, epochs,
+            loss: Number(logs.loss ?? 0).toFixed(4),
+            percent: Math.round(((epoch + 1) / epochs) * 100),
+          }
+        });
+      },
+      onTrainEnd: () => {
+        progressCb?.({ type: 'train.done', payload: { saved: true, variant: 'ttt5' } });
+      },
+    }
+  });
+
+  const saveDir = path.join(_MODEL_DIR, 'ttt5_transformer');
+  await ensureDir(saveDir);
+  await model.save(`file://${saveDir}`);
+  reloadTTT5Model();
+
+  xTensor.dispose(); posTensor.dispose(); yPolicyTensor.dispose(); yValueTensor.dispose();
+  console.log('[TTT5 TrainOnGames] Model saved and reloaded');
+}
+
+// ===== TTT5 Background Training =====
+async function startTTT5BackgroundTraining(progressCb = null, newSkillsCount = 0, incrementalBatchSize = 256) {
+  if (backgroundTraining) {
+    console.log('[TTT5 BackgroundTrain] Training already in progress, skipping...');
+    return;
+  }
+
+  if (ttt5GameHistory.length < 5) {
+    console.log(`[TTT5 BackgroundTrain] Not enough data (${ttt5GameHistory.length}), skipping...`);
+    return;
+  }
+
+  backgroundTraining = true;
+  console.log('[TTT5 BackgroundTrain] Starting...');
+
+  const totalSkills = ttt5GameHistory.length;
+  progressCb?.({
+    type: 'background_train.start',
+    payload: { newSkills: newSkillsCount, totalSkills, epochs: 1, message: `TTT5: ${newSkillsCount} новых навыков` }
+  });
+
+  backgroundTrainingPromise = (async () => {
+    try {
+      await trainTTT5OnGames(
+        (ev) => {
+          if (ev.type === 'train.progress') {
+            progressCb?.({
+              type: 'background_train.progress',
+              payload: {
+                epoch: ev.payload?.epoch || 0, epochs: ev.payload?.epochs || 1,
+                epochPercent: ev.payload?.percent || 0,
+                newSkills: newSkillsCount, totalSkills, loss: ev.payload?.loss,
+                message: `TTT5 эпоха ${ev.payload?.epoch}/${ev.payload?.epochs}`
+              }
+            });
+          } else if (ev.type === 'train.done') {
+            progressCb?.({
+              type: 'background_train.done',
+              payload: { newSkills: newSkillsCount, totalSkills, message: `TTT5: ${newSkillsCount} навыков усвоено` }
+            });
+          }
+        },
+        { epochs: 1, batchSize: incrementalBatchSize }
+      );
+      console.log('[TTT5 BackgroundTrain] Completed');
+    } catch (e) {
+      console.error('[TTT5 BackgroundTrain] Error:', e);
+      progressCb?.({ type: 'background_train.error', error: String(e), payload: { message: `Ошибка: ${e.message}` } });
+    } finally {
+      backgroundTraining = false;
+      backgroundTrainingPromise = null;
+    }
+  })();
+}
+
+// ===== Очистка =====
+export function clearGameHistory() {
+  gameHistory = [];
+  ttt5GameHistory = [];
+  console.log('[GameHistory] Cleared (TTT3 + TTT5)');
+  return { success: true, count: 0, ttt5Count: 0 };
+}
+
+export function getGameHistoryStats() {
+  return {
+    count: gameHistory.length,
+    maxSize: MAX_HISTORY_SIZE,
+    ttt5Count: ttt5GameHistory.length,
+    ttt5MaxSize: MAX_TTT5_HISTORY,
+  };
+}
+
+// Обучение TTT3 Transformer с нуля
+export async function trainTTT3WithProgress(progressCb, { epochs, batchSize, earlyStop = true } = {}) {
+  const { trainTTT3WithProgress: trainTTT3 } = await import('./src/train_ttt3_transformer_service.mjs');
+  return await trainTTT3(progressCb, { epochs, batchSize, earlyStop });
+}
+
+// Обучение TTT5 Transformer (bootstrap + MCTS self-play)
+export async function trainTTT5WithProgress(progressCb, opts = {}) {
+  const { trainTTT5WithProgress: trainTTT5 } = await import('./src/train_ttt5_service.mjs');
+  return await trainTTT5(progressCb, opts);
+}
+
+// Обучение Gomoku Engine V2 (7x7 — 16x16)
+export async function trainGomokuWithProgress(progressCb, opts = {}) {
+  const { trainGomokuWithProgress: trainGomoku } = await import('./src/train_gomoku_service.mjs');
+  return await trainGomoku(progressCb, opts);
+}
+
+// Очистка модели
+export async function clearModel(variant = 'all') {
   try {
-    console.log('[Clear] Clearing all saved models...');
-    
-    // Освобождаем текущую модель из памяти
-    if (model) {
-      model.dispose?.();
-      model = null;
-    }
-    
-    // Освобождаем TTT3 модель из памяти и сбрасываем флаг загрузки
-    if (ttt3Model) {
-      ttt3Model.dispose?.();
-      ttt3Model = null;
-      console.log('[Clear] TTT3 model cleared from memory');
-    }
-    // Сбрасываем флаг загрузки, чтобы модель могла быть загружена заново после очистки
-    ttt3ModelLoading = false;
-    console.log('[Clear] TTT3 model cache reset - model will be reloaded from disk if exists');
-    
-    // Удаляем файлы старой модели
-    const modelJsonPath = path.join(_MODEL_DIR, 'model.json');
-    const weightsBinPath = path.join(_MODEL_DIR, 'weights.bin');
-    
+    console.log(`[Clear] Clearing models (variant=${variant})...`);
     let deletedFiles = [];
-    try {
-      await fs.unlink(modelJsonPath);
-      deletedFiles.push('model.json');
-    } catch (e) {
-      if (e.code !== 'ENOENT') throw e;
-    }
-    
-    try {
-      await fs.unlink(weightsBinPath);
-      deletedFiles.push('weights.bin');
-    } catch (e) {
-      if (e.code !== 'ENOENT') throw e;
-    }
-    
-    // Удаляем TTT3 Transformer модель
-    const ttt3ModelDir = path.join(_MODEL_DIR, 'ttt3_transformer');
-    try {
-      const ttt3ModelPath = path.join(ttt3ModelDir, 'model.json');
-      const ttt3WeightsPath = path.join(ttt3ModelDir, 'weights.bin');
-      
+
+    // Очистка TTT3
+    if (variant === 'all' || variant === 'ttt3') {
+      if (ttt3Model) { ttt3Model.dispose?.(); ttt3Model = null; }
+      ttt3ModelLoading = false;
+
+      const ttt3ModelDir = path.join(_MODEL_DIR, 'ttt3_transformer');
       try {
-        await fs.unlink(ttt3ModelPath);
-        deletedFiles.push('ttt3_transformer/model.json');
-        console.log('[Clear] Deleted TTT3 model.json');
-      } catch (e) {
-        if (e.code !== 'ENOENT') throw e;
-      }
-      
-      try {
-        await fs.unlink(ttt3WeightsPath);
-        deletedFiles.push('ttt3_transformer/weights.bin');
-        console.log('[Clear] Deleted TTT3 weights.bin');
-      } catch (e) {
-        if (e.code !== 'ENOENT') throw e;
-      }
-      
-      // Пробуем удалить другие файлы весов TTT3 (на случай если есть несколько shards)
-      try {
-        const ttt3Files = await fs.readdir(ttt3ModelDir);
-        for (const file of ttt3Files) {
-          if (file.startsWith('weights') || file.endsWith('.bin')) {
+        const files = await fs.readdir(ttt3ModelDir);
+        for (const file of files) {
+          if (file.endsWith('.json') || file.endsWith('.bin')) {
             await fs.unlink(path.join(ttt3ModelDir, file));
-            const filePath = `ttt3_transformer/${file}`;
-            if (!deletedFiles.includes(filePath)) deletedFiles.push(filePath);
+            deletedFiles.push(`ttt3_transformer/${file}`);
           }
         }
+      } catch (e) { /* dir may not exist */ }
+
+      // Legacy cleanup
+      try {
+        const oldModelPath = path.join(_MODEL_DIR, 'model.json');
+        await fs.unlink(oldModelPath);
+        deletedFiles.push('model.json');
       } catch (e) {
-        // Игнорируем ошибки чтения директории (может не существовать)
+        if (e.code !== 'ENOENT') console.warn('[Clear] Error:', e.message);
       }
-    } catch (e) {
-      // Игнорируем ошибки при удалении TTT3 модели
-      console.warn('[Clear] Error clearing TTT3 model directory:', e.message);
-    }
-    
-    // Пробуем удалить другие файлы весов старой модели (на случай если есть несколько shards)
-    try {
-      const files = await fs.readdir(_MODEL_DIR);
-      for (const file of files) {
-        if (file.startsWith('weights') || file.endsWith('.bin')) {
-          await fs.unlink(path.join(_MODEL_DIR, file));
-          if (!deletedFiles.includes(file)) deletedFiles.push(file);
+
+      try {
+        const files = await fs.readdir(_MODEL_DIR);
+        for (const file of files) {
+          if (file.startsWith('weights') || file.endsWith('.bin')) {
+            await fs.unlink(path.join(_MODEL_DIR, file));
+            deletedFiles.push(file);
+          }
         }
-      }
-    } catch (e) {
-      // Игнорируем ошибки чтения директории
+      } catch (e) { /* ignore */ }
     }
-    
-    console.log(`[Clear] All models cleared. Deleted files: ${deletedFiles.join(', ') || 'none'}`);
+
+    // Очистка TTT5
+    if (variant === 'all' || variant === 'ttt5') {
+      if (ttt5Model) { ttt5Model.dispose?.(); ttt5Model = null; }
+      ttt5ModelLoading = false;
+
+      const ttt5ModelDir = path.join(_MODEL_DIR, 'ttt5_transformer');
+      try {
+        const files = await fs.readdir(ttt5ModelDir);
+        for (const file of files) {
+          if (file.endsWith('.json') || file.endsWith('.bin')) {
+            await fs.unlink(path.join(ttt5ModelDir, file));
+            deletedFiles.push(`ttt5_transformer/${file}`);
+          }
+        }
+      } catch (e) { /* dir may not exist */ }
+    }
+
+    console.log(`[Clear] Cleared. Deleted: ${deletedFiles.join(', ') || 'none'}`);
     return { success: true, deletedFiles };
   } catch (e) {
-    console.error('[Clear] Error clearing model:', e);
+    console.error('[Clear] Error:', e);
     throw e;
   }
 }
