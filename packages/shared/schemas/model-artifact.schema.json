@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gomoku.platform.model_artifact",
+  "title": "ModelArtifact",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "artifactId": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "format": {
+      "type": "string",
+      "enum": ["pt", "onnx", "nnue"]
+    },
+    "boardSizes": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 7,
+        "maximum": 16
+      }
+    },
+    "inputShape": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "createdAt": {
+      "type": "string"
+    },
+    "metrics": {
+      "type": "object"
+    }
+  },
+  "required": ["artifactId", "name", "version", "format", "boardSizes", "createdAt"]
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ModelArtifact",
+  "title": "Model Artifact",
+  "type": "object",
+  "required": ["id", "variant", "format", "path", "createdAt"],
+  "properties": {
+    "id": { "type": "string", "format": "uuid" },
+    "variant": { "type": "string", "description": "gomoku7..gomoku16" },
+    "format": { "type": "string", "enum": ["onnx", "pytorch", "checkpoint"] },
+    "path": { "type": "string" },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "policyAccuracy": { "type": "number" },
+        "valueMae": { "type": "number" },
+        "eloEstimate": { "type": "integer" }
+      }
+    },
+    "parentModelId": { "type": "string", "format": "uuid" },
+    "trainingJobId": { "type": "string", "format": "uuid" },
+    "createdAt": { "type": "string", "format": "date-time" }
+  }
+}

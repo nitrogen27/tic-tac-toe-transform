@@ -28,6 +28,7 @@ const PLANES_LEN = SEQ_LEN * 3; // 75
 const adapter = createGameAdapter({ variant: 'ttt5', winLen: TTT5_WIN_LEN });
 
 const SAVE_DIR = path.join(__dirname, '..', 'saved', 'ttt5_transformer');
+const GPU_PERF_MODE = process.env.USE_GPU_BIG === '1';
 
 // ===== Training State for structured progress =====
 function createTrainingState(totalPhases) {
@@ -198,6 +199,30 @@ function buildLrPhases(baseLR, epochs) {
     { fraction: 0.3, lr: baseLR / 4 },
     { fraction: 0.3, lr: baseLR / 20 },
   ];
+}
+
+function shouldRunEpochEval(epoch, epochs) {
+  if (!GPU_PERF_MODE || epochs <= 2) return true;
+  return epoch === 0 || epoch === epochs - 1 || ((epoch + 1) % 3 === 0);
+}
+
+function isResourceExhaustedError(error) {
+  const message = String(error?.message || error || '');
+  return (
+    message.includes('RESOURCE_EXHAUSTED') ||
+    message.includes('failed to allocate memory') ||
+    message.includes('OOM when allocating tensor') ||
+    message.includes('CUDA_ERROR_OUT_OF_MEMORY') ||
+    message.toLowerCase().includes('out of memory')
+  );
+}
+
+function nextLowerBatchSize(currentBatchSize, totalSamples) {
+  const candidates = [768, 640, 576, 544, 512, 448, 384, 320, 288, 256, 224, 192, 160, 128, 96, 64, 32];
+  for (const candidate of candidates) {
+    if (candidate < currentBatchSize && candidate <= totalSamples) return candidate;
+  }
+  return 0;
 }
 
 function normalizePolicyFromScores(entries, length, power = 1.0) {
@@ -627,34 +652,37 @@ function forwardPass(model, board, player) {
 
 /**
  * Batched forward pass — evaluates multiple positions in a single model.predict call.
- * Up to 8x faster than individual calls on GPU due to parallelized matrix ops.
+ * Optimized: pre-allocated posRow, flat mask buffer, minimal tensor creation.
  */
+const _posRow = Int32Array.from({ length: SEQ_LEN }, (_, i) => i);
+
 function forwardPassBatched(model, requests) {
   // requests: Array<{ board, player }>
   const batchSize = requests.length;
   if (batchSize === 0) return [];
 
   return tf.tidy(() => {
-    // Encode all positions into a single flat buffer
+    // Pre-allocate flat buffers to avoid per-item array creation
     const planesFlat = new Float32Array(batchSize * SEQ_LEN * 3);
-    const masksArr = [];
+    const masksFlat = new Float32Array(batchSize * SEQ_LEN);
+    const posFlat = new Int32Array(batchSize * SEQ_LEN);
+
     for (let i = 0; i < batchSize; i++) {
       const { board, player } = requests[i];
       const planes = adapter.encodePlanes(board, player);
       planesFlat.set(planes, i * SEQ_LEN * 3);
-      masksArr.push(Array.from(adapter.maskLegalMoves(board)));
+      const mask = adapter.maskLegalMoves(board);
+      masksFlat.set(mask, i * SEQ_LEN);
+      posFlat.set(_posRow, i * SEQ_LEN);
     }
 
     const x = tf.tensor(planesFlat, [batchSize, SEQ_LEN, 3]);
-    const posRow = Array.from({ length: SEQ_LEN }, (_, i) => i);
-    const posData = [];
-    for (let i = 0; i < batchSize; i++) posData.push(posRow);
-    const posIndices = tf.tensor2d(posData, [batchSize, SEQ_LEN], 'int32');
+    const posIndices = tf.tensor(posFlat, [batchSize, SEQ_LEN], 'int32');
 
     const [logits, valueTensor] = model.predict([x, posIndices]);
 
     // Mask & softmax
-    const maskTensor = tf.tensor2d(masksArr, [batchSize, SEQ_LEN]);
+    const maskTensor = tf.tensor(masksFlat, [batchSize, SEQ_LEN]);
     const masked = maskLogits(logits, maskTensor);
     const probs = tf.softmax(masked, -1);
 
@@ -663,8 +691,10 @@ function forwardPassBatched(model, requests) {
 
     const results = [];
     for (let i = 0; i < batchSize; i++) {
+      const start = i * SEQ_LEN;
+      const end = start + SEQ_LEN;
       results.push({
-        policy: new Float32Array(policiesFlat.slice(i * SEQ_LEN, (i + 1) * SEQ_LEN)),
+        policy: policiesFlat.subarray(start, end),
         value: valuesFlat[i],
       });
     }
@@ -769,8 +799,8 @@ async function trainOnData(model, trainingData, progressCb, { epochs = 5, phase 
   const yPolicyTensor = tf.tensor2d(policyArr, [N, SEQ_LEN]);
   const yValueTensor = tf.tensor2d(valueArr, [N, 1]);
 
-  const batchSize = Math.max(16, Math.min(requestedBatchSize, N));
-  const totalBatches = Math.ceil(N / batchSize);
+  let effectiveBatchSize = Math.max(16, Math.min(requestedBatchSize, N));
+  let totalBatches = Math.ceil(N / effectiveBatchSize);
 
   // LR schedule
   const baseLR = TTT5_TRAIN.lr;
@@ -815,52 +845,83 @@ async function trainOnData(model, trainingData, progressCb, { epochs = 5, phase 
       trainingState.totalBatches = totalBatches;
     }
 
-    const history = await model.fit(
-      [xTensor, posTensor],
-      [yPolicyTensor, yValueTensor],
-      {
-        epochs: 1,
-        batchSize,
-        shuffle: true,
-        verbose: 0,
-        callbacks: {
-          onBatchEnd: (batch) => {
-            if (trainingState) {
-              trainingState.batch = batch + 1;
-              // Emit every 3 batches to avoid WS flooding
-              if ((batch + 1) % 3 === 0 || batch === totalBatches - 1) {
-                emitProgress(trainingState, progressCb);
+    let history;
+    for (;;) {
+      totalBatches = Math.ceil(N / effectiveBatchSize);
+      if (trainingState) {
+        trainingState.totalBatches = totalBatches;
+      }
+
+      try {
+        history = await model.fit(
+          [xTensor, posTensor],
+          [yPolicyTensor, yValueTensor],
+          {
+            epochs: 1,
+            batchSize: effectiveBatchSize,
+            shuffle: true,
+            verbose: 0,
+            callbacks: {
+              onBatchEnd: (batch) => {
+                if (trainingState) {
+                  trainingState.batch = batch + 1;
+                  // Emit every 3 batches to avoid WS flooding
+                  if ((batch + 1) % 3 === 0 || batch === totalBatches - 1) {
+                    emitProgress(trainingState, progressCb);
+                  }
+                }
               }
             }
           }
+        );
+        break;
+      } catch (error) {
+        if (!isResourceExhaustedError(error)) throw error;
+
+        const loweredBatch = nextLowerBatchSize(effectiveBatchSize, N);
+        if (loweredBatch < 32) throw error;
+
+        console.warn(`[TrainTTT5] ${phase}: OOM at batchSize=${effectiveBatchSize}, retrying with batchSize=${loweredBatch}`);
+        progressCb?.({
+          type: 'train.status',
+          payload: {
+            message: `GPU память переполнена на batch ${effectiveBatchSize}, пробую batch ${loweredBatch}...`
+          }
+        });
+        effectiveBatchSize = loweredBatch;
+        if (trainingState) {
+          trainingState.batch = 0;
         }
+        await new Promise((resolve) => setTimeout(resolve, 300));
       }
-    );
+    }
 
     const loss = history.history.loss[0];
 
-    // Compute accuracy (top-1 policy match) and value MAE on a subset
-    let accuracy = 0;
-    let mae = 0;
-    const evalSize = Math.min(N, 512);
-    const evalResult = tf.tidy(() => {
-      const evalX = xTensor.slice([0, 0, 0], [evalSize, SEQ_LEN, 3]);
-      const evalPos = posTensor.slice([0, 0], [evalSize, SEQ_LEN]);
-      const [pLogits, vPred] = model.predict([evalX, evalPos]);
-      const legalMask = evalX.slice([0, 0, 2], [evalSize, SEQ_LEN, 1]).reshape([evalSize, SEQ_LEN]);
-      const maskedLogits = maskLogits(pLogits, legalMask);
+    // Metric evaluation adds synchronous GPU→CPU barriers, so in perf mode we do it sparsely.
+    let accuracy = trainingState?.accuracy ? Number(trainingState.accuracy) / 100 : 0;
+    let mae = trainingState?.mae ? Number(trainingState.mae) : 0;
+    if (shouldRunEpochEval(epoch, epochs)) {
+      const evalSize = Math.min(N, GPU_PERF_MODE ? 256 : 512);
+      const evalResult = tf.tidy(() => {
+        const evalX = xTensor.slice([0, 0, 0], [evalSize, SEQ_LEN, 3]);
+        const evalPos = posTensor.slice([0, 0], [evalSize, SEQ_LEN]);
+        const [pLogits, vPred] = model.predict([evalX, evalPos]);
+        const legalMask = evalX.slice([0, 0, 2], [evalSize, SEQ_LEN, 1]).reshape([evalSize, SEQ_LEN]);
+        const maskedLogits = maskLogits(pLogits, legalMask);
 
-      const modelArgmax = maskedLogits.argMax(-1);
-      const targetArgmax = yPolicyTensor.slice([0, 0], [evalSize, SEQ_LEN]).argMax(-1);
-      const matches = modelArgmax.equal(targetArgmax).sum().dataSync()[0];
+        const modelArgmax = maskedLogits.argMax(-1);
+        const targetArgmax = yPolicyTensor.slice([0, 0], [evalSize, SEQ_LEN]).argMax(-1);
+        const matches = modelArgmax.equal(targetArgmax).sum().dataSync()[0];
 
-      const targetVal = yValueTensor.slice([0, 0], [evalSize, 1]);
-      const valMae = vPred.sub(targetVal).abs().mean().dataSync()[0];
+        const targetVal = yValueTensor.slice([0, 0], [evalSize, 1]);
+        const valMae = vPred.sub(targetVal).abs().mean().dataSync()[0];
 
-      return { matches, valMae };
-    });
-    accuracy = evalResult.matches / evalSize;
-    mae = evalResult.valMae;
+        return { matches, valMae };
+      });
+      accuracy = evalResult.matches / evalSize;
+      mae = evalResult.valMae;
+    }
 
     if (trainingState) {
       trainingState.loss = Number(loss).toFixed(4);
@@ -886,13 +947,18 @@ async function trainOnData(model, trainingData, progressCb, { epochs = 5, phase 
       });
     }
 
-    console.log(`[TrainTTT5] ${phase} Epoch ${epoch + 1}/${epochs} - Loss: ${Number(loss).toFixed(4)}, Acc: ${(accuracy * 100).toFixed(1)}%, MAE: ${mae.toFixed(4)} (LR: ${currentLR.toExponential(1)})`);
+    const metricSuffix = shouldRunEpochEval(epoch, epochs)
+      ? `, Acc: ${(accuracy * 100).toFixed(1)}%, MAE: ${mae.toFixed(4)}`
+      : ', Acc: cached, MAE: cached';
+    console.log(`[TrainTTT5] ${phase} Epoch ${epoch + 1}/${epochs} - Loss: ${Number(loss).toFixed(4)}${metricSuffix} (LR: ${currentLR.toExponential(1)})`);
   }
 
   xTensor.dispose();
   posTensor.dispose();
   yPolicyTensor.dispose();
   yValueTensor.dispose();
+
+  return effectiveBatchSize;
 }
 
 // ===== Phase 1: Bootstrap with heuristic self-play =====
@@ -967,7 +1033,7 @@ async function bootstrapPhase(model, progressCb, numGames = 200, epochs = 5, bat
     emitProgress(trainingState, progressCb);
   }
 
-  await trainOnData(model, trainingData, progressCb, { epochs, phase: 'bootstrap', batchSize, trainingState });
+  return await trainOnData(model, trainingData, progressCb, { epochs, phase: 'bootstrap', batchSize, trainingState });
 }
 
 // ===== Phase 2: MCTS Self-Play with Replay Buffer =====
@@ -999,12 +1065,15 @@ async function mctsPhase(model, progressCb, iterations = 5, gamesPerIter = 50, e
     }
 
     // === Batched NN-eval queue ===
-    // Collect pending evaluations and flush them in one model.predict call
+    // Accumulate pending evaluations and flush in large batches for GPU saturation
     let evalQueue = [];
-    let flushTimer = null;
-    const BATCH_SIZE = 16; // Max batch for GPU batching
+    let flushScheduled = false;
+    const concurrentGames = Math.max(1, TTT5_MCTS.concurrentGames || 1);
+    const selfPlayBatchParallel = Math.max(32, TTT5_MCTS.batchParallel || 32);
+    const BATCH_SIZE = Math.max(selfPlayBatchParallel, concurrentGames * 32);
 
     function flushEvalQueue() {
+      flushScheduled = false;
       if (evalQueue.length === 0) return;
       const batch = evalQueue.splice(0);
       const requests = batch.map(b => ({ board: b.board, player: b.player }));
@@ -1016,31 +1085,25 @@ async function mctsPhase(model, progressCb, iterations = 5, gamesPerIter = 50, e
 
     const nnEval = (board, player) => {
       return new Promise((resolve) => {
-        evalQueue.push({ board: [...board], player, resolve });
+        evalQueue.push({ board: board.slice(), player, resolve });
         if (evalQueue.length >= BATCH_SIZE) {
           flushEvalQueue();
-        } else if (!flushTimer) {
-          // Microtask flush — collects all synchronous expansions
-          flushTimer = Promise.resolve().then(() => {
-            flushTimer = null;
-            flushEvalQueue();
-          });
+        } else if (!flushScheduled) {
+          flushScheduled = true;
+          // Collect all leaf expansions produced in the current tick without adding a timer stall.
+          queueMicrotask(flushEvalQueue);
         }
       });
     };
 
     const recentSamples = [];
 
-    for (let g = 0; g < gamesPerIter; g++) {
-      const defaultPlayer = (iter + g) % 2 === 0 ? 1 : -1;
+    async function playSelfPlayGame(gameIndex) {
+      const defaultPlayer = (iter + gameIndex) % 2 === 0 ? 1 : -1;
       const start = createSelfPlayStartWithFallback(hardBuffer, defaultPlayer);
       let board = start.board;
       let player = start.player;
       const gameRecord = [];
-
-      if (trainingState && start.seeded) {
-        trainingState.seededGames += 1;
-      }
 
       while (!adapter.isTerminal(board)) {
         const legal = adapter.legalMoves(board);
@@ -1054,7 +1117,6 @@ async function mctsPhase(model, progressCb, iterations = 5, gamesPerIter = 50, e
           policyTarget = forcedTarget.policy;
           move = forcedTarget.move;
           source = forcedTarget.source;
-          targetPeak = 1;
         } else {
           const moveNumber = SEQ_LEN - legal.length;
           const explorationMoves = TTT5_MCTS.explorationMoves || 8;
@@ -1073,6 +1135,7 @@ async function mctsPhase(model, progressCb, iterations = 5, gamesPerIter = 50, e
             temperature: currentTemp,
             dirichletAlpha: currentDirichletAlpha,
             dirichletEpsilon: currentDirichletEpsilon,
+            batchParallel: selfPlayBatchParallel,
             winnerFn: (b) => adapter.winner(b),
             legalMovesFn: (b) => adapter.legalMoves(b),
             candidateMovesFn: (b, p, legalMoves, policyProbs) => adapter.candidateMoves(b, {
@@ -1106,10 +1169,11 @@ async function mctsPhase(model, progressCb, iterations = 5, gamesPerIter = 50, e
         player = -player;
       }
 
-      const w = adapter.winner(board);
+      const winner = adapter.winner(board);
+      const samples = [];
       for (const rec of gameRecord) {
-        const value = w === rec.player ? 1 : (w === -rec.player ? -1 : 0);
-        const sample = {
+        const value = winner === rec.player ? 1 : (winner === -rec.player ? -1 : 0);
+        samples.push({
           board: rec.board,
           player: rec.player,
           planes: rec.planes,
@@ -1119,28 +1183,48 @@ async function mctsPhase(model, progressCb, iterations = 5, gamesPerIter = 50, e
           source: rec.source,
           move: rec.move,
           targetPeak: rec.targetPeak,
-        };
-        replayBuffer.push(sample);
-        recentSamples.push(sample);
+        });
       }
 
-      hardBuffer.push(...extractHardExamples(gameRecord, w));
+      return {
+        winner,
+        seeded: start.seeded,
+        samples,
+        hardExamples: extractHardExamples(gameRecord, winner),
+      };
+    }
 
-      if (trainingState) {
-        trainingState.game = g + 1;
-        trainingState.totalPositions = replayBuffer.length;
-        trainingState.hardPositions = hardBuffer.length;
-        if (w === 1) trainingState.selfPlayStats.wins++;
-        else if (w === -1) trainingState.selfPlayStats.losses++;
-        else trainingState.selfPlayStats.draws++;
-        if ((g + 1) % 5 === 0 || g === gamesPerIter - 1) {
-          emitProgress(trainingState, progressCb);
+    for (let batchStart = 0; batchStart < gamesPerIter; batchStart += concurrentGames) {
+      const batchEnd = Math.min(gamesPerIter, batchStart + concurrentGames);
+      const batchResults = await Promise.all(
+        Array.from({ length: batchEnd - batchStart }, (_, idx) => playSelfPlayGame(batchStart + idx))
+      );
+
+      for (let idx = 0; idx < batchResults.length; idx++) {
+        const g = batchStart + idx;
+        const result = batchResults[idx];
+
+        replayBuffer.push(...result.samples);
+        recentSamples.push(...result.samples);
+        hardBuffer.push(...result.hardExamples);
+
+        if (trainingState) {
+          trainingState.game = g + 1;
+          trainingState.totalPositions = replayBuffer.length;
+          trainingState.hardPositions = hardBuffer.length;
+          if (result.seeded) trainingState.seededGames += 1;
+          if (result.winner === 1) trainingState.selfPlayStats.wins++;
+          else if (result.winner === -1) trainingState.selfPlayStats.losses++;
+          else trainingState.selfPlayStats.draws++;
+          if ((g + 1) % 5 === 0 || g === gamesPerIter - 1) {
+            emitProgress(trainingState, progressCb);
+          }
+        } else if ((g + 1) % 10 === 0) {
+          progressCb?.({
+            type: 'train.status',
+            payload: { message: `MCTS ${iter + 1}/${iterations}: игра ${g + 1}/${gamesPerIter}` }
+          });
         }
-      } else if ((g + 1) % 10 === 0) {
-        progressCb?.({
-          type: 'train.status',
-          payload: { message: `MCTS ${iter + 1}/${iterations}: игра ${g + 1}/${gamesPerIter}` }
-        });
       }
     }
 
@@ -1171,7 +1255,7 @@ async function mctsPhase(model, progressCb, iterations = 5, gamesPerIter = 50, e
       trainingState.totalPositions = replayBatch.length;
     }
 
-    await trainOnData(model, replayBatch, progressCb, {
+    batchSize = await trainOnData(model, replayBatch, progressCb, {
       epochs: epochsPerIter,
       phase: `mcts_iter_${iter + 1}`,
       batchSize,
@@ -1183,6 +1267,8 @@ async function mctsPhase(model, progressCb, iterations = 5, gamesPerIter = 50, e
     await model.save(`file://${SAVE_DIR}`);
     console.log(`[TrainTTT5] Checkpoint saved after MCTS iteration ${iter + 1}`);
   }
+
+  return batchSize;
 }
 
 // ===== Try to load existing model =====
@@ -1201,12 +1287,19 @@ async function tryLoadModel() {
 // ===== Main entry point =====
 export async function trainTTT5WithProgress(progressCb, {
   epochs = TTT5_TRAIN.epochs,
-  batchSize = TTT5_TRAIN.batchSize,
+  batchSize: _batchSize = TTT5_TRAIN.batchSize,
   bootstrapGames = 200,
   mctsIterations = 10,
   mctsGamesPerIter = 100,
-  mctsTrainingSims = TTT5_MCTS.trainingSimulations, // Симуляций на ход при self-play (light:80, medium:100, deep:200)
+  mctsTrainingSims: _mctsTrainingSims = TTT5_MCTS.trainingSimulations,
 } = {}) {
+  const MAX_SAFE_BATCH = 256; // RTX 3060 6GB safe limit (768 → OOM)
+  let batchSize = Number.isFinite(_batchSize)
+    ? Math.min(MAX_SAFE_BATCH, Math.max(GPU_PERF_MODE ? 256 : 16, Math.round(_batchSize / 32) * 32))
+    : Math.min(MAX_SAFE_BATCH, TTT5_TRAIN.batchSize);
+  const mctsTrainingSims = Number.isFinite(_mctsTrainingSims)
+    ? Math.max(16, Math.floor(_mctsTrainingSims))
+    : TTT5_MCTS.trainingSimulations;
   try {
     console.log('[TrainTTT5] Starting TTT5 training...');
     console.log('[TrainTTT5] Config:', {
@@ -1274,7 +1367,7 @@ export async function trainTTT5WithProgress(progressCb, {
       const tacticalData = generateTacticalCurriculum(Math.max(240, Math.floor(bootstrapGames * 1.5)));
       if (tacticalData.length > 0) {
         trainingState.totalPositions = tacticalData.length;
-        await trainOnData(model, tacticalData, progressCb, {
+        batchSize = await trainOnData(model, tacticalData, progressCb, {
           epochs: phaseEpochs.tactical,
           phase: 'tactical_curriculum',
           batchSize,
@@ -1285,7 +1378,7 @@ export async function trainTTT5WithProgress(progressCb, {
 
       // Phase 2: Bootstrap
       trainingState.phaseStep = 2;
-      await bootstrapPhase(model, progressCb, bootstrapGames, phaseEpochs.bootstrap, batchSize, trainingState);
+      batchSize = await bootstrapPhase(model, progressCb, bootstrapGames, phaseEpochs.bootstrap, batchSize, trainingState);
       trainingState.completedPhases.push('bootstrap');
 
       await fs.mkdir(SAVE_DIR, { recursive: true });
@@ -1295,7 +1388,7 @@ export async function trainTTT5WithProgress(progressCb, {
 
     // Phase 3: MCTS Self-Play
     trainingState.phaseStep = isNewModel ? 3 : 1;
-    await mctsPhase(model, progressCb, effectiveMctsIterations, mctsGamesPerIter, mctsEpochsPerIter, batchSize, trainingState, mctsTrainingSims);
+    batchSize = await mctsPhase(model, progressCb, effectiveMctsIterations, mctsGamesPerIter, mctsEpochsPerIter, batchSize, trainingState, mctsTrainingSims);
 
     // Final save
     await model.save(`file://${SAVE_DIR}`);

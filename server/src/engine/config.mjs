@@ -63,14 +63,15 @@ export const GOMOKU_TRANSFORMER_CFG = {
   dropout:   0.08,
 };
 
-// Training configuration
+// Training configuration — optimized for GPU saturation (RTX 3060)
 export const GOMOKU_TRAIN_CFG = {
-  batchSize:         64,
+  batchSize:         256,       // Увеличено с 64 — GPU batch saturation
   epochs:            30,
-  lr:                5e-4,
+  lr:                1e-3,      // Увеличено с 5e-4 — linear scaling для больших батчей
   weightValue:       0.5,
   selfPlayGames:     200,
-  selfPlaySimulations: 150,
-  replayBufferMax:   10000,
-  hardBufferMax:     3000,
+  selfPlaySimulations: 400,     // Увеличено с 150 — глубже MCTS для качества
+  replayBufferMax:   20000,     // Увеличено с 10000 — больше данных
+  hardBufferMax:     5000,      // Увеличено с 3000
+  batchParallel:     32,        // Параллельных MCTS leaf expansions
 };

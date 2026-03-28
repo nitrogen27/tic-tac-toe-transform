@@ -88,6 +88,7 @@ export async function inferencePolicy({
       C_puct: mctsCpuct,
       sims: mctsSimulations,
       temperature,
+      batchParallel: 32,
       winnerFn: (b) => adapter.winner(b),
       legalMovesFn: (b) => adapter.legalMoves(b),
       candidateMovesFn: (b, p, legal, policyProbs) => {

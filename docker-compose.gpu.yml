@@ -40,6 +40,11 @@ services:
       - TF_ENABLE_ONEDNN_OPTS=1
       - CUDA_CACHE_DISABLE=0
       - CUDA_CACHE_MAXSIZE=2147483647
+      # XLA и CUDA оптимизации
+      - TF_XLA_FLAGS=--tf_xla_auto_jit=2
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      # Целевой power limit для GPU внутри контейнера
+      - GPU_POWER_LIMIT=95
     # Снятие ограничений cgroups для максимальной производительности
     # (CPU и память ограничены только ресурсами хоста)
     # Для продакшена можно добавить ограничения:

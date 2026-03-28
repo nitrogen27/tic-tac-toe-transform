@@ -1,6 +1,23 @@
 # Tic-Tac-Toe Transformer Fullstack
 A full-featured tic-tac-toe application that uses a Transformer model powered by TensorFlow.js.
 
+## Gomoku Platform V3
+
+Branch `feature/gomoku-platform-v3` contains a production-grade Gomoku platform
+living alongside the legacy TensorFlow.js stack. See [docs/gomoku-platform-v3/README.md](docs/gomoku-platform-v3/README.md) for full progress.
+
+| Module | Status | Description |
+|--------|--------|-------------|
+| `packages/shared/` | ✅ Phase 1 | JSON Schema contracts + TS/Python codegen |
+| `engine-core/` | ✅ Phase 2 | C++17 alpha-beta engine — 36/36 tests pass |
+| `trainer-lab/` | ✅ Phase 3 | PyTorch ResNet trainer — 21/21 tests pass |
+| `apps/api/` | 🔲 Phase 4 | FastAPI gateway (scaffolded) |
+| `apps/web/` | 🔲 Phase 5 | React + TypeScript UI (scaffolded) |
+| Self-play pipeline | 🔲 Phase 6 | generate → train → eval loop (skeleton) |
+
+Legacy `server/` and `client/` remain unchanged and continue to be the active
+runtime for the current product.
+
 TEST
 
 ## Key Features

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "definitions": {
+    "TrainJobConfig": {
+      "$id": "TrainJobConfig",
+      "type": "object",
+      "properties": {
+        "variant": { "type": "string", "description": "gomoku7..gomoku16" },
+        "batchSize": { "type": "integer", "default": 256 },
+        "epochs": { "type": "integer", "default": 30 },
+        "lr": { "type": "number", "default": 0.001 },
+        "selfPlayGames": { "type": "integer", "default": 200 },
+        "selfPlaySimulations": { "type": "integer", "default": 400 },
+        "resumeFromCheckpoint": { "type": "string" }
+      }
+    },
+    "TrainJobProgress": {
+      "$id": "TrainJobProgress",
+      "type": "object",
+      "properties": {
+        "phase": { "type": "string", "enum": ["tactical", "bootstrap", "self_play", "training", "evaluating"] },
+        "epoch": { "type": "integer" },
+        "totalEpochs": { "type": "integer" },
+        "loss": { "type": "number" },
+        "policyAccuracy": { "type": "number" },
+        "valueMae": { "type": "number" },
+        "gamesGenerated": { "type": "integer" },
+        "positionsCollected": { "type": "integer" },
+        "elapsedSec": { "type": "number" }
+      }
+    },
+    "TrainJob": {
+      "$id": "TrainJob",
+      "title": "Training Job",
+      "type": "object",
+      "required": ["id", "variant", "status", "createdAt"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "variant": { "type": "string" },
+        "status": { "type": "string", "enum": ["queued", "running", "completed", "failed", "cancelled"] },
+        "config": { "$ref": "#/definitions/TrainJobConfig" },
+        "progress": { "$ref": "#/definitions/TrainJobProgress" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

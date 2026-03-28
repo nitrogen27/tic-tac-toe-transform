@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gomoku.platform.position",
+  "title": "Position",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "boardSize": {
+      "type": "integer",
+      "minimum": 7,
+      "maximum": 16
+    },
+    "winLength": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 5,
+      "default": 5
+    },
+    "currentPlayer": {
+      "type": "integer",
+      "enum": [1, -1]
+    },
+    "cells": {
+      "type": "array",
+      "minItems": 49,
+      "maxItems": 256,
+      "items": {
+        "type": "integer",
+        "enum": [0, 1, -1]
+      },
+      "description": "Length must equal boardSize * boardSize."
+    },
+    "lastMove": {
+      "type": "integer",
+      "minimum": -1,
+      "maximum": 255
+    },
+    "variant": {
+      "type": "string",
+      "pattern": "^gomoku(7|8|9|10|11|12|13|14|15|16)$"
+    }
+  },
+  "required": ["boardSize", "winLength", "currentPlayer", "cells"]
+}

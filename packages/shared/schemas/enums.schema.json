@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "definitions": {
+    "EngineSource": {
+      "type": "string",
+      "enum": ["safety_win", "safety_block", "safety_multi_block", "vcf_win", "vcf_defense", "fork", "alpha_beta"]
+    },
+    "JobStatus": {
+      "type": "string",
+      "enum": ["queued", "running", "completed", "failed", "cancelled"]
+    },
+    "TrainPhase": {
+      "type": "string",
+      "enum": ["tactical", "bootstrap", "self_play", "training", "evaluating"]
+    },
+    "ModelFormat": {
+      "type": "string",
+      "enum": ["onnx", "pytorch", "checkpoint"]
+    },
+    "GomokuVariant": {
+      "type": "string",
+      "enum": ["gomoku7", "gomoku9", "gomoku11", "gomoku13", "gomoku15", "gomoku16"]
+    }
+  }
+}

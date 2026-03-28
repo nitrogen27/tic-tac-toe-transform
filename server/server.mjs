@@ -58,6 +58,35 @@ wss.on('connection', (ws) => {
         // TTT5 Transformer training (bootstrap + MCTS self-play)
         console.log('[WS] Starting TTT5 Transformer training:', m.payload);
         const trainingPayload = m.payload || {};
+        const useBigGpuMode = process.env.USE_GPU_BIG === '1';
+
+        if (trainingPayload.epochs === undefined) {
+          trainingPayload.epochs = 25;
+        } else {
+          trainingPayload.epochs = Math.max(1, Math.min(60, Math.round(trainingPayload.epochs)));
+        }
+
+        const minTtt5Batch = useBigGpuMode ? 512 : 128;
+        if (trainingPayload.batchSize === undefined) {
+          trainingPayload.batchSize = useBigGpuMode ? 1024 : 256;
+        } else {
+          trainingPayload.batchSize = Math.max(minTtt5Batch, Math.min(4096, trainingPayload.batchSize));
+          trainingPayload.batchSize = Math.round(trainingPayload.batchSize / 32) * 32;
+        }
+
+        if (trainingPayload.bootstrapGames !== undefined) {
+          trainingPayload.bootstrapGames = Math.max(20, Math.min(400, Math.round(trainingPayload.bootstrapGames)));
+        }
+        if (trainingPayload.mctsIterations !== undefined) {
+          trainingPayload.mctsIterations = Math.max(1, Math.min(8, Math.round(trainingPayload.mctsIterations)));
+        }
+        if (trainingPayload.mctsGamesPerIter !== undefined) {
+          trainingPayload.mctsGamesPerIter = Math.max(8, Math.min(200, Math.round(trainingPayload.mctsGamesPerIter)));
+        }
+        if (trainingPayload.mctsTrainingSims !== undefined) {
+          trainingPayload.mctsTrainingSims = Math.max(16, Math.min(1024, Math.round(trainingPayload.mctsTrainingSims)));
+        }
+        console.log('[WS] TTT5 training config:', trainingPayload);
 
         await trainTTT5WithProgress((ev) => {
           try {

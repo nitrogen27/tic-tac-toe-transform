@@ -31,15 +31,15 @@ export const TTT5_TRANSFORMER_CFG = {
 };
 
 export const TTT5_TRAIN = {
-  batchSize: 64,
+  batchSize: 256,                        // Безопасно для RTX 3060 6GB с ~2.5GB занятыми другими процессами
   epochs: 30,
-  lr: 1e-3,                             // Ниже чем 3x3 — более стабильное обучение
+  lr: 2e-3,                             // Выше LR для больших батчей (linear scaling)
   weightValue: 0.5,                      // Value важнее для MCTS
 };
 
 export const TTT5_MCTS = {
-  inferenceSimulations: 80,              // Для игры в реальном времени
-  trainingSimulations: 200,              // Глубокий поиск для качественного обучения
+  inferenceSimulations: 200,             // Увеличено с 80 — глубже ищем при игре
+  trainingSimulations: 800,              // Увеличено с 200 — больше симуляций = больше GPU-работы
   cpuct: 1.5,
   temperature: 1.0,                      // Для обучения (исследование)
   inferenceTemperature: 0.1,             // Для игры (эксплуатация)
@@ -47,12 +47,14 @@ export const TTT5_MCTS = {
   dirichletEpsilon: 0.10,                // Включаем умеренный root-noise только в early-game self-play
   explorationMoves: 5,                   // Ходов с temperature=1.0 (снижено с 8)
   exploitationTemp: 0.3,                 // Temperature после exploration phase
+  batchParallel: 96,                     // Крупнее батчи leaf-eval для более плотной загрузки GPU
+  concurrentGames: 4,                    // Несколько self-play игр одновременно делят общий batched nnEval
 };
 
 export const TTT5_CURRICULUM = {
-  replayMax: 5000,                       // Общий replay буфер
-  hardMax: 1400,                         // Буфер сложных/ошибочных позиций
-  trainingSampleSize: 2400,              // Размер смешанного train batch по позициям
+  replayMax: 10000,                      // Увеличено с 5000 — больше данных для обучения
+  hardMax: 3000,                         // Увеличено с 1400
+  trainingSampleSize: 4800,              // Увеличено с 2400 — больше позиций за итерацию
   freshRatio: 0.4,                       // Свежий self-play текущей итерации
   hardRatio: 0.35,                       // Переобучение на ошибках
   replayRatio: 0.25,                     // Стабилизация общим replay

@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "definitions": {
+    "AnalyzeRequest": {
+      "$id": "AnalyzeRequest",
+      "title": "Analyze Request",
+      "type": "object",
+      "required": ["position"],
+      "properties": {
+        "position": { "$ref": "Position" },
+        "options": {
+          "type": "object",
+          "properties": {
+            "maxDepth": { "type": "integer", "minimum": 1, "maximum": 30, "default": 12 },
+            "timeLimitMs": { "type": "integer", "minimum": 100, "maximum": 60000, "default": 3000 },
+            "topK": { "type": "integer", "minimum": 1, "maximum": 25, "default": 5 }
+          }
+        }
+      }
+    },
+    "MoveCandidate": {
+      "$id": "MoveCandidate",
+      "title": "Move Candidate",
+      "type": "object",
+      "required": ["move", "score", "row", "col"],
+      "properties": {
+        "move": { "type": "integer", "description": "Flat board index" },
+        "score": { "type": "number", "description": "Normalized score [-1, 1]" },
+        "row": { "type": "integer" },
+        "col": { "type": "integer" }
+      }
+    },
+    "AnalyzeResponse": {
+      "$id": "AnalyzeResponse",
+      "title": "Analyze Response",
+      "type": "object",
+      "required": ["bestMove", "value", "source", "depth", "nodesSearched", "timeMs"],
+      "properties": {
+        "bestMove": { "type": "integer", "description": "Best move flat index" },
+        "value": { "type": "number", "minimum": -1, "maximum": 1, "description": "Position evaluation" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "source": {
+          "type": "string",
+          "enum": ["safety_win", "safety_block", "safety_multi_block", "vcf_win", "vcf_defense", "fork", "alpha_beta"],
+          "description": "Which engine layer produced the result"
+        },
+        "depth": { "type": "integer", "description": "Search depth reached" },
+        "nodesSearched": { "type": "integer" },
+        "timeMs": { "type": "integer" },
+        "topMoves": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/MoveCandidate" }
+        },
+        "pvLine": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "description": "Principal variation (best move sequence)"
+        },
+        "policy": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "Move probability distribution"
+        },
+        "engineMeta": {
+          "type": "object",
+          "properties": {
+            "ttHitRate": { "type": "number" },
+            "ttSize": { "type": "integer" },
+            "rawScore": { "type": "number" }
+          }
+        }
+      }
+    }
+  }
+}

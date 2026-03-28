@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trainer-lab"
+version = "0.1.0"
+description = "Training stack for Gomoku Platform V3 — ResNet policy-value network"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.1",
+  "onnx>=1.15",
+  "onnxruntime",
+  "pydantic>=2.0",
+  "pydantic-settings>=2.0",
+  "numpy",
+  "tqdm",
+  "tensorboard",
+  "typer>=0.12.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-cov",
+]
+
+[project.scripts]
+trainer-lab = "trainer_lab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

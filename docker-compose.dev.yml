@@ -1,0 +1,60 @@
+services:
+  engine-core:
+    build:
+      context: ./engine-core
+      dockerfile: Dockerfile
+    volumes:
+      - engine-bin:/usr/local/bin
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - engine-bin:/opt/engine:ro
+      - ./apps/api/src:/app/src
+    environment:
+      - GOMOKU_ENGINE_BINARY=/opt/engine/gomoku-engine
+      - GOMOKU_HOST=0.0.0.0
+      - GOMOKU_PORT=8000
+    depends_on:
+      - engine-core
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    ports:
+      - "5174:5174"
+    volumes:
+      - ./apps/web/src:/app/src
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - api
+
+  trainer-lab:
+    build:
+      context: ./trainer-lab
+      dockerfile: Dockerfile.gpu
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute]
+    shm_size: 8g
+    volumes:
+      - ./trainer-lab/src:/app/src
+      - models-vol:/app/models
+      - engine-bin:/opt/engine:ro
+    environment:
+      - ENGINE_BINARY=/opt/engine/gomoku-engine
+
+volumes:
+  engine-bin:
+  models-vol:

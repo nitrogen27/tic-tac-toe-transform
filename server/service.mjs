@@ -162,9 +162,9 @@ function countFilledCells(board) {
 function getDynamicTTT5Simulations(board) {
   const base = TTT5_MCTS.inferenceSimulations;
   const filled = countFilledCells(board);
-  if (filled < 4) return Math.max(base, 80);
-  if (filled < 10) return Math.max(base, 120);
-  return Math.max(base, 180);
+  if (filled < 4) return Math.max(base, 200);
+  if (filled < 10) return Math.max(base, 400);
+  return Math.max(base, 600);
 }
 
 function chooseTTT5FallbackMove(board, player) {

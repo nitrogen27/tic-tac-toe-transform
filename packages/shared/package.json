@@ -1,0 +1,11 @@
+{
+  "name": "@gomoku/shared",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "codegen": "bash codegen.sh"
+  },
+  "devDependencies": {
+    "json-schema-to-typescript": "^14.0.0"
+  }
+}
