@@ -1643,7 +1643,7 @@ async def train_variant(
         )
         completed_phases.append("supervised")
         torch.save(model.state_dict(), model_path)
-        logger.info("Supervised warm start: %d positions loaded", len(supervised_positions))
+        logger.info("Supervised warm start: %d positions (%d minimax + tactical)", len(supervised_pool), len(minimax_positions))
 
     # ── Phase 3: Bootstrap (GPU policy self-play) ─────────────────────
     if is_new_model:
