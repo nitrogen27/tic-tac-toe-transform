@@ -11,6 +11,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from gomoku_api.ws.game_service import GameService
 from gomoku_api.ws.gpu_info import get_gpu_info
 from gomoku_api.ws.predict_service import predict
+from gomoku_api.ws.offline_gen import generate_minimax_dataset
 from gomoku_api.ws.train_service_ws import clear_model, train_variant
 
 logger = logging.getLogger(__name__)
@@ -102,7 +103,7 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         cb = await _ws_callback(ws)
         # Forward preset curriculum params from Vue client
         extra = {}
-        for key in ("bootstrapGames", "mctsIterations", "mctsGamesPerIter", "mctsTrainingSims"):
+        for key in ("bootstrapGames", "mctsIterations", "mctsGamesPerIter"):
             if key in payload:
                 extra[key] = payload[key]
         await train_variant("ttt5", cb, epochs=epochs, batch_size=batch_size, data_count=5000, **extra)
@@ -113,6 +114,13 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         variant = payload.get("variant", "gomoku15")
         cb = await _ws_callback(ws)
         await train_variant(variant, cb, epochs=epochs, batch_size=batch_size, data_count=5000)
+
+    elif msg_type == "generate_dataset":
+        variant = payload.get("variant", "ttt5")
+        count = min(max(int(payload.get("count", 5000)), 100), 50000)
+        cb = await _ws_callback(ws)
+        path = await generate_minimax_dataset(variant, count, cb)
+        await _send(ws, {"type": "dataset.done", "payload": {"path": str(path), "count": count, "variant": variant}})
 
     elif msg_type == "clear_model":
         variant = payload.get("variant", "all")

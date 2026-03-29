@@ -29,6 +29,7 @@
           <button :disabled="training || clearing" @click="startTrain">Обучить с нуля</button>
           <button :disabled="training || clearing" @click="trainOnGames" :class="historyCount >= 10 ? '' : 'disabled-btn'">Дообучить на играх</button>
           <button :disabled="training || clearing" @click="clearModel" class="clear-btn">Очистить модель</button>
+          <button v-if="variant === 'ttt5'" :disabled="training || generatingDataset" @click="generateDataset" class="dataset-btn">{{ generatingDataset ? 'Генерация...' : 'Датасет minimax' }}</button>
         </div>
         <div class="history-info" v-if="historyCount > 0">
           <span>Сохранено ходов: {{historyCount}}</span>
@@ -352,6 +353,7 @@ import 'uplot/dist/uPlot.min.css'
 const ws = ref(null)
 const training = ref(false)
 const clearing = ref(false)
+const generatingDataset = ref(false)
 const progress = ref(null)
 const variant = ref('ttt3') // 'ttt3' или 'ttt5'
 const boardSize = computed(() => variant.value === 'ttt5' ? 25 : 9)
@@ -376,9 +378,9 @@ const mainTrainingBatchSize = ref(1024)
 const activePreset = ref('medium') // 'light', 'medium', 'deep', 'custom'
 
 const PRESETS = {
-  light:  { epochs: 10, batchSize: 512,  bootstrapGames: 50,  mctsIterations: 2, mctsGamesPerIter: 20,  mctsTrainingSims: 64,  label: 'Лёгкое (~2 мин)', desc: '10 эпох · batch 512 · 50 bootstrap · 2×20 MCTS · 64 sims/ход' },
-  medium: { epochs: 25, batchSize: 1024, bootstrapGames: 100, mctsIterations: 3, mctsGamesPerIter: 40,  mctsTrainingSims: 96,  label: 'Среднее (~5 мин)', desc: '25 эпох · batch 1024 · 100 bootstrap · 3×40 MCTS · 96 sims/ход' },
-  deep:   { epochs: 50, batchSize: 2048, bootstrapGames: 200, mctsIterations: 5, mctsGamesPerIter: 100, mctsTrainingSims: 160, label: 'Глубокое (~15 мин)', desc: '50 эпох · batch 2048 · 200 bootstrap · 5×100 MCTS · 160 sims/ход' },
+  light:  { epochs: 10, batchSize: 512,  bootstrapGames: 50,  mctsIterations: 2, mctsGamesPerIter: 20,  label: 'Лёгкое', desc: '10 эпох · batch 512 · 50 bootstrap · 2×20 self-play' },
+  medium: { epochs: 25, batchSize: 1024, bootstrapGames: 100, mctsIterations: 3, mctsGamesPerIter: 40,  label: 'Среднее', desc: '25 эпох · batch 1024 · 100 bootstrap · 3×40 self-play' },
+  deep:   { epochs: 50, batchSize: 2048, bootstrapGames: 200, mctsIterations: 5, mctsGamesPerIter: 100, label: 'Глубокое', desc: '50 эпох · batch 2048 · 200 bootstrap · 5×100 self-play' },
 }
 
 const presetDescription = computed(() => PRESETS[activePreset.value]?.desc || '')
@@ -547,7 +549,7 @@ function formatPositionCount(progress) {
 }
 
 function getPhaseLabel(name) {
-  const labels = { tactical: 'Tactical', bootstrap: 'Bootstrap', mcts: 'MCTS', training: 'PyTorch Training', preparing: 'Preparing', encoding: 'Encoding', evaluating: 'Evaluating' }
+  const labels = { tactical: 'Tactical', supervised: 'Supervised', bootstrap: 'Bootstrap', mcts: 'MCTS', self_play: 'Self-Play', training: 'PyTorch Training', preparing: 'Preparing', encoding: 'Encoding', evaluating: 'Evaluating' }
   return labels[name] || name
 }
 
@@ -888,6 +890,12 @@ function connectWS() {
           }
           console.log('[WS] Dataset progress updated:', p.generated, '/', p.total, `(${p.percent}%)`)
         }
+      if (msg.type === 'dataset.done') {
+        generatingDataset.value = false
+        datasetProgress.value = null
+        const p = msg.payload
+        status.value = `Датасет готов: ${p.count} позиций (${p.variant})`
+      }
       if (msg.type === 'train.done') {
         training.value = false
         datasetProgress.value = null
@@ -1108,7 +1116,6 @@ function startTrain() {
       payload.bootstrapGames = preset.bootstrapGames
       payload.mctsIterations = preset.mctsIterations
       payload.mctsGamesPerIter = preset.mctsGamesPerIter
-      payload.mctsTrainingSims = preset.mctsTrainingSims
     }
     ws.value.send(JSON.stringify({ type: trainType, payload }))
     console.log(`[Train] ${trainType} sent:`, payload)
@@ -1141,6 +1148,16 @@ function clearModel() {
     clearing.value = false
     status.value = 'Ошибка отправки запроса: ' + e.message
   }
+}
+
+function generateDataset() {
+  if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
+    status.value = 'WebSocket не подключен'
+    return
+  }
+  generatingDataset.value = true
+  status.value = 'Генерация minimax датасета...'
+  ws.value.send(JSON.stringify({ type: 'generate_dataset', payload: { variant: variant.value, count: 5000 } }))
 }
 
 // Проверка победы (скопировано с сервера)
