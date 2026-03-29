@@ -9,6 +9,21 @@
         <span class="gpu-text">{{ gpuAvailable ? 'CUDA GPU ускорение активно' : 'CPU режим' }}</span>
         <span class="gpu-backend" v-if="gpuBackend">({{ gpuBackend }})</span>
       </div>
+      <div v-if="gpuTelemetry" class="gpu-live-stats">
+        <span v-if="gpuTelemetry.gpuUtilization !== null && gpuTelemetry.gpuUtilization !== undefined">GPU {{ gpuTelemetry.gpuUtilization }}%</span>
+        <span v-if="gpuTelemetry.gpuPowerW !== null && gpuTelemetry.gpuPowerW !== undefined">{{ gpuTelemetry.gpuPowerW }} W</span>
+        <span v-if="gpuTelemetry.gpuMemoryUsedMB !== null && gpuTelemetry.gpuMemoryUsedMB !== undefined">
+          VRAM {{ gpuTelemetry.gpuMemoryUsedMB }}/{{ gpuTelemetry.gpuMemoryTotalMB || '?' }} MB
+        </span>
+        <span v-if="gpuTelemetry.gpuTemperatureC !== null && gpuTelemetry.gpuTemperatureC !== undefined">{{ gpuTelemetry.gpuTemperatureC }}°C</span>
+      </div>
+      <div v-if="trainingMeta && training" class="training-meta-strip">
+        <span>{{ trainingMeta.variant || variant }}</span>
+        <span v-if="trainingMeta.boardSize">{{ trainingMeta.boardSize }}×{{ trainingMeta.boardSize }}</span>
+        <span v-if="trainingMeta.batchSize">batch {{ trainingMeta.batchSize }}</span>
+        <span v-if="trainingMeta.deviceName">{{ trainingMeta.deviceName }}</span>
+        <span v-if="trainingMeta.modelParams">params {{ formatParamCount(trainingMeta.modelParams) }}</span>
+      </div>
       <div class="controls">
         <div class="button-group">
           <button :disabled="training || clearing" @click="startTrain">Обучить с нуля</button>
@@ -113,43 +128,49 @@
             <div class="bar dataset-bar" :style="{ width: (datasetProgress.percent||0)+'%' }"></div>
           </div>
           <div class="dataset-info">
-            <span>{{ datasetProgress.generated || 0 }} / {{ datasetProgress.total || 0 }} игр ({{ datasetProgress.percent || 0 }}%)</span>
-            <span v-if="datasetProgress.rate" class="rate-info">· {{ datasetProgress.rate }} игр/с</span>
+            <span>{{ datasetProgress.generated || 0 }} / {{ datasetProgress.total || 0 }} {{ datasetProgress.unit || 'samples' }} ({{ datasetProgress.percent || 0 }}%)</span>
+            <span v-if="datasetProgress.games" class="rate-info">· games: {{ datasetProgress.games }}</span>
+            <span v-if="datasetProgress.rate" class="rate-info">· {{ datasetProgress.rate }} {{ datasetProgress.unit || 'samples' }}/с</span>
             <span v-if="datasetProgress.elapsed" class="time-info">· {{ datasetProgress.elapsed }}с</span>
           </div>
-          <div v-if="datasetProgress.stage === 'concatenating'" class="dataset-stage">
-            {{ datasetProgress.message || 'Объединение тензоров на GPU...' }}
+          <div v-if="datasetProgress.message" class="dataset-stage">
+            {{ datasetProgress.message }}
           </div>
         </div>
         <!-- TTT5 Interactive Training Panel -->
         <div v-if="training && ttt5Progress && ttt5Progress.phase && !datasetProgress && !backgroundProgress" class="ttt5-training-panel">
           <!-- Phase badges -->
           <div class="phase-badges">
-            <span class="phase-badge"
-                  :class="{
-                    'phase-completed': ttt5Progress.completedPhases && ttt5Progress.completedPhases.includes('tactical'),
-                    'phase-active': ttt5Progress.phase === 'tactical',
-                    'phase-pending': !ttt5Progress.completedPhases?.includes('tactical') && ttt5Progress.phase !== 'tactical'
-                  }">
-              {{ ttt5Progress.completedPhases?.includes('tactical') ? '\u2713 ' : '' }}Tactical
-            </span>
-            <span class="phase-badge"
-                  :class="{
-                    'phase-completed': ttt5Progress.completedPhases && ttt5Progress.completedPhases.includes('bootstrap'),
-                    'phase-active': ttt5Progress.phase === 'bootstrap',
-                    'phase-pending': !ttt5Progress.completedPhases?.includes('bootstrap') && ttt5Progress.phase !== 'bootstrap'
-                  }">
-              {{ ttt5Progress.completedPhases?.includes('bootstrap') ? '\u2713 ' : '' }}Bootstrap
-            </span>
-            <span v-for="i in (ttt5Progress.totalIterations || 1)" :key="'mcts'+i"
-                  class="phase-badge"
-                  :class="{
-                    'phase-completed': ttt5Progress.phase === 'mcts' && ttt5Progress.iteration > i || (ttt5Progress.phase === 'mcts_game' && ttt5Progress.iteration > i) || (ttt5Progress.phase === 'mcts_train' && ttt5Progress.iteration > i),
-                    'phase-active': (ttt5Progress.phase === 'mcts' || ttt5Progress.phase === 'mcts_game' || ttt5Progress.phase === 'mcts_train') && ttt5Progress.iteration === i,
-                    'phase-pending': (!['mcts','mcts_game','mcts_train'].includes(ttt5Progress.phase)) || ttt5Progress.iteration < i,
-                  }">
-              MCTS {{ i }}
-            </span>
+            <template v-if="isLegacyStructuredPhase(ttt5Progress.phase)">
+              <span class="phase-badge"
+                    :class="{
+                      'phase-completed': ttt5Progress.completedPhases && ttt5Progress.completedPhases.includes('tactical'),
+                      'phase-active': ttt5Progress.phase === 'tactical',
+                      'phase-pending': !ttt5Progress.completedPhases?.includes('tactical') && ttt5Progress.phase !== 'tactical'
+                    }">
+                {{ ttt5Progress.completedPhases?.includes('tactical') ? '\u2713 ' : '' }}Tactical
+              </span>
+              <span class="phase-badge"
+                    :class="{
+                      'phase-completed': ttt5Progress.completedPhases && ttt5Progress.completedPhases.includes('bootstrap'),
+                      'phase-active': ttt5Progress.phase === 'bootstrap',
+                      'phase-pending': !ttt5Progress.completedPhases?.includes('bootstrap') && ttt5Progress.phase !== 'bootstrap'
+                    }">
+                {{ ttt5Progress.completedPhases?.includes('bootstrap') ? '\u2713 ' : '' }}Bootstrap
+              </span>
+              <span v-for="i in (ttt5Progress.totalIterations || 1)" :key="'mcts'+i"
+                    class="phase-badge"
+                    :class="{
+                      'phase-completed': ttt5Progress.phase === 'mcts' && ttt5Progress.iteration > i || (ttt5Progress.phase === 'mcts_game' && ttt5Progress.iteration > i) || (ttt5Progress.phase === 'mcts_train' && ttt5Progress.iteration > i),
+                      'phase-active': (ttt5Progress.phase === 'mcts' || ttt5Progress.phase === 'mcts_game' || ttt5Progress.phase === 'mcts_train') && ttt5Progress.iteration === i,
+                      'phase-pending': (!['mcts','mcts_game','mcts_train'].includes(ttt5Progress.phase)) || ttt5Progress.iteration < i,
+                    }">
+                MCTS {{ i }}
+              </span>
+            </template>
+            <template v-else>
+              <span class="phase-badge phase-active">{{ getPhaseLabel(ttt5Progress.phase) }}</span>
+            </template>
           </div>
 
           <!-- Overall progress bar -->
@@ -164,7 +185,7 @@
               <span class="counter-value">{{ ttt5Progress.game || 0 }}<span class="counter-total">/{{ ttt5Progress.totalGames }}</span></span>
             </div>
             <div class="counter">
-              <span class="counter-label">Positions</span>
+              <span class="counter-label">{{ ttt5Progress.samplesTotal ? 'Samples' : 'Positions' }}</span>
               <span class="counter-value">{{ formatPositionCount(ttt5Progress) }}</span>
             </div>
             <div class="counter">
@@ -189,9 +210,22 @@
             <span v-if="ttt5Progress.accuracy" class="metric-text acc-text">acc: {{ ttt5Progress.accuracy }}%</span>
             <span v-if="ttt5Progress.mae" class="metric-text">MAE: {{ ttt5Progress.mae }}</span>
           </div>
+          <div v-if="hasRuntimeDiagnostics(ttt5Progress)" class="runtime-grid">
+            <span v-if="ttt5Progress.deviceName" class="runtime-pill">device: {{ ttt5Progress.deviceName }}</span>
+            <span v-if="ttt5Progress.batchSize" class="runtime-pill">batch: {{ ttt5Progress.batchSize }}</span>
+            <span v-if="ttt5Progress.learningRate" class="runtime-pill">lr: {{ ttt5Progress.learningRate }}</span>
+            <span v-if="ttt5Progress.samplesPerSec" class="runtime-pill">samples/s: {{ ttt5Progress.samplesPerSec }}</span>
+            <span v-if="ttt5Progress.batchesPerSec" class="runtime-pill">batches/s: {{ ttt5Progress.batchesPerSec }}</span>
+            <span v-if="ttt5Progress.batchTimeMs" class="runtime-pill">batch: {{ ttt5Progress.batchTimeMs }} ms</span>
+            <span v-if="ttt5Progress.modelParams" class="runtime-pill">params: {{ formatParamCount(ttt5Progress.modelParams) }}</span>
+            <span class="runtime-pill">AMP: {{ ttt5Progress.mixedPrecision ? 'on' : 'off' }}</span>
+            <span class="runtime-pill">TF32: {{ ttt5Progress.tf32 ? 'on' : 'off' }}</span>
+            <span v-if="ttt5Progress.gpuMemoryUsedMB" class="runtime-pill">VRAM: {{ ttt5Progress.gpuMemoryUsedMB }}/{{ ttt5Progress.gpuMemoryTotalMB || '?' }} MB</span>
+            <span v-if="ttt5Progress.gpuPowerW" class="runtime-pill">Power: {{ ttt5Progress.gpuPowerW }} W</span>
+          </div>
 
           <!-- Self-play stats -->
-          <div v-if="ttt5Progress.stage === 'mcts_game' && ttt5Progress.selfPlayStats" class="selfplay-stats">
+          <div v-if="ttt5Progress.selfPlayStats && (ttt5Progress.selfPlayStats.wins > 0 || ttt5Progress.selfPlayStats.losses > 0 || ttt5Progress.selfPlayStats.draws > 0)" class="selfplay-stats">
             Self-play: <span class="sp-win">W {{ ttt5Progress.selfPlayStats.wins }}</span> /
             <span class="sp-loss">L {{ ttt5Progress.selfPlayStats.losses }}</span> /
             <span class="sp-draw">D {{ ttt5Progress.selfPlayStats.draws }}</span>
@@ -476,14 +510,17 @@ let reconnectTimeout = null
 let isConnecting = false
 const gpuAvailable = ref(false)
 const gpuBackend = ref('')
+const gpuTelemetry = ref(null)
 const datasetProgress = ref(null)
 const backgroundProgress = ref(null) // Прогресс фонового обучения
 const modelConfidence = ref(null) // Уверенность модели (0-1)
 const ttt5Progress = ref(null) // Structured TTT5 training progress
+const trainingMeta = ref(null)
 const trainingStartTime = ref(0) // When training started (ms)
 const trainingElapsed = ref(0) // Elapsed seconds
 const trainingETA = ref(0) // Estimated remaining seconds
 let trainingTimerInterval = null
+let gpuPollInterval = null
 
 const metricsHistory = ref([]) // For training charts
 const lossChartEl = ref(null) // uPlot loss chart container
@@ -502,6 +539,7 @@ function formatTime(seconds) {
 
 function formatPositionCount(progress) {
   if (!progress) return '0'
+  if (progress.samplesTotal) return `${progress.samplesDone || 0}/${progress.samplesTotal}`
   const base = progress.positions || 0
   const effective = progress.effectivePositions || 0
   if (effective > base) return `${base} (${effective})`
@@ -509,8 +547,46 @@ function formatPositionCount(progress) {
 }
 
 function getPhaseLabel(name) {
-  const labels = { tactical: 'Tactical', bootstrap: 'Bootstrap', mcts: 'MCTS' }
+  const labels = { tactical: 'Tactical', bootstrap: 'Bootstrap', mcts: 'MCTS', training: 'PyTorch Training', preparing: 'Preparing', encoding: 'Encoding', evaluating: 'Evaluating' }
   return labels[name] || name
+}
+
+function isLegacyStructuredPhase(name) {
+  return ['tactical', 'bootstrap', 'mcts', 'mcts_game', 'mcts_train'].includes(name)
+}
+
+function formatParamCount(value) {
+  if (!value) return '0'
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`
+  return String(value)
+}
+
+function hasRuntimeDiagnostics(progress) {
+  return !!(progress?.deviceName || progress?.batchSize || progress?.samplesPerSec || progress?.gpuPowerW || progress?.gpuMemoryUsedMB)
+}
+
+function extractGpuTelemetry(payload) {
+  if (!payload) return null
+  const source = payload.gpu || payload
+  const telemetry = source.telemetry || {}
+  const vram = source.vram || {}
+  const snapshot = {
+    gpuUtilization: payload.gpuUtilization ?? telemetry.utilizationGpu ?? null,
+    gpuMemoryUtilization: payload.gpuMemoryUtilization ?? telemetry.utilizationMemory ?? null,
+    gpuPowerW: payload.gpuPowerW ?? telemetry.powerDrawW ?? null,
+    gpuPowerLimitW: payload.gpuPowerLimitW ?? telemetry.powerLimitW ?? null,
+    gpuMemoryUsedMB: payload.gpuMemoryUsedMB ?? telemetry.memoryUsedMB ?? vram.usedMB ?? null,
+    gpuMemoryTotalMB: payload.gpuMemoryTotalMB ?? telemetry.memoryTotalMB ?? vram.totalMB ?? null,
+    gpuTemperatureC: payload.gpuTemperatureC ?? telemetry.temperatureC ?? null,
+    gpuClockSmMHz: payload.gpuClockSmMHz ?? telemetry.clockSmMHz ?? null,
+    gpuClockMemMHz: payload.gpuClockMemMHz ?? telemetry.clockMemMHz ?? null,
+    gpuAllocatedMB: payload.gpuAllocatedMB ?? vram.allocatedMB ?? null,
+    gpuReservedMB: payload.gpuReservedMB ?? vram.reservedMB ?? null,
+    gpuTelemetryTimestamp: payload.gpuTelemetryTimestamp ?? telemetry.timestamp ?? null,
+    name: source.name || payload.deviceName || null,
+  }
+  return Object.values(snapshot).some(v => v !== null && v !== undefined) ? snapshot : null
 }
 
 // ===== uPlot Training Charts =====
@@ -754,11 +830,14 @@ function connectWS() {
         if (msg.type === 'train.progress') {
           // Игнорируем прогресс обычного обучения, если идет фоновое
           if (!backgroundProgress.value) {
+            datasetProgress.value = null
             progress.value = msg.payload
 
             // Structured TTT5 progress
             if (msg.payload.phase) {
               ttt5Progress.value = msg.payload
+              trainingMeta.value = { ...(trainingMeta.value || {}), ...msg.payload }
+              gpuTelemetry.value = extractGpuTelemetry(msg.payload)
               if (msg.payload.metricsHistory) {
                 metricsHistory.value = msg.payload.metricsHistory
               }
@@ -785,7 +864,10 @@ function connectWS() {
         }
         if (msg.type === 'train.start') { 
           training.value = true
+          trainingMeta.value = msg.payload
+          gpuTelemetry.value = extractGpuTelemetry(msg.payload)
           progress.value = { percent: 0, epoch: 0, epochs: msg.payload.epochs }
+          ttt5Progress.value = { ...msg.payload, phase: 'preparing', percent: 0, elapsed: 0, eta: 0 }
           // Не сбрасываем datasetProgress здесь - генерация еще не началась
           status.value = 'Подготовка к обучению...'
           console.log('[WS] Training started, epochs:', msg.payload.epochs)
@@ -813,6 +895,7 @@ function connectWS() {
         if (trainingTimerInterval) { clearInterval(trainingTimerInterval); trainingTimerInterval = null }
         const totalTime = formatTime(Math.floor((Date.now() - trainingStartTime.value) / 1000))
         ttt5Progress.value = null
+        trainingMeta.value = null
         metricsHistory.value = []
         status.value = `Обучение завершено за ${totalTime}`
         console.log('[WS] Training completed')
@@ -940,6 +1023,7 @@ function connectWS() {
         if (msg.type === 'gpu.info') {
           gpuAvailable.value = msg.payload.available || false
           gpuBackend.value = msg.payload.backend || 'cpu'
+          gpuTelemetry.value = extractGpuTelemetry(msg.payload)
           console.log('[WS] GPU info:', msg.payload)
         }
         if (msg.type === 'game.started') {
@@ -956,6 +1040,7 @@ function connectWS() {
           training.value = false
           clearing.value = false
           waiting.value = false // Сбрасываем ожидание при ошибке
+          trainingMeta.value = null
           status.value = 'Ошибка: ' + msg.error
         }
       } catch (e) {
@@ -1435,6 +1520,7 @@ watch(training, (val) => {
 
 onUnmounted(() => {
   destroyCharts()
+  if (gpuPollInterval) clearInterval(gpuPollInterval)
 })
 
 // Сбрасываем игру и настройки при смене варианта
@@ -1460,6 +1546,11 @@ onMounted(() => {
   setTimeout(() => {
     connectWS()
   }, 100)
+  gpuPollInterval = setInterval(() => {
+    if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+      ws.value.send(JSON.stringify({ type: 'get_gpu_info' }))
+    }
+  }, 3000)
 })
 </script>
 
@@ -1513,6 +1604,36 @@ onMounted(() => {
   display: flex; 
   gap: 8px; 
   flex-wrap: wrap;
+}
+.gpu-live-stats {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 8px 0 12px;
+  font-size: 13px;
+  color: #444;
+}
+.training-meta-strip {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 8px 0 12px;
+  font-size: 12px;
+  color: #555;
+}
+.training-meta-strip span,
+.gpu-live-stats span,
+.runtime-pill {
+  background: white;
+  border: 1px solid #e0e0e0;
+  border-radius: 999px;
+  padding: 4px 8px;
+}
+.runtime-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
 .rate-info { 
   color: #4caf50; 

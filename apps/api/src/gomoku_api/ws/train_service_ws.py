@@ -558,6 +558,7 @@ async def _play_selfplay_games(
                 break
 
             # Choose move
+            mcts_policy = None  # Reset each turn
             if use_mcts and model is not None:
                 from trainer_lab.self_play.player import GameState, mcts_search
                 gs = GameState(board_size)
@@ -567,11 +568,14 @@ async def _play_selfplay_games(
                 if last_move >= 0:
                     gs.last_move = divmod(last_move, board_size)
                 model.eval()
-                policy_vec, _ = mcts_search(gs, model, device, num_simulations=mcts_simulations)
+                # Run MCTS in thread pool to avoid blocking event loop
+                mcts_policy, _ = await asyncio.to_thread(
+                    mcts_search, gs, model, device, num_simulations=mcts_simulations
+                )
                 # Sample with temperature
-                total_p = sum(policy_vec)
+                total_p = sum(mcts_policy)
                 if total_p > 0:
-                    move = random.choices(range(len(policy_vec)), weights=policy_vec, k=1)[0]
+                    move = random.choices(range(len(mcts_policy)), weights=mcts_policy, k=1)[0]
                 else:
                     move = random.choice(empty)
             elif model is not None:
@@ -600,12 +604,12 @@ async def _play_selfplay_games(
                 move = random.choice(empty)
 
             # Build policy target
-            if use_mcts and 'policy_vec' in dir():
+            if use_mcts and mcts_policy is not None:
                 # MCTS: use visit count distribution
                 policy = [0.0] * 256
                 for idx in range(board_size * board_size):
                     r, c = divmod(idx, board_size)
-                    policy[r * 16 + c] = policy_vec[idx] if idx < len(policy_vec) else 0.0
+                    policy[r * 16 + c] = mcts_policy[idx] if idx < len(mcts_policy) else 0.0
             elif board_size <= 5:
                 # Small boards: use minimax policy for quality targets
                 mm_pol, _ = _nxn_minimax_policy(list(board), board_size, win_len, current, 3)
@@ -655,8 +659,9 @@ async def _play_selfplay_games(
         else:
             stats["draws"] += 1
 
-        # Emit progress every 5 games
-        if (g + 1) % 5 == 0 or g + 1 == num_games:
+        # Emit progress every 2 games (or every game for slow MCTS)
+        emit_interval = 1 if use_mcts else 2
+        if (g + 1) % emit_interval == 0 or g + 1 == num_games:
             elapsed = time.monotonic() - started_at
             game_pct = (g + 1) / num_games
             speed = (g + 1) / max(elapsed, 0.01)
@@ -664,6 +669,7 @@ async def _play_selfplay_games(
 
             live_gpu = get_gpu_info()
             telemetry = _extract_telemetry(live_gpu)
+            rf = runtime_flags or {}
             await callback({
                 "type": "train.progress",
                 "payload": {
@@ -678,6 +684,8 @@ async def _play_selfplay_games(
                     "elapsed": round(elapsed, 1),
                     "eta": round((elapsed / max(g + 1, 1)) * max(num_games - g - 1, 0), 1),
                     "speed": round(speed, 2), "speedUnit": "g/s",
+                    "mixedPrecision": rf.get("mixedPrecision", False),
+                    "tf32": rf.get("tf32", False),
                     "gpu": live_gpu, **telemetry,
                     **{k: v for k, v in extra_fields.items() if k not in ("variant",)},
                 },

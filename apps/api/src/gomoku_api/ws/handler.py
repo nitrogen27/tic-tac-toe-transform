@@ -100,7 +100,12 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         epochs = min(max(int(payload.get("epochs", 30)), 1), 60)
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 4096)
         cb = await _ws_callback(ws)
-        await train_variant("ttt5", cb, epochs=epochs, batch_size=batch_size, data_count=5000)
+        # Forward preset curriculum params from Vue client
+        extra = {}
+        for key in ("bootstrapGames", "mctsIterations", "mctsGamesPerIter", "mctsTrainingSims"):
+            if key in payload:
+                extra[key] = payload[key]
+        await train_variant("ttt5", cb, epochs=epochs, batch_size=batch_size, data_count=5000, **extra)
 
     elif msg_type == "train_gomoku":
         epochs = min(max(int(payload.get("epochs", 30)), 1), 60)
