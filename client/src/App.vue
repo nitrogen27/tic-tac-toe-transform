@@ -594,6 +594,8 @@ function extractGpuTelemetry(payload) {
 // ===== uPlot Training Charts =====
 function createLossChart() {
   if (!lossChartEl.value || lossChart) return
+  // Guard: element must be in the live DOM (v-if may have re-mounted it)
+  if (!lossChartEl.value.isConnected) return
   const opts = {
     width: lossChartEl.value.offsetWidth || 600,
     height: 180,
@@ -1525,6 +1527,11 @@ watch(gameType, () => {
 watch(metricsHistory, () => {
   if (metricsHistory.value.length > 0) {
     nextTick(() => {
+      // If chart lost its DOM (v-if re-mount), destroy and recreate
+      if (lossChart && lossChartEl.value && !lossChartEl.value.querySelector('canvas')) {
+        try { lossChart.destroy() } catch (_) {}
+        lossChart = null
+      }
       if (!lossChart && lossChartEl.value) createLossChart()
       updateCharts()
     })
