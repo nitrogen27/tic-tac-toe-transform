@@ -173,46 +173,31 @@ def _extract_telemetry(gpu_info: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compute_tactical_accuracy(
-    model: Any, board_size: int, win_len: int, device: Any, n_samples: int = 200
+    model: Any,
+    board_size: int,
+    win_len: int,
+    device: Any,
+    n_samples: int = 200,
+    motif: str | None = None,
 ) -> float:
     """Evaluate model on tactical positions (win/block). Returns accuracy 0-100."""
     from trainer_lab.data.encoder import board_to_tensor
-    import torch.nn.functional as F
 
-    directions = ((0, 1), (1, 0), (1, 1), (1, -1))
     correct = 0
     total = 0
 
+    was_training = model.training
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(n_samples):
-            board = [0] * (board_size * board_size)
-            motif = random.choice(("win", "block"))
-            current = random.choice((1, 2))
-            line_player = current if motif == "win" else (2 if current == 1 else 1)
-            dr, dc = random.choice(directions)
-
-            valid_starts = [
-                (r, c) for r in range(board_size) for c in range(board_size)
-                if 0 <= r + dr * (win_len - 1) < board_size and 0 <= c + dc * (win_len - 1) < board_size
-            ]
-            if not valid_starts:
+            sample = _sample_tactical_position(board_size, win_len, motif=motif)
+            if sample is None:
                 continue
-            sr, sc = random.choice(valid_starts)
-            gap = random.randrange(win_len)
-            target_move = (sr + dr * gap) * board_size + (sc + dc * gap)
-
-            for step in range(win_len):
-                r, c = sr + dr * step, sc + dc * step
-                flat = r * board_size + c
-                if flat != target_move:
-                    board[flat] = line_player
-
             pos = {
-                "board_size": board_size,
-                "board": [[board[r * board_size + c] for c in range(board_size)] for r in range(board_size)],
-                "current_player": current,
-                "last_move": None,
+                "board_size": sample["board_size"],
+                "board": sample["board"],
+                "current_player": sample["current_player"],
+                "last_move": sample["last_move"],
             }
             planes = board_to_tensor(pos).unsqueeze(0).to(device)
             if device.type == "cuda":
@@ -221,15 +206,85 @@ def _compute_tactical_accuracy(
             legal_mask = planes[:, 2].reshape(1, -1)
             masked = logits + (1.0 - legal_mask) * (-1e8)
             pred = masked.argmax(dim=1).item()
-
-            target_r, target_c = divmod(target_move, board_size)
-            target_idx = target_r * 16 + target_c
+            target_idx = max(range(len(sample["policy"])), key=sample["policy"].__getitem__)
             if pred == target_idx:
                 correct += 1
             total += 1
 
-    model.train()
+    if was_training:
+        model.train()
     return round(100.0 * correct / max(total, 1), 1)
+
+
+def _sample_tactical_position(
+    board_size: int,
+    win_len: int,
+    *,
+    motif: str | None = None,
+    block_probability: float = 0.5,
+) -> dict[str, Any] | None:
+    """Sample a single immediate-win or immediate-block tactical position."""
+    directions = ((0, 1), (1, 0), (1, 1), (1, -1))
+    board = [0] * (board_size * board_size)
+    chosen_motif = motif or ("block" if random.random() < block_probability else "win")
+    current_player = random.choice((1, 2))
+    line_player = current_player if chosen_motif == "win" else (2 if current_player == 1 else 1)
+    dr, dc = random.choice(directions)
+
+    valid_starts: list[tuple[int, int]] = []
+    for row in range(board_size):
+        for col in range(board_size):
+            end_row = row + dr * (win_len - 1)
+            end_col = col + dc * (win_len - 1)
+            if 0 <= end_row < board_size and 0 <= end_col < board_size:
+                valid_starts.append((row, col))
+    if not valid_starts:
+        return None
+
+    start_row, start_col = random.choice(valid_starts)
+    gap_index = random.randrange(win_len)
+    target_move = (start_row + dr * gap_index) * board_size + (start_col + dc * gap_index)
+
+    occupied: set[int] = {target_move}
+    for step in range(win_len):
+        row = start_row + dr * step
+        col = start_col + dc * step
+        flat = row * board_size + col
+        if flat == target_move:
+            continue
+        board[flat] = line_player
+        occupied.add(flat)
+
+    extra_stones = random.randint(0, max(2, board_size // 3))
+    for _ in range(extra_stones):
+        placed = False
+        for _attempt in range(20):
+            move = random.randrange(board_size * board_size)
+            if move in occupied or board[move] != 0:
+                continue
+            if abs((move // board_size) - (target_move // board_size)) <= 1 and abs((move % board_size) - (target_move % board_size)) <= 1:
+                continue
+            board[move] = random.choice((1, 2))
+            occupied.add(move)
+            placed = True
+            break
+        if not placed:
+            break
+
+    last_stone = next((idx for idx, cell in enumerate(board) if cell == line_player), -1)
+    if last_stone >= 0 and _nxn_winner(board, board_size, win_len, last_stone) != 0:
+        return None
+
+    return {
+        "board_size": board_size,
+        "board": _flat_to_board2d(board, board_size),
+        "current_player": current_player,
+        "last_move": None,
+        "policy": _one_hot_policy(target_move, board_size),
+        "value": 1.0 if chosen_motif == "win" else 0.35,
+        "motif": chosen_motif,
+        "source": "tactical",
+    }
 
 
 async def _emit_dataset_progress(
@@ -652,80 +707,24 @@ async def _generate_tactical_curriculum_positions(
     board_size: int,
     win_len: int,
     callback: TRAIN_CALLBACK,
+    *,
+    block_probability: float = 0.5,
 ) -> list[dict[str, Any]]:
     """Generate immediate-win / immediate-block positions for strong tactical supervision."""
-    directions = ((0, 1), (1, 0), (1, 1), (1, -1))
     positions: list[dict[str, Any]] = []
     started_at = time.monotonic()
     last_reported = 0
 
     while len(positions) < count:
-        board = [0] * (board_size * board_size)
-        motif = random.choice(("win", "block"))
-        current_player = random.choice((1, 2))
-        line_player = current_player if motif == "win" else (2 if current_player == 1 else 1)
-        target_player = current_player
-        direction = random.choice(directions)
-        dr, dc = direction
-
-        # Pick a start cell where a full win_len segment fits.
-        valid_starts: list[tuple[int, int]] = []
-        for row in range(board_size):
-            for col in range(board_size):
-                end_row = row + dr * (win_len - 1)
-                end_col = col + dc * (win_len - 1)
-                if 0 <= end_row < board_size and 0 <= end_col < board_size:
-                    valid_starts.append((row, col))
-        if not valid_starts:
-            break
-
-        start_row, start_col = random.choice(valid_starts)
-        gap_index = random.randrange(win_len)
-        target_move = (start_row + dr * gap_index) * board_size + (start_col + dc * gap_index)
-
-        occupied: set[int] = {target_move}
-        for step in range(win_len):
-            row = start_row + dr * step
-            col = start_col + dc * step
-            flat = row * board_size + col
-            if flat == target_move:
-                continue
-            board[flat] = line_player
-            occupied.add(flat)
-
-        # Add a few random context stones far from the tactical segment.
-        extra_stones = random.randint(0, max(2, board_size // 3))
-        for _ in range(extra_stones):
-            placed = False
-            for _attempt in range(20):
-                move = random.randrange(board_size * board_size)
-                if move in occupied or board[move] != 0:
-                    continue
-                if abs((move // board_size) - (target_move // board_size)) <= 1 and abs((move % board_size) - (target_move % board_size)) <= 1:
-                    continue
-                board[move] = random.choice((1, 2))
-                occupied.add(move)
-                placed = True
-                break
-            if not placed:
-                break
-
-        # Reject accidental terminal boards or broken motifs.
-        last_stone = next((idx for idx, cell in enumerate(board) if cell == line_player), -1)
-        if last_stone >= 0 and _nxn_winner(board, board_size, win_len, last_stone) != 0:
+        sample = _sample_tactical_position(
+            board_size,
+            win_len,
+            block_probability=block_probability,
+        )
+        if sample is None:
             continue
 
-        policy = _one_hot_policy(target_move, board_size)
-        value = 1.0 if motif == "win" else 0.35
-        positions.append({
-            "board_size": board_size,
-            "board": _flat_to_board2d(board, board_size),
-            "current_player": target_player,
-            "last_move": None,
-            "policy": policy,
-            "value": value,
-            "motif": motif,
-        })
+        positions.append(sample)
 
         if len(positions) - last_reported >= 128 or len(positions) == count:
             last_reported = len(positions)
@@ -740,6 +739,89 @@ async def _generate_tactical_curriculum_positions(
             await asyncio.sleep(0)
 
     return positions
+
+
+async def _mine_hard_tactical_examples(
+    model: Any,
+    board_size: int,
+    win_len: int,
+    device: Any,
+    *,
+    target_count: int = 256,
+    block_probability: float = 0.8,
+    candidate_multiplier: int = 6,
+) -> list[dict[str, Any]]:
+    """Mine tactical positions where the current model still predicts the wrong move."""
+    from trainer_lab.data.encoder import board_to_tensor
+
+    if target_count <= 0:
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    max_candidates = max(target_count * candidate_multiplier, target_count)
+    attempts = 0
+    while len(candidates) < max_candidates and attempts < max_candidates * 3:
+        sample = _sample_tactical_position(
+            board_size,
+            win_len,
+            block_probability=block_probability,
+        )
+        attempts += 1
+        if sample is not None:
+            sample["source"] = "hard_tactical_candidate"
+            candidates.append(sample)
+
+    if not candidates:
+        return []
+
+    hard_examples: list[dict[str, Any]] = []
+    was_training = model.training
+    batch_eval = min(max(target_count, 32), 128)
+    model.eval()
+    with torch.inference_mode():
+        for start in range(0, len(candidates), batch_eval):
+            chunk = candidates[start : start + batch_eval]
+            planes = torch.stack([
+                board_to_tensor({
+                    "board_size": pos["board_size"],
+                    "board": pos["board"],
+                    "current_player": pos["current_player"],
+                    "last_move": pos["last_move"],
+                })
+                for pos in chunk
+            ]).to(device, non_blocking=device.type == "cuda")
+            if device.type == "cuda":
+                planes = planes.contiguous(memory_format=torch.channels_last)
+
+            logits, _ = model(planes)
+            legal_mask = planes[:, 2].reshape(len(chunk), -1)
+            masked = logits + (1.0 - legal_mask) * (-1e8)
+            predictions = masked.argmax(dim=1).tolist()
+
+            for pos, predicted in zip(chunk, predictions):
+                target_idx = max(range(len(pos["policy"])), key=pos["policy"].__getitem__)
+                if predicted != target_idx:
+                    hard = dict(pos)
+                    hard["source"] = "hard_tactical"
+                    hard_examples.append(hard)
+                    if len(hard_examples) >= target_count:
+                        break
+            if len(hard_examples) >= target_count:
+                break
+
+    if was_training:
+        model.train()
+
+    if len(hard_examples) < target_count:
+        block_fallback = [pos for pos in candidates if pos.get("motif") == "block"]
+        for pos in block_fallback:
+            hard = dict(pos)
+            hard["source"] = "hard_tactical"
+            hard_examples.append(hard)
+            if len(hard_examples) >= target_count:
+                break
+
+    return hard_examples[:target_count]
 
 
 # ---------------------------------------------------------------------------
@@ -846,25 +928,27 @@ def _build_train_pool(
     data_count: int,
     seed_positions: list[dict[str, Any]] | None = None,
     minimax_positions: list[dict[str, Any]] | None = None,
+    hard_positions: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Mix fresh self-play, replay, tactical seed, and minimax positions.
+    """Mix fresh self-play, replay, tactical seed, minimax, and hard examples.
 
-    Hardened quotas:
-      20% tactical seed (min)
-      20% minimax seed (min)
-      60% recent self-play (remaining)
-    Replay fills gaps if any bucket is too small.
+    Hardened quotas for 5x5 tactical stability:
+      20% tactical seed
+      15% hard tactical mistakes
+      15% minimax seed
+      50% recent self-play + replay
     """
     if data_count <= 0:
         return []
 
     seed_positions = seed_positions or []
     minimax_positions = minimax_positions or []
+    hard_positions = hard_positions or []
 
-    # Minimum quotas: 20% tactical, 20% minimax, rest = latest + replay
     tactical_quota = min(len(seed_positions), max(data_count * 20 // 100, 0))
-    minimax_quota = min(len(minimax_positions), max(data_count * 20 // 100, 0))
-    latest_budget = data_count - tactical_quota - minimax_quota
+    hard_quota = min(len(hard_positions), max(data_count * 15 // 100, 0))
+    minimax_quota = min(len(minimax_positions), max(data_count * 15 // 100, 0))
+    latest_budget = data_count - tactical_quota - hard_quota - minimax_quota
     latest_quota = min(len(latest_positions), latest_budget)
     remaining = max(latest_budget - latest_quota, 0)
     replay_quota = min(len(replay_positions), remaining)
@@ -876,12 +960,14 @@ def _build_train_pool(
         pool.extend(random.sample(replay_positions, replay_quota))
     if tactical_quota > 0 and seed_positions:
         pool.extend(random.sample(seed_positions, tactical_quota))
+    if hard_quota > 0 and hard_positions:
+        pool.extend(random.sample(hard_positions, hard_quota))
     if minimax_quota > 0 and minimax_positions:
         pool.extend(random.sample(minimax_positions, minimax_quota))
 
     # Backfill if any bucket was too small.
     if len(pool) < data_count:
-        leftovers = latest_positions + replay_positions + seed_positions + minimax_positions
+        leftovers = latest_positions + replay_positions + seed_positions + hard_positions + minimax_positions
         needed = min(data_count - len(pool), len(leftovers))
         if needed > 0:
             pool.extend(random.sample(leftovers, needed))
@@ -1465,6 +1551,11 @@ async def _run_training_steps(
             a_acc = (cum_acc / max(cum_samples, 1)) * 100.0
             a_mae = cum_mae / max(cum_samples, 1)
 
+            # Early stop: if accuracy >= 80% after 50+ steps, good enough
+            if step >= 50 and a_acc >= 80.0:
+                logger.info("Early stop at step %d: acc %.1f%% >= 80%%", step, a_acc)
+                max_steps = step  # will exit loop
+
             now = time.monotonic()
             if _should_emit_progress(now, last_emit_at, force=(step >= max_steps)):
                 live_gpu, last_gpu_probe = _maybe_refresh_gpu_info(now, last_gpu_probe, live_gpu)
@@ -1562,14 +1653,14 @@ async def train_variant(
         model = model.to(device)
     model = _maybe_compile_model(model, device, runtime_flags)
 
-    # Curriculum parameters
-    bootstrap_games = int(kwargs.get("bootstrapGames", 64))
-    selfplay_iterations = int(kwargs.get("mctsIterations", 3))
-    selfplay_games = int(kwargs.get("mctsGamesPerIter", 32))
+    # Curriculum parameters — kept simple: supervised + 1 self-play round
+    bootstrap_games = int(kwargs.get("bootstrapGames", 50))
+    selfplay_iterations = int(kwargs.get("mctsIterations", 1))
+    selfplay_games = int(kwargs.get("mctsGamesPerIter", 40))
     tactical_epochs = min(2, epochs)
-    supervised_epochs = min(12, epochs) if board_size <= 5 else min(3, epochs)
-    bootstrap_steps = 500 if board_size <= 5 else 300
-    selfplay_steps_per_iter = 500 if board_size <= 5 else 300
+    supervised_epochs = min(6, epochs) if board_size <= 5 else min(3, epochs)
+    bootstrap_steps = int(kwargs.get("bootstrapSteps", 200))
+    selfplay_steps_per_iter = int(kwargs.get("selfPlaySteps", 200))
 
     live_gpu = get_gpu_info()
     await callback({
@@ -1591,137 +1682,57 @@ async def train_variant(
     tactical_positions: list[dict[str, Any]] = []
     bootstrap_positions: list[dict[str, Any]] = []
     minimax_positions: list[dict[str, Any]] = []
+    hard_positions: list[dict[str, Any]] = []
     started_at = time.monotonic()
     common = {"variant": variant, "boardSize": board_size, "winLength": win_len}
 
-    # ── Phase 1: Tactical ──────────────────────────────────────────────
+    # ── Single phase: collect all data → train until 80% acc ────────
     if is_new_model:
-        logger.info("Phase 1: Tactical — generating positions")
-        tactical_count = min(data_count // 2, 1000)
+        # 1. Load/generate offline minimax
+        dataset_path = SAVED_DIR / "datasets" / f"{variant}_minimax.json"
+        if not dataset_path.exists():
+            logger.info("Auto-generating minimax dataset at %s", dataset_path)
+            from gomoku_api.ws.offline_gen import generate_minimax_dataset
+            await generate_minimax_dataset(variant, 5000, callback)
+        minimax_positions = json.loads(dataset_path.read_text())
+
+        # 2. Generate tactical positions
+        tactical_count = min(data_count, 2000) if board_size <= 5 else min(data_count // 2, 1000)
         if board_size > 5:
             tactical_positions = await _generate_tactical_curriculum_positions(
-                tactical_count, board_size, win_len, callback
+                tactical_count, board_size, win_len, callback,
             )
         else:
             tactical_positions, _, _ = await _build_positions(variant, tactical_count, callback)
-        all_positions.extend(tactical_positions)
 
-        await _run_training_epochs(
-            model, tactical_positions, tactical_epochs, batch_size, device, runtime_flags,
-            callback, metrics_history,
-            phase="tactical", stage="training", completed_phases=completed_phases,
-            overall_started_at=started_at, overall_percent_base=0, overall_percent_range=10,
-            **common,
-        )
-        completed_phases.append("tactical")
-        torch.save(model.state_dict(), model_path)
-
-    # ── Phase 2: Supervised warm start (offline minimax seed) ─────────
-    if is_new_model:
-        dataset_path = SAVED_DIR / "datasets" / f"{variant}_minimax.json"
-        if not dataset_path.exists():
-            logger.info("No offline dataset at %s — auto-generating...", dataset_path)
-            from gomoku_api.ws.offline_gen import generate_minimax_dataset
-            await generate_minimax_dataset(variant, 5000, callback)
-        logger.info("Phase 2: Supervised — loading %s", dataset_path)
-        minimax_positions = json.loads(dataset_path.read_text())
-        # Shard: 40% tactical + 60% minimax for balanced supervised pool
-        tactical_shard_count = min(len(minimax_positions) * 2 // 3, 2000)
-        tactical_shard = await _generate_tactical_curriculum_positions(
-            tactical_shard_count, board_size, win_len, callback
-        )
-        supervised_pool = tactical_shard + minimax_positions
-        random.shuffle(supervised_pool)
-        # NB: supervised_pool is NOT added to all_positions — minimax_positions
-        # are passed separately to _build_train_pool to avoid double-counting.
-        await _run_training_epochs(
-            model, supervised_pool, supervised_epochs, batch_size, device, runtime_flags,
-            callback, metrics_history,
-            phase="supervised", stage="training", completed_phases=completed_phases,
-            overall_started_at=started_at, overall_percent_base=10, overall_percent_range=10,
-            **common,
-        )
-        completed_phases.append("supervised")
-        torch.save(model.state_dict(), model_path)
-        logger.info("Supervised warm start: %d positions (%d minimax + tactical)", len(supervised_pool), len(minimax_positions))
-
-    # ── Phase 3: Bootstrap (GPU policy self-play) ─────────────────────
-    if is_new_model:
-        logger.info("Phase 3: Bootstrap — %d games (policy teacher)", bootstrap_games)
-        bootstrap_positions, bootstrap_stats = await _play_selfplay_games_batched(
-            bootstrap_games, board_size, win_len, model, device, callback,
-            phase="bootstrap", teacher_mode="policy",
-            completed_phases=completed_phases,
-            overall_percent_base=20, overall_percent_range=10,
-            runtime_flags=runtime_flags, **common,
-        )
-        all_positions.extend(bootstrap_positions)
-
-        await _run_training_steps(
-            model, bootstrap_positions, bootstrap_steps, batch_size, device, runtime_flags,
-            callback, metrics_history,
-            phase="bootstrap", stage="training", completed_phases=completed_phases,
-            selfplay_stats=bootstrap_stats,
-            overall_started_at=started_at, overall_percent_base=25, overall_percent_range=5,
-            **common,
-        )
-        completed_phases.append("bootstrap")
-        torch.save(model.state_dict(), model_path)
-
-    # ── Phase 4: Self-play iterations (GPU policy only) ───────────────
-    sp_pct_per_iter = 60.0 / max(selfplay_iterations, 1)
-    sp_base_pct = 30.0 if is_new_model else 0.0
-
-    for it in range(1, selfplay_iterations + 1):
-        logger.info("Phase 4: Self-play iteration %d/%d — %d games", it, selfplay_iterations, selfplay_games)
-        iter_base = sp_base_pct + (it - 1) * sp_pct_per_iter
-
+        # 3. Self-play games for diversity
         sp_positions, sp_stats = await _play_selfplay_games_batched(
-            selfplay_games, board_size, win_len, model, device, callback,
-            phase="self_play", teacher_mode="policy",
+            bootstrap_games, board_size, win_len, model, device, callback,
+            phase="training", teacher_mode="policy",
             completed_phases=completed_phases,
-            iteration=it, total_iterations=selfplay_iterations,
-            overall_percent_base=iter_base, overall_percent_range=sp_pct_per_iter,
+            overall_percent_base=0, overall_percent_range=10,
             runtime_flags=runtime_flags, **common,
         )
-        all_positions.extend(sp_positions)
 
-        # Train on recent + replay (tactical and minimax are separate buckets)
-        replay_tail = all_positions[:-len(sp_positions)] if sp_positions else list(all_positions)
-        train_pool = _build_train_pool(
-            sp_positions,
-            replay_tail[-max(data_count, len(replay_tail) // 2):],
-            data_count=data_count,
-            seed_positions=tactical_positions,
-            minimax_positions=minimax_positions,
+        # 4. Combine everything into one pool and train
+        all_positions = tactical_positions + minimax_positions + sp_positions
+        random.shuffle(all_positions)
+        logger.info(
+            "Training pool: %d total (%d tactical + %d minimax + %d self-play)",
+            len(all_positions), len(tactical_positions), len(minimax_positions), len(sp_positions),
         )
+
+        total_steps = selfplay_steps_per_iter * 3
         await _run_training_steps(
-            model, train_pool, selfplay_steps_per_iter, batch_size, device, runtime_flags,
+            model, all_positions, total_steps, batch_size, device, runtime_flags,
             callback, metrics_history,
-            phase="self_play", stage="training", completed_phases=completed_phases,
+            phase="training", stage="training", completed_phases=completed_phases,
             selfplay_stats=sp_stats,
-            iteration=it, total_iterations=selfplay_iterations,
-            overall_started_at=started_at,
-            overall_percent_base=iter_base + sp_pct_per_iter * 0.5,
-            overall_percent_range=sp_pct_per_iter * 0.5,
+            overall_started_at=started_at, overall_percent_base=10, overall_percent_range=85,
             **common,
         )
+        completed_phases.append("training")
         torch.save(model.state_dict(), model_path)
-
-        # Tactical accuracy eval
-        if board_size <= 9:
-            tac_acc = _compute_tactical_accuracy(model, board_size, win_len, device)
-            logger.info("Self-play %d/%d tactical accuracy: %.1f%%", it, selfplay_iterations, tac_acc)
-            await callback({
-                "type": "train.progress",
-                "payload": {
-                    "phase": "self_play", "stage": "eval", "variant": variant,
-                    "completedPhases": completed_phases or [],
-                    "iteration": it, "totalIterations": selfplay_iterations,
-                    "tacticalAccuracy": tac_acc,
-                    "message": f"Tactical accuracy: {tac_acc}%",
-                },
-            })
 
     # ── Done ───────────────────────────────────────────────────────────
     from gomoku_api.ws.predict_service import clear_cached_model
