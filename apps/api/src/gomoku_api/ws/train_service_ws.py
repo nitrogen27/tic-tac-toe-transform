@@ -785,19 +785,28 @@ def _build_train_pool(
     *,
     data_count: int,
     seed_positions: list[dict[str, Any]] | None = None,
+    minimax_positions: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Mix fresh self-play, replay, and tactical seed samples.
+    """Mix fresh self-play, replay, tactical seed, and minimax positions.
 
-    The freshest positions stay dominant, but a small stable seed helps keep
-    tactical motifs from being forgotten in later self-play iterations.
+    Hardened quotas:
+      20% tactical seed (min)
+      20% minimax seed (min)
+      60% recent self-play (remaining)
+    Replay fills gaps if any bucket is too small.
     """
     if data_count <= 0:
         return []
 
     seed_positions = seed_positions or []
-    seed_quota = min(len(seed_positions), max(data_count // 5, 0))
-    latest_quota = min(len(latest_positions), max(data_count // 2, 1))
-    remaining = max(data_count - seed_quota - latest_quota, 0)
+    minimax_positions = minimax_positions or []
+
+    # Minimum quotas: 20% tactical, 20% minimax, rest = latest + replay
+    tactical_quota = min(len(seed_positions), max(data_count * 20 // 100, 0))
+    minimax_quota = min(len(minimax_positions), max(data_count * 20 // 100, 0))
+    latest_budget = data_count - tactical_quota - minimax_quota
+    latest_quota = min(len(latest_positions), latest_budget)
+    remaining = max(latest_budget - latest_quota, 0)
     replay_quota = min(len(replay_positions), remaining)
 
     pool: list[dict[str, Any]] = []
@@ -805,12 +814,14 @@ def _build_train_pool(
         pool.extend(random.sample(latest_positions, latest_quota))
     if replay_quota > 0 and replay_positions:
         pool.extend(random.sample(replay_positions, replay_quota))
-    if seed_quota > 0 and seed_positions:
-        pool.extend(random.sample(seed_positions, seed_quota))
+    if tactical_quota > 0 and seed_positions:
+        pool.extend(random.sample(seed_positions, tactical_quota))
+    if minimax_quota > 0 and minimax_positions:
+        pool.extend(random.sample(minimax_positions, minimax_quota))
 
-    # Backfill if one bucket was too small.
+    # Backfill if any bucket was too small.
     if len(pool) < data_count:
-        leftovers = latest_positions + replay_positions + seed_positions
+        leftovers = latest_positions + replay_positions + seed_positions + minimax_positions
         needed = min(data_count - len(pool), len(leftovers))
         if needed > 0:
             pool.extend(random.sample(leftovers, needed))
@@ -1356,7 +1367,7 @@ async def train_variant(
     selfplay_iterations = int(kwargs.get("mctsIterations", 3))
     selfplay_games = int(kwargs.get("mctsGamesPerIter", 20))
     tactical_epochs = min(2, epochs)
-    supervised_epochs = min(3, epochs)
+    supervised_epochs = min(12, epochs) if board_size <= 5 else min(3, epochs)
     bootstrap_epochs = min(3, epochs)
     selfplay_epochs_per_iter = min(3, epochs)
 
@@ -1379,6 +1390,7 @@ async def train_variant(
     all_positions: list[dict[str, Any]] = []
     tactical_positions: list[dict[str, Any]] = []
     bootstrap_positions: list[dict[str, Any]] = []
+    minimax_positions: list[dict[str, Any]] = []
     started_at = time.monotonic()
     common = {"variant": variant, "boardSize": board_size, "winLength": win_len}
 
@@ -1406,23 +1418,31 @@ async def train_variant(
 
     # ── Phase 2: Supervised warm start (offline minimax seed) ─────────
     if is_new_model:
-        dataset_path = Path("saved/datasets") / f"{variant}_minimax.json"
-        if dataset_path.exists():
-            logger.info("Phase 2: Supervised — loading %s", dataset_path)
-            supervised_positions = json.loads(dataset_path.read_text())
-            all_positions.extend(supervised_positions)
-            await _run_training_epochs(
-                model, all_positions, supervised_epochs, batch_size, device, runtime_flags,
-                callback, metrics_history,
-                phase="supervised", stage="training", completed_phases=completed_phases,
-                overall_started_at=started_at, overall_percent_base=10, overall_percent_range=10,
-                **common,
-            )
-            completed_phases.append("supervised")
-            torch.save(model.state_dict(), model_path)
-            logger.info("Supervised warm start: %d positions loaded", len(supervised_positions))
-        else:
-            logger.info("No offline dataset at %s — skipping supervised phase", dataset_path)
+        dataset_path = SAVED_DIR / "datasets" / f"{variant}_minimax.json"
+        if not dataset_path.exists():
+            logger.info("No offline dataset at %s — auto-generating...", dataset_path)
+            from gomoku_api.ws.offline_gen import generate_minimax_dataset
+            await generate_minimax_dataset(variant, 5000, callback)
+        logger.info("Phase 2: Supervised — loading %s", dataset_path)
+        minimax_positions = json.loads(dataset_path.read_text())
+        # Shard: 40% tactical + 60% minimax for balanced supervised pool
+        tactical_shard_count = min(len(minimax_positions) * 2 // 3, 2000)
+        tactical_shard = await _generate_tactical_curriculum_positions(
+            tactical_shard_count, board_size, win_len, callback
+        )
+        supervised_positions = tactical_shard + minimax_positions
+        random.shuffle(supervised_positions)
+        all_positions.extend(supervised_positions)
+        await _run_training_epochs(
+            model, all_positions, supervised_epochs, batch_size, device, runtime_flags,
+            callback, metrics_history,
+            phase="supervised", stage="training", completed_phases=completed_phases,
+            overall_started_at=started_at, overall_percent_base=10, overall_percent_range=10,
+            **common,
+        )
+        completed_phases.append("supervised")
+        torch.save(model.state_dict(), model_path)
+        logger.info("Supervised warm start: %d positions loaded", len(supervised_positions))
 
     # ── Phase 3: Bootstrap (GPU policy self-play) ─────────────────────
     if is_new_model:
@@ -1475,6 +1495,7 @@ async def train_variant(
             replay_tail[-max(data_count, len(replay_tail) // 2):],
             data_count=data_count,
             seed_positions=seed_replay,
+            minimax_positions=minimax_positions,
         )
         await _run_training_epochs(
             model, train_pool, selfplay_epochs_per_iter, batch_size, device, runtime_flags,

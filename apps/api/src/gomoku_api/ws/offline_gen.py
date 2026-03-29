@@ -18,6 +18,8 @@ from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
+SAVED_DIR = Path(__file__).resolve().parents[5] / "saved"
+
 TRAIN_CALLBACK = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -130,7 +132,7 @@ async def generate_minimax_dataset(
     board_size, win_len = _resolve_variant(variant)
     minimax_depth = 4 if board_size <= 3 else 3
 
-    output_dir = Path("saved/datasets")
+    output_dir = SAVED_DIR / "datasets"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{variant}_minimax.json"
 

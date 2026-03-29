@@ -896,6 +896,20 @@ function connectWS() {
         const p = msg.payload
         status.value = `Датасет готов: ${p.count} позиций (${p.variant})`
       }
+      if (msg.type === 'train.accepted') {
+        status.value = `Обучение ${msg.payload.variant} запущено...`
+      }
+      if (msg.type === 'train.error') {
+        training.value = false
+        if (trainingTimerInterval) { clearInterval(trainingTimerInterval); trainingTimerInterval = null }
+        status.value = `Ошибка обучения: ${msg.payload.error}`
+        console.error('[WS] Training error:', msg.payload)
+      }
+      if (msg.type === 'train.cancelled') {
+        training.value = false
+        if (trainingTimerInterval) { clearInterval(trainingTimerInterval); trainingTimerInterval = null }
+        status.value = `Обучение ${msg.payload.variant} отменено`
+      }
       if (msg.type === 'train.done') {
         training.value = false
         datasetProgress.value = null

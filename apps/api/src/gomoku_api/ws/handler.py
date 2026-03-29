@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -18,6 +19,23 @@ logger = logging.getLogger(__name__)
 
 # Shared game service (one per process)
 _game_service = GameService()
+
+# Active training tasks — non-blocking dispatch
+_active_train_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _run_training(variant: str, cb, **kwargs):
+    """Wrapper that runs train_variant as a background task."""
+    try:
+        await train_variant(variant, cb, **kwargs)
+    except asyncio.CancelledError:
+        logger.info("Training cancelled [%s]", variant)
+        await cb({"type": "train.cancelled", "payload": {"variant": variant}})
+    except Exception as exc:
+        logger.error("Training failed [%s]: %s", variant, exc, exc_info=True)
+        await cb({"type": "train.error", "payload": {"error": str(exc), "variant": variant}})
+    finally:
+        _active_train_tasks.pop(variant, None)
 
 
 async def _send(ws: WebSocket, msg: dict) -> None:
@@ -95,25 +113,30 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         epochs = min(max(int(payload.get("epochs", 30)), 1), 50)
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 4096)
         cb = await _ws_callback(ws)
-        await train_variant("ttt3", cb, epochs=epochs, batch_size=batch_size, data_count=3000)
+        task = asyncio.create_task(_run_training("ttt3", cb, epochs=epochs, batch_size=batch_size, data_count=3000))
+        _active_train_tasks["ttt3"] = task
+        await _send(ws, {"type": "train.accepted", "payload": {"variant": "ttt3"}})
 
     elif msg_type == "train_ttt5":
         epochs = min(max(int(payload.get("epochs", 30)), 1), 60)
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 4096)
         cb = await _ws_callback(ws)
-        # Forward preset curriculum params from Vue client
         extra = {}
         for key in ("bootstrapGames", "mctsIterations", "mctsGamesPerIter"):
             if key in payload:
                 extra[key] = payload[key]
-        await train_variant("ttt5", cb, epochs=epochs, batch_size=batch_size, data_count=5000, **extra)
+        task = asyncio.create_task(_run_training("ttt5", cb, epochs=epochs, batch_size=batch_size, data_count=5000, **extra))
+        _active_train_tasks["ttt5"] = task
+        await _send(ws, {"type": "train.accepted", "payload": {"variant": "ttt5"}})
 
     elif msg_type == "train_gomoku":
         epochs = min(max(int(payload.get("epochs", 30)), 1), 60)
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 4096)
         variant = payload.get("variant", "gomoku15")
         cb = await _ws_callback(ws)
-        await train_variant(variant, cb, epochs=epochs, batch_size=batch_size, data_count=5000)
+        task = asyncio.create_task(_run_training(variant, cb, epochs=epochs, batch_size=batch_size, data_count=5000))
+        _active_train_tasks[variant] = task
+        await _send(ws, {"type": "train.accepted", "payload": {"variant": variant}})
 
     elif msg_type == "generate_dataset":
         variant = payload.get("variant", "ttt5")
@@ -150,20 +173,32 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         )
         await _send(ws, {"type": "game.finished", "payload": stats})
 
-        # Optional auto-train
+        # Optional auto-train (fire-and-forget)
         if payload.get("autoTrain"):
             variant = payload.get("variant", "ttt3")
             cb = await _ws_callback(ws)
             epochs = min(max(int(payload.get("epochs", 3)), 1), 10)
             batch_size = min(max(int(payload.get("incrementalBatchSize", 256)), 32), 1024)
-            await train_variant(variant, cb, epochs=epochs, batch_size=batch_size, data_count=1000)
+            task = asyncio.create_task(_run_training(variant, cb, epochs=epochs, batch_size=batch_size, data_count=1000))
+            _active_train_tasks[variant] = task
 
     elif msg_type == "train_on_games":
         variant = payload.get("variant", "ttt3")
         epochs = min(max(int(payload.get("epochs", 3)), 1), 10)
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 1024)
         cb = await _ws_callback(ws)
-        await train_variant(variant, cb, epochs=epochs, batch_size=batch_size, data_count=2000)
+        task = asyncio.create_task(_run_training(variant, cb, epochs=epochs, batch_size=batch_size, data_count=2000))
+        _active_train_tasks[variant] = task
+        await _send(ws, {"type": "train.accepted", "payload": {"variant": variant}})
+
+    elif msg_type == "cancel_training":
+        variant = payload.get("variant", "")
+        task = _active_train_tasks.get(variant)
+        if task and not task.done():
+            task.cancel()
+            await _send(ws, {"type": "train.cancelled", "payload": {"variant": variant}})
+        else:
+            await _send(ws, {"type": "error", "error": f"no active training for {variant}"})
 
     elif msg_type == "clear_history":
         result = _game_service.clear_history()
