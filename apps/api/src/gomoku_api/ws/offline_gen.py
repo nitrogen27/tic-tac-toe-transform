@@ -97,12 +97,16 @@ def _nxn_minimax_policy(board: list[int], n: int, win_len: int,
         move_values.append((move, val))
 
     best_val = max(v for _, v in move_values)
-    # Softmax-ish: best moves get most weight
+    # Sharp softmax: concentrate weight on best moves (temperature=0.3)
+    import math
+    temperature = 0.3
     policy = [0.0] * (n * n)
-    top_moves = [m for m, v in move_values if v >= best_val - 0.01]
-    weight = 1.0 / len(top_moves)
-    for m in top_moves:
-        policy[m] = weight
+    exp_vals = []
+    for m, v in move_values:
+        exp_vals.append((m, math.exp((v - best_val) / temperature)))
+    total = sum(e for _, e in exp_vals)
+    for m, e in exp_vals:
+        policy[m] = e / total if total > 0 else 1.0 / len(move_values)
     return policy, best_val
 
 

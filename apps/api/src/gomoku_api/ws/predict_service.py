@@ -162,6 +162,11 @@ def _maybe_compile_model(model: Any) -> Any:
     if not torch.cuda.is_available() or not hasattr(torch, "compile"):
         return model
     try:
+        import triton  # noqa: F401
+    except ImportError:
+        logger.info("Triton not installed — predict model stays in eager mode")
+        return model
+    try:
         return torch.compile(model, mode="reduce-overhead", fullgraph=False)
     except Exception as exc:
         logger.warning("Predict model stays in eager mode because torch.compile failed: %s", exc)

@@ -1513,7 +1513,7 @@ async def _run_training_steps(
     phase_start = time.monotonic()
     step = 0
     epoch = 0
-    cum_loss = cum_acc = cum_mae = 0.0
+    cum_loss = cum_ploss = cum_vloss = cum_acc = cum_mae = 0.0
     cum_samples = 0
 
     while step < max_steps:
@@ -1544,17 +1544,18 @@ async def _run_training_steps(
             bs = planes.size(0)
             acc = policy_accuracy(logits.detach(), pol_t, legal_mask=legal_mask)
             mae = value_mae(vpred.detach(), val_t)
-            cum_loss += loss.item() * bs; cum_acc += acc * bs; cum_mae += mae * bs
+            cum_loss += loss.item() * bs; cum_ploss += pl.item() * bs; cum_vloss += vl.item() * bs
+            cum_acc += acc * bs; cum_mae += mae * bs
             cum_samples += bs; samples_seen += bs
 
             a_loss = cum_loss / max(cum_samples, 1)
             a_acc = (cum_acc / max(cum_samples, 1)) * 100.0
             a_mae = cum_mae / max(cum_samples, 1)
 
-            # Early stop: if accuracy >= 80% after 50+ steps, good enough
-            if step >= 50 and a_acc >= 80.0:
-                logger.info("Early stop at step %d: acc %.1f%% >= 80%%", step, a_acc)
-                max_steps = step  # will exit loop
+            # Early stop: if loss plateaus (< 2.0 after 100+ steps)
+            if step >= 100 and a_loss < 2.0:
+                logger.info("Early stop at step %d: loss %.3f < 2.0", step, a_loss)
+                max_steps = step
 
             now = time.monotonic()
             if _should_emit_progress(now, last_emit_at, force=(step >= max_steps)):
@@ -1575,7 +1576,10 @@ async def _run_training_steps(
                         "selfPlayStats": selfplay_stats or {},
                         "step": step, "totalSteps": max_steps,
                         "epoch": epoch, "totalEpochs": max(1, (max_steps * batch_size) // max(n, 1)),
-                        "loss": round(a_loss, 6), "accuracy": round(a_acc, 2), "acc": round(a_acc, 2),
+                        "loss": round(a_loss, 6),
+                        "policyLoss": round(cum_ploss / max(cum_samples, 1), 6),
+                        "valueLoss": round(cum_vloss / max(cum_samples, 1), 6),
+                        "accuracy": round(a_acc, 2), "acc": round(a_acc, 2),
                         "mae": round(a_mae, 6),
                         "percent": round(pct, 1),
                         "elapsed": round(elapsed, 1),
@@ -1602,7 +1606,7 @@ async def _run_training_steps(
                 "acc": round((cum_acc / cum_samples) * 100.0, 2),
                 "mae": round(cum_mae / cum_samples, 6),
             })
-            cum_loss = cum_acc = cum_mae = 0.0
+            cum_loss = cum_ploss = cum_vloss = cum_acc = cum_mae = 0.0
             cum_samples = 0
 
 
@@ -1696,14 +1700,11 @@ async def train_variant(
             await generate_minimax_dataset(variant, 5000, callback)
         minimax_positions = json.loads(dataset_path.read_text())
 
-        # 2. Generate tactical positions
-        tactical_count = min(data_count, 2000) if board_size <= 5 else min(data_count // 2, 1000)
-        if board_size > 5:
-            tactical_positions = await _generate_tactical_curriculum_positions(
-                tactical_count, board_size, win_len, callback,
-            )
-        else:
-            tactical_positions, _, _ = await _build_positions(variant, tactical_count, callback)
+        # 2. Generate tactical positions (always use curriculum generator)
+        tactical_count = min(data_count, 2000)
+        tactical_positions = await _generate_tactical_curriculum_positions(
+            tactical_count, board_size, win_len, callback,
+        )
 
         # 3. Self-play games for diversity
         sp_positions, sp_stats = await _play_selfplay_games_batched(
@@ -1714,17 +1715,36 @@ async def train_variant(
             runtime_flags=runtime_flags, **common,
         )
 
-        # 4. Combine everything into one pool and train
-        all_positions = tactical_positions + minimax_positions + sp_positions
-        random.shuffle(all_positions)
+        # 4. Mine hard tactical examples (positions where model fails to block)
+        hard_positions: list[dict[str, Any]] = []
+        if board_size <= 9 and hasattr(train_variant, '__module__'):
+            try:
+                hard_positions = await _mine_hard_tactical_examples(
+                    model, board_size, win_len, device,
+                    target_count=min(max(data_count // 8, 128), 512),
+                )
+                logger.info("Mined %d hard tactical examples", len(hard_positions))
+            except Exception as exc:
+                logger.warning("Hard mining failed: %s", exc)
+
+        # 5. Build balanced train pool with proper quotas
+        train_pool = _build_train_pool(
+            sp_positions,
+            [],  # no replay yet (first run)
+            data_count=data_count,
+            seed_positions=tactical_positions,
+            minimax_positions=minimax_positions,
+            hard_positions=hard_positions,
+        )
         logger.info(
-            "Training pool: %d total (%d tactical + %d minimax + %d self-play)",
-            len(all_positions), len(tactical_positions), len(minimax_positions), len(sp_positions),
+            "Training pool: %d positions (%d tactical, %d minimax, %d self-play, %d hard)",
+            len(train_pool), len(tactical_positions), len(minimax_positions),
+            len(sp_positions), len(hard_positions),
         )
 
         total_steps = selfplay_steps_per_iter * 3
         await _run_training_steps(
-            model, all_positions, total_steps, batch_size, device, runtime_flags,
+            model, train_pool, total_steps, batch_size, device, runtime_flags,
             callback, metrics_history,
             phase="training", stage="training", completed_phases=completed_phases,
             selfplay_stats=sp_stats,
