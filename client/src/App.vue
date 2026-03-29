@@ -378,9 +378,9 @@ const mainTrainingBatchSize = ref(1024)
 const activePreset = ref('medium') // 'light', 'medium', 'deep', 'custom'
 
 const PRESETS = {
-  light:  { epochs: 10, batchSize: 1024, bootstrapGames: 30,  mctsIterations: 1, mctsGamesPerIter: 30,  label: 'Лёгкое', desc: 'supervised + 1 self-play · early stop 80%' },
-  medium: { epochs: 25, batchSize: 1024, bootstrapGames: 50,  mctsIterations: 1, mctsGamesPerIter: 40,  label: 'Среднее', desc: 'supervised + bootstrap + 1 self-play' },
-  deep:   { epochs: 50, batchSize: 1024, bootstrapGames: 100, mctsIterations: 3, mctsGamesPerIter: 50,  label: 'Глубокое', desc: 'supervised + bootstrap + 3 self-play' },
+  light:  { epochs: 10, batchSize: 512,  bootstrapGames: 50,  mctsIterations: 2, mctsGamesPerIter: 20,  label: 'Лёгкое', desc: '10 эпох · batch 512 · 50 bootstrap · 2×20 self-play' },
+  medium: { epochs: 25, batchSize: 1024, bootstrapGames: 100, mctsIterations: 3, mctsGamesPerIter: 40,  label: 'Среднее', desc: '25 эпох · batch 1024 · 100 bootstrap · 3×40 self-play' },
+  deep:   { epochs: 50, batchSize: 2048, bootstrapGames: 200, mctsIterations: 5, mctsGamesPerIter: 100, label: 'Глубокое', desc: '50 эпох · batch 2048 · 200 bootstrap · 5×100 self-play' },
 }
 
 const presetDescription = computed(() => PRESETS[activePreset.value]?.desc || '')
@@ -594,8 +594,6 @@ function extractGpuTelemetry(payload) {
 // ===== uPlot Training Charts =====
 function createLossChart() {
   if (!lossChartEl.value || lossChart) return
-  // Guard: element must be in the live DOM (v-if may have re-mounted it)
-  if (!lossChartEl.value.isConnected) return
   const opts = {
     width: lossChartEl.value.offsetWidth || 600,
     height: 180,
@@ -1527,11 +1525,6 @@ watch(gameType, () => {
 watch(metricsHistory, () => {
   if (metricsHistory.value.length > 0) {
     nextTick(() => {
-      // If chart lost its DOM (v-if re-mount), destroy and recreate
-      if (lossChart && lossChartEl.value && !lossChartEl.value.querySelector('canvas')) {
-        try { lossChart.destroy() } catch (_) {}
-        lossChart = null
-      }
       if (!lossChart && lossChartEl.value) createLossChart()
       updateCharts()
     })
