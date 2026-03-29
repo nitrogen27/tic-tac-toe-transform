@@ -172,12 +172,19 @@ def _get_model(variant: str):
         from trainer_lab.models.resnet import PolicyValueResNet
 
         cfg = ModelConfig()
+        # Match model size to variant (must match training)
+        if variant in ("ttt3", "ttt5"):
+            res_filters, res_blocks, value_fc = 32, 3, 64
+        elif variant.startswith("gomoku") and int(variant.replace("gomoku", "")) <= 9:
+            res_filters, res_blocks, value_fc = 64, 4, 128
+        else:
+            res_filters, res_blocks, value_fc = cfg.res_filters, cfg.res_blocks, cfg.value_fc
         model = PolicyValueResNet(
             in_channels=cfg.in_channels,
-            res_filters=cfg.res_filters,
-            res_blocks=cfg.res_blocks,
+            res_filters=res_filters,
+            res_blocks=res_blocks,
             policy_filters=cfg.policy_filters,
-            value_fc=cfg.value_fc,
+            value_fc=value_fc,
             board_max=cfg.board_max,
         )
         model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))

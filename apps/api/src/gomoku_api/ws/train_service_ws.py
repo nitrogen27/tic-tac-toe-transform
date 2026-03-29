@@ -234,7 +234,140 @@ async def _generate_ttt3_positions(count: int, callback: TRAIN_CALLBACK) -> list
 
 
 # ---------------------------------------------------------------------------
-# Generic NxN self-play-ish data generation
+# Alpha-beta minimax for small NxN boards (5x5 with depth limit)
+# ---------------------------------------------------------------------------
+
+
+def _nxn_evaluate_heuristic(board: list[int], n: int, win_len: int, player: int) -> float:
+    """Quick heuristic evaluation for NxN board from player's perspective."""
+    score = 0.0
+    opponent = 3 - player
+    for r in range(n):
+        for c in range(n):
+            if board[r * n + c] != 0:
+                continue
+            # Count threats around empty cell
+            for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+                my_count = opp_count = 0
+                for s in range(1, win_len):
+                    nr, nc = r + dr * s, c + dc * s
+                    if 0 <= nr < n and 0 <= nc < n:
+                        v = board[nr * n + nc]
+                        if v == player:
+                            my_count += 1
+                        elif v == opponent:
+                            opp_count += 1
+                        else:
+                            break
+                    else:
+                        break
+                for s in range(1, win_len):
+                    nr, nc = r - dr * s, c - dc * s
+                    if 0 <= nr < n and 0 <= nc < n:
+                        v = board[nr * n + nc]
+                        if v == player:
+                            my_count += 1
+                        elif v == opponent:
+                            opp_count += 1
+                        else:
+                            break
+                    else:
+                        break
+                if my_count >= win_len - 1 and opp_count == 0:
+                    score += 10.0
+                elif my_count >= win_len - 2 and opp_count == 0:
+                    score += 1.0
+                if opp_count >= win_len - 1 and my_count == 0:
+                    score -= 8.0
+                elif opp_count >= win_len - 2 and my_count == 0:
+                    score -= 0.8
+    return score
+
+
+def _nxn_minimax(
+    board: list[int], n: int, win_len: int, current: int,
+    depth: int, alpha: float, beta: float, last_move: int,
+) -> float:
+    """Alpha-beta minimax for NxN boards with depth limit."""
+    if last_move >= 0:
+        w = _nxn_winner(board, n, win_len, last_move)
+        if w != 0:
+            return 100.0 if w == current else -100.0
+
+    if depth <= 0:
+        return _nxn_evaluate_heuristic(board, n, win_len, current)
+
+    empty = [i for i in range(n * n) if board[i] == 0]
+    if not empty:
+        return 0.0
+
+    # Order moves: center first, then near existing stones
+    center = n // 2
+    def move_priority(m: int) -> float:
+        r, c = divmod(m, n)
+        dist = abs(r - center) + abs(c - center)
+        # Bonus for adjacent to existing stones
+        adj = 0
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < n and 0 <= nc < n and board[nr * n + nc] != 0:
+                    adj += 1
+        return -adj * 10 + dist
+    empty.sort(key=move_priority)
+
+    best = -200.0
+    opp = 3 - current
+    for move in empty:
+        board[move] = current
+        val = -_nxn_minimax(board, n, win_len, opp, depth - 1, -beta, -alpha, move)
+        board[move] = 0
+        if val > best:
+            best = val
+        alpha = max(alpha, val)
+        if alpha >= beta:
+            break
+    return best
+
+
+def _nxn_minimax_policy(board: list[int], n: int, win_len: int, current: int, depth: int = 6) -> tuple[list[float], float]:
+    """Get minimax-evaluated policy for NxN board. Returns (policy_N*N, value)."""
+    empty = [i for i in range(n * n) if board[i] == 0]
+    if not empty:
+        return [0.0] * (n * n), 0.0
+
+    scores: dict[int, float] = {}
+    opp = 3 - current
+    for move in empty:
+        board[move] = current
+        w = _nxn_winner(board, n, win_len, move)
+        if w != 0:
+            scores[move] = 100.0
+            board[move] = 0
+            continue
+        val = -_nxn_minimax(board, n, win_len, opp, depth - 1, -200.0, 200.0, move)
+        scores[move] = val
+        board[move] = 0
+
+    best_val = max(scores.values())
+    # Softmax-like distribution: boost good moves
+    import math
+    temperature = 1.0
+    exp_scores = {}
+    for m, s in scores.items():
+        exp_scores[m] = math.exp(min((s - best_val) / max(temperature, 0.1), 20))
+    total = sum(exp_scores.values())
+
+    policy = [0.0] * (n * n)
+    for m, e in exp_scores.items():
+        policy[m] = e / total
+
+    value = max(-1.0, min(1.0, best_val / 100.0))
+    return policy, value
+
+
+# ---------------------------------------------------------------------------
+# Generic NxN data generation (with minimax for small boards)
 # ---------------------------------------------------------------------------
 
 
@@ -276,6 +409,8 @@ async def _generate_nxn_positions(
     games_played = 0
     start_time = time.monotonic()
     last_reported = 0
+    use_minimax = board_size <= 5  # Minimax for small boards only
+    minimax_depth = 4 if board_size <= 3 else 3  # depth 3 for 5x5 (fast enough)
 
     while len(positions) < count:
         board = [0] * (board_size * board_size)
@@ -289,11 +424,23 @@ async def _generate_nxn_positions(
             if not empty:
                 break
 
-            policy = [0.0] * 256
-            probability = 1.0 / len(empty)
-            for idx in empty:
-                row, col = divmod(idx, board_size)
-                policy[row * 16 + col] = probability
+            # Get policy: minimax for small boards, random for large
+            if use_minimax:
+                mm_policy, mm_value = _nxn_minimax_policy(
+                    list(board), board_size, win_len, current_player, minimax_depth
+                )
+                policy = [0.0] * 256
+                for idx in range(board_size * board_size):
+                    r, c = divmod(idx, board_size)
+                    policy[r * 16 + c] = mm_policy[idx]
+                pos_value = mm_value
+            else:
+                policy = [0.0] * 256
+                probability = 1.0 / len(empty)
+                for idx in empty:
+                    r, c = divmod(idx, board_size)
+                    policy[r * 16 + c] = probability
+                pos_value = 0.0
 
             board_2d = [
                 [board[row * board_size + col] for col in range(board_size)]
@@ -305,10 +452,19 @@ async def _generate_nxn_positions(
                 "current_player": current_player,
                 "last_move": list(divmod(last_move_flat, board_size)) if last_move_flat >= 0 else None,
                 "policy": policy,
-                "value": 0.0,
+                "value": pos_value,
             })
 
-            move = random.choice(empty)
+            # Choose move based on policy (weighted sample for diversity)
+            if use_minimax:
+                weights = [mm_policy[i] for i in empty]
+                total_w = sum(weights)
+                if total_w > 0:
+                    move = random.choices(empty, weights=weights, k=1)[0]
+                else:
+                    move = random.choice(empty)
+            else:
+                move = random.choice(empty)
             board[move] = current_player
             last_move_flat = move
 
@@ -443,11 +599,26 @@ async def _play_selfplay_games(
             else:
                 move = random.choice(empty)
 
-            # Build policy (uniform for bootstrap, MCTS visit counts handled above)
-            policy = [0.0] * 256
-            for idx in empty:
-                r, c = divmod(idx, board_size)
-                policy[r * 16 + c] = 1.0 / len(empty)
+            # Build policy target
+            if use_mcts and 'policy_vec' in dir():
+                # MCTS: use visit count distribution
+                policy = [0.0] * 256
+                for idx in range(board_size * board_size):
+                    r, c = divmod(idx, board_size)
+                    policy[r * 16 + c] = policy_vec[idx] if idx < len(policy_vec) else 0.0
+            elif board_size <= 5:
+                # Small boards: use minimax policy for quality targets
+                mm_pol, _ = _nxn_minimax_policy(list(board), board_size, win_len, current, 3)
+                policy = [0.0] * 256
+                for idx in range(board_size * board_size):
+                    r, c = divmod(idx, board_size)
+                    policy[r * 16 + c] = mm_pol[idx]
+            else:
+                # Large boards: uniform (fallback)
+                policy = [0.0] * 256
+                for idx in empty:
+                    r, c = divmod(idx, board_size)
+                    policy[r * 16 + c] = 1.0 / len(empty)
 
             # Record position
             board_2d = [[0] * board_size for _ in range(board_size)]
@@ -683,14 +854,24 @@ async def train_variant(
     runtime_flags = _prepare_cuda_runtime(device)
     cfg = ModelConfig()
 
+    board_size, win_len = _resolve_variant_spec(variant)
+
     model_dir = _ensure_saved_dir(variant)
     model_path = model_dir / "model.pt"
     is_new_model = not model_path.exists()
 
+    # Use smaller model for small boards (3x3, 5x5) — large ResNet overfits
+    if board_size <= 5:
+        res_filters, res_blocks, value_fc = 32, 3, 64
+    elif board_size <= 9:
+        res_filters, res_blocks, value_fc = 64, 4, 128
+    else:
+        res_filters, res_blocks, value_fc = cfg.res_filters, cfg.res_blocks, cfg.value_fc
+
     model = PolicyValueResNet(
-        in_channels=cfg.in_channels, res_filters=cfg.res_filters,
-        res_blocks=cfg.res_blocks, policy_filters=cfg.policy_filters,
-        value_fc=cfg.value_fc, board_max=cfg.board_max,
+        in_channels=cfg.in_channels, res_filters=res_filters,
+        res_blocks=res_blocks, policy_filters=cfg.policy_filters,
+        value_fc=value_fc, board_max=cfg.board_max,
     )
     if model_path.exists():
         model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
@@ -699,8 +880,6 @@ async def train_variant(
         model = model.to(device=device, memory_format=torch.channels_last)
     else:
         model = model.to(device)
-
-    board_size, win_len = _resolve_variant_spec(variant)
 
     # Curriculum parameters
     bootstrap_games = int(kwargs.get("bootstrapGames", 40))
