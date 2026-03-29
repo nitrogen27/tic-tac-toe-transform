@@ -320,7 +320,7 @@ async def train_variant(
 
             optimizer.zero_grad()
             policy_logits, value_pred = model(planes)
-            loss, ploss, vloss = criterion(policy_logits, policy_target, value_pred, value_target)
+            loss, ploss, vloss = criterion(policy_logits, value_pred, policy_target, value_target)
             loss.backward()
             optimizer.step()
 
