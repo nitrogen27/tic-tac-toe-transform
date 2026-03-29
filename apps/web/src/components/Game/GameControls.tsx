@@ -7,8 +7,10 @@ import { useAnalysis } from "../../hooks/useAnalysis";
 import { BoardSizeSelector } from "../Board/BoardSizeSelector";
 
 export function GameControls() {
-  const { undo, newGame, moveHistory, isAnalyzing } = useGame();
+  const { undo, newGame, moveHistory, isAnalyzing, winner, isDraw } = useGame();
   const { runAnalysis } = useAnalysis();
+
+  const gameOver = winner !== null || isDraw;
 
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -36,6 +38,16 @@ export function GameControls() {
       >
         {isAnalyzing ? "Analyzing..." : "Analyze"}
       </button>
+
+      {gameOver && (
+        <span className="ml-2 rounded bg-amber-100 px-3 py-1 text-sm font-bold text-amber-800">
+          {winner === 1
+            ? "Black wins!"
+            : winner === -1
+              ? "White wins!"
+              : "Draw!"}
+        </span>
+      )}
     </div>
   );
 }

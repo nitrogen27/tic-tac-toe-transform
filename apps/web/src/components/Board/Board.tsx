@@ -30,8 +30,10 @@ const STAR_POINTS: Record<number, [number, number][]> = {
   ],
 };
 
+const HINT_COLORS = [COLORS.hintGood, COLORS.hintNeutral, COLORS.hintNeutral, COLORS.hintBad, COLORS.hintBad];
+
 export function Board() {
-  const { boardSize, cells, lastMove, currentPlayer } = useGameState();
+  const { boardSize, cells, lastMove, currentPlayer, analysis } = useGameState();
   const { hoverIndex, handleClick, handleMouseMove, handleMouseLeave } = useBoard();
 
   const pad = BOARD_PADDING;
@@ -97,6 +99,22 @@ export function Board() {
 
       {/* Stones */}
       {stones}
+
+      {/* Analysis hint markers */}
+      {analysis?.topMoves?.map((candidate, i) => {
+        if (cells[candidate.move] !== 0) return null;
+        const [hr, hc] = flatToRowCol(candidate.move, boardSize);
+        return (
+          <circle
+            key={`hint-${candidate.move}`}
+            cx={hc}
+            cy={hr}
+            r={0.2}
+            fill={HINT_COLORS[i] ?? COLORS.hintBad}
+            opacity={0.7}
+          />
+        );
+      })}
 
       {/* Ghost */}
       {ghost}

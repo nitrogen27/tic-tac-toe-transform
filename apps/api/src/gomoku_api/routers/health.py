@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 router = APIRouter(tags=["health"])
 
 
 @router.get("/health")
-async def health() -> dict:
+async def health(request: Request) -> dict:
     """Liveness probe."""
-    return {"status": "ok"}
+    engine = request.app.state.engine
+    return {"status": "ok", "engineAvailable": engine.available}

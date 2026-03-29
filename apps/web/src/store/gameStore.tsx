@@ -5,7 +5,7 @@
 import React, { createContext, useContext, useReducer, type Dispatch, type ReactNode } from "react";
 import type { CellValue, Player, AnalyzeResponse } from "../api/types";
 import { DEFAULT_BOARD_SIZE, WIN_LENGTH } from "../utils/constants";
-import { emptyCells } from "../utils/boardUtils";
+import { emptyCells, checkWinner } from "../utils/boardUtils";
 
 // ---------------------------------------------------------------------------
 // State
@@ -22,6 +22,8 @@ export interface GameState {
   mode: GameMode;
   analysis: AnalyzeResponse | null;
   isAnalyzing: boolean;
+  winner: Player | null;
+  isDraw: boolean;
 }
 
 const initialState: GameState = {
@@ -33,6 +35,8 @@ const initialState: GameState = {
   mode: "play",
   analysis: null,
   isAnalyzing: false,
+  winner: null,
+  isDraw: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,16 +59,21 @@ export type GameAction =
 function gameReducer(state: GameState, action: GameAction): GameState {
   switch (action.type) {
     case "PLACE_STONE": {
-      if (state.cells[action.index] !== 0) return state;
+      if (state.cells[action.index] !== 0 || state.winner !== null || state.isDraw) return state;
       const newCells = [...state.cells];
       newCells[action.index] = state.currentPlayer;
+      const winner = checkWinner(newCells as (0 | 1 | -1)[], state.boardSize, action.index, WIN_LENGTH);
+      const newHistory = [...state.moveHistory, action.index];
+      const isDraw = winner === null && newHistory.length === state.boardSize * state.boardSize;
       return {
         ...state,
         cells: newCells as CellValue[],
         currentPlayer: (state.currentPlayer === 1 ? -1 : 1) as Player,
-        moveHistory: [...state.moveHistory, action.index],
+        moveHistory: newHistory,
         lastMove: action.index,
         analysis: null,
+        winner,
+        isDraw,
       };
     }
 
@@ -81,6 +90,8 @@ function gameReducer(state: GameState, action: GameAction): GameState {
         moveHistory: history,
         lastMove: history.length > 0 ? history[history.length - 1] : -1,
         analysis: null,
+        winner: null,
+        isDraw: false,
       };
     }
 

@@ -19,6 +19,12 @@ services:
       - GOMOKU_ENGINE_BINARY=/opt/engine/gomoku-engine
       - GOMOKU_HOST=0.0.0.0
       - GOMOKU_PORT=8000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     depends_on:
       - engine-core
 

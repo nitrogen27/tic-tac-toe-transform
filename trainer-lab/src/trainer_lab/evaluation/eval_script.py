@@ -76,6 +76,37 @@ def _apply_move(position: dict, move: tuple[int, int]) -> dict:
     return pos
 
 
+def _check_winner(position: dict, win_length: int = 5) -> int:
+    """Check if the last move resulted in a win. Returns winner (1 or 2) or 0."""
+    last = position.get("last_move")
+    if last is None:
+        return 0
+    r, c = last[0], last[1]
+    bs = position["board_size"]
+    board = position["board"]
+    player = board[r][c]
+    if player == 0:
+        return 0
+
+    for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        count = 1
+        for s in range(1, win_length):
+            nr, nc = r + dr * s, c + dc * s
+            if 0 <= nr < bs and 0 <= nc < bs and board[nr][nc] == player:
+                count += 1
+            else:
+                break
+        for s in range(1, win_length):
+            nr, nc = r - dr * s, c - dc * s
+            if 0 <= nr < bs and 0 <= nc < bs and board[nr][nc] == player:
+                count += 1
+            else:
+                break
+        if count >= win_length:
+            return player
+    return 0
+
+
 def evaluate_vs_random(
     model: PolicyValueResNet,
     num_games: int = 20,
@@ -98,6 +129,8 @@ def evaluate_vs_random(
 
     for g in range(num_games):
         pos = _make_empty_position(board_size)
+        game_result = 0  # 0=draw, 1=player1 wins, 2=player2 wins
+
         for _ in range(max_moves):
             if pos["current_player"] == 1:
                 move = _model_move(model, pos, device)
@@ -105,12 +138,18 @@ def evaluate_vs_random(
                 move = _random_move(pos)
 
             if move is None:
-                draws += 1
                 break
 
             pos = _apply_move(pos, move)
+            winner = _check_winner(pos)
+            if winner > 0:
+                game_result = winner
+                break
 
-            # (Simplified: no win detection — full implementation deferred)
+        if game_result == 1:
+            wins += 1
+        elif game_result == 2:
+            losses += 1
         else:
             draws += 1
 
