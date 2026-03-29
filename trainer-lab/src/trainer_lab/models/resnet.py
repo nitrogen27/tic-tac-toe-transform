@@ -53,12 +53,12 @@ class PolicyValueResNet(nn.Module):
 
         # policy head
         p = F.relu(self.policy_bn(self.policy_conv(s)))
-        p = p.view(p.size(0), -1)
+        p = p.reshape(p.size(0), -1)
         p = self.policy_fc(p)  # [B, 256] raw logits
 
         # value head
         v = F.relu(self.value_bn(self.value_conv(s)))
-        v = v.view(v.size(0), -1)
+        v = v.reshape(v.size(0), -1)
         v = F.relu(self.value_fc1(v))
         v = torch.tanh(self.value_fc2(v))  # [B, 1]
 
