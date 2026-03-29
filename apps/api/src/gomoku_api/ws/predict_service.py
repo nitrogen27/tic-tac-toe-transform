@@ -158,6 +158,26 @@ async def _engine_predict(board: list[int], current: int, board_size: int, win_l
 _loaded_models: dict[str, Any] = {}
 
 
+def _maybe_compile_model(model: Any) -> Any:
+    if not torch.cuda.is_available() or not hasattr(torch, "compile"):
+        return model
+    try:
+        return torch.compile(model, mode="reduce-overhead", fullgraph=False)
+    except Exception as exc:
+        logger.warning("Predict model stays in eager mode because torch.compile failed: %s", exc)
+        return model
+
+
+def _variant_model_hparams(variant: str, board_size: int, cfg: Any) -> tuple[int, int, int]:
+    if board_size <= 3:
+        return 32, 3, 64
+    if board_size <= 5:
+        return 96, 8, 160
+    if board_size <= 9:
+        return 96, 6, 160
+    return cfg.res_filters, cfg.res_blocks, max(cfg.value_fc, 192)
+
+
 def _get_model(variant: str):
     """Load or return cached PyTorch model."""
     if variant in _loaded_models:
@@ -172,13 +192,15 @@ def _get_model(variant: str):
         from trainer_lab.models.resnet import PolicyValueResNet
 
         cfg = ModelConfig()
-        # Match model size to variant (must match training)
-        if variant in ("ttt3", "ttt5"):
-            res_filters, res_blocks, value_fc = 32, 3, 64
-        elif variant.startswith("gomoku") and int(variant.replace("gomoku", "")) <= 9:
-            res_filters, res_blocks, value_fc = 64, 4, 128
+        if variant == "ttt3":
+            board_size = 3
+        elif variant == "ttt5":
+            board_size = 5
+        elif variant.startswith("gomoku"):
+            board_size = int(variant.replace("gomoku", ""))
         else:
-            res_filters, res_blocks, value_fc = cfg.res_filters, cfg.res_blocks, cfg.value_fc
+            board_size = 15
+        res_filters, res_blocks, value_fc = _variant_model_hparams(variant, board_size, cfg)
         model = PolicyValueResNet(
             in_channels=cfg.in_channels,
             res_filters=res_filters,
@@ -187,10 +209,15 @@ def _get_model(variant: str):
             value_fc=value_fc,
             board_max=cfg.board_max,
         )
-        model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
+        try:
+            model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
+        except Exception as exc:
+            logger.warning("Model checkpoint %s is incompatible with current architecture: %s", model_path, exc)
+            return None
         model.eval()
         if torch.cuda.is_available():
             model = model.cuda()
+            model = _maybe_compile_model(model)
         _loaded_models[variant] = model
         logger.info("Loaded model for %s from %s", variant, model_path)
         return model
@@ -240,7 +267,7 @@ def _model_predict(board: list[int], current: int, variant: str, board_size: int
         device = next(model.parameters()).device
         tensor = tensor.to(device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             policy_logits, value = model(tensor)
 
         logits = policy_logits.squeeze(0).cpu()

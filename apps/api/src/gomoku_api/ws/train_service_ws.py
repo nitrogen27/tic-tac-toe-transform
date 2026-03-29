@@ -59,7 +59,7 @@ def _variant_model_hparams(board_size: int, cfg: Any) -> tuple[int, int, int]:
     if board_size <= 3:
         return 32, 3, 64
     if board_size <= 5:
-        return 64, 6, 128
+        return 96, 8, 160
     if board_size <= 9:
         return 96, 6, 160
     return cfg.res_filters, cfg.res_blocks, max(cfg.value_fc, 192)
@@ -170,6 +170,66 @@ def _extract_telemetry(gpu_info: dict[str, Any]) -> dict[str, Any]:
         "gpuReservedMB": vram.get("reservedMB"),
         "gpuTelemetryTimestamp": telemetry.get("timestamp"),
     }
+
+
+def _compute_tactical_accuracy(
+    model: Any, board_size: int, win_len: int, device: Any, n_samples: int = 200
+) -> float:
+    """Evaluate model on tactical positions (win/block). Returns accuracy 0-100."""
+    from trainer_lab.data.encoder import board_to_tensor
+    import torch.nn.functional as F
+
+    directions = ((0, 1), (1, 0), (1, 1), (1, -1))
+    correct = 0
+    total = 0
+
+    model.eval()
+    with torch.no_grad():
+        for _ in range(n_samples):
+            board = [0] * (board_size * board_size)
+            motif = random.choice(("win", "block"))
+            current = random.choice((1, 2))
+            line_player = current if motif == "win" else (2 if current == 1 else 1)
+            dr, dc = random.choice(directions)
+
+            valid_starts = [
+                (r, c) for r in range(board_size) for c in range(board_size)
+                if 0 <= r + dr * (win_len - 1) < board_size and 0 <= c + dc * (win_len - 1) < board_size
+            ]
+            if not valid_starts:
+                continue
+            sr, sc = random.choice(valid_starts)
+            gap = random.randrange(win_len)
+            target_move = (sr + dr * gap) * board_size + (sc + dc * gap)
+
+            for step in range(win_len):
+                r, c = sr + dr * step, sc + dc * step
+                flat = r * board_size + c
+                if flat != target_move:
+                    board[flat] = line_player
+
+            pos = {
+                "board_size": board_size,
+                "board": [[board[r * board_size + c] for c in range(board_size)] for r in range(board_size)],
+                "current_player": current,
+                "last_move": None,
+            }
+            planes = board_to_tensor(pos).unsqueeze(0).to(device)
+            if device.type == "cuda":
+                planes = planes.contiguous(memory_format=torch.channels_last)
+            logits, _ = model(planes)
+            legal_mask = planes[:, 2].reshape(1, -1)
+            masked = logits + (1.0 - legal_mask) * (-1e8)
+            pred = masked.argmax(dim=1).item()
+
+            target_r, target_c = divmod(target_move, board_size)
+            target_idx = target_r * 16 + target_c
+            if pred == target_idx:
+                correct += 1
+            total += 1
+
+    model.train()
+    return round(100.0 * correct / max(total, 1), 1)
 
 
 async def _emit_dataset_progress(
@@ -1315,8 +1375,148 @@ async def _run_training_epochs(
         })
 
 
+async def _run_training_steps(
+    model: Any,
+    positions: list[dict[str, Any]],
+    max_steps: int,
+    batch_size: int,
+    device: Any,
+    runtime_flags: dict[str, bool],
+    callback: TRAIN_CALLBACK,
+    metrics_history: list[dict[str, Any]],
+    phase: str,
+    stage: str = "training",
+    completed_phases: list[str] | None = None,
+    iteration: int = 0,
+    total_iterations: int = 0,
+    selfplay_stats: dict[str, int] | None = None,
+    overall_started_at: float = 0.0,
+    overall_percent_base: float = 0.0,
+    overall_percent_range: float = 10.0,
+    **extra_fields: Any,
+) -> None:
+    """Step-based training with manual batching — keeps GPU busy longer."""
+    from trainer_lab.data.encoder import board_to_tensor
+    from trainer_lab.training.loss import GomokuLoss
+    from trainer_lab.training.metrics import policy_accuracy, value_mae
+
+    if not positions or max_steps <= 0:
+        return
+
+    # Pre-stack tensors on CPU with pin_memory
+    all_planes = torch.stack([board_to_tensor(p) for p in positions])
+    all_policy = torch.stack([torch.tensor(p["policy"], dtype=torch.float32) for p in positions])
+    all_value = torch.stack([torch.tensor([p["value"]], dtype=torch.float32) for p in positions])
+    if device.type == "cuda":
+        all_planes = all_planes.pin_memory()
+        all_policy = all_policy.pin_memory()
+        all_value = all_value.pin_memory()
+
+    n = all_planes.size(0)
+    criterion = GomokuLoss(weight_value=0.5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
+    use_amp = runtime_flags["mixedPrecision"] and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    model.train()
+
+    model_params = _count_model_parameters(model)
+    samples_seen = 0
+    last_gpu_probe = 0.0
+    last_emit_at = 0.0
+    live_gpu = get_gpu_info()
+    phase_start = time.monotonic()
+    step = 0
+    epoch = 0
+    cum_loss = cum_acc = cum_mae = 0.0
+    cum_samples = 0
+
+    while step < max_steps:
+        epoch += 1
+        perm = torch.randperm(n)
+        for bi_start in range(0, n, batch_size):
+            if step >= max_steps:
+                break
+            idx = perm[bi_start : bi_start + batch_size]
+            planes = all_planes[idx].to(device, non_blocking=True)
+            pol_t = all_policy[idx].to(device, non_blocking=True)
+            val_t = all_value[idx].to(device, non_blocking=True)
+            if device.type == "cuda":
+                planes = planes.contiguous(memory_format=torch.channels_last)
+
+            legal_mask = planes[:, 2].reshape(planes.size(0), -1)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits, vpred = model(planes)
+                loss, pl, vl = criterion(logits, vpred, pol_t, val_t, legal_mask=legal_mask)
+
+            if use_amp:
+                scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
+            else:
+                loss.backward(); optimizer.step()
+
+            step += 1
+            bs = planes.size(0)
+            acc = policy_accuracy(logits.detach(), pol_t, legal_mask=legal_mask)
+            mae = value_mae(vpred.detach(), val_t)
+            cum_loss += loss.item() * bs; cum_acc += acc * bs; cum_mae += mae * bs
+            cum_samples += bs; samples_seen += bs
+
+            a_loss = cum_loss / max(cum_samples, 1)
+            a_acc = (cum_acc / max(cum_samples, 1)) * 100.0
+            a_mae = cum_mae / max(cum_samples, 1)
+
+            now = time.monotonic()
+            if _should_emit_progress(now, last_emit_at, force=(step >= max_steps)):
+                live_gpu, last_gpu_probe = _maybe_refresh_gpu_info(now, last_gpu_probe, live_gpu)
+                telemetry = _extract_telemetry(live_gpu)
+                phase_elapsed = max(now - phase_start, 0.01)
+                sps = samples_seen / phase_elapsed
+                pct = overall_percent_base + overall_percent_range * (0.6 + 0.4 * step / max_steps)
+                elapsed = max(now - overall_started_at, 0.01)
+
+                cur_hist = metrics_history + [{"epoch": epoch, "loss": round(a_loss, 6), "acc": round(a_acc, 2), "mae": round(a_mae, 6)}]
+                await callback({
+                    "type": "train.progress",
+                    "payload": {
+                        "phase": phase, "stage": stage, "variant": extra_fields.get("variant", ""),
+                        "completedPhases": completed_phases or [],
+                        "iteration": iteration, "totalIterations": total_iterations,
+                        "selfPlayStats": selfplay_stats or {},
+                        "step": step, "totalSteps": max_steps,
+                        "epoch": epoch, "totalEpochs": max(1, (max_steps * batch_size) // max(n, 1)),
+                        "loss": round(a_loss, 6), "accuracy": round(a_acc, 2), "acc": round(a_acc, 2),
+                        "mae": round(a_mae, 6),
+                        "percent": round(pct, 1),
+                        "elapsed": round(elapsed, 1),
+                        "eta": round((phase_elapsed / step) * max(max_steps - step, 0), 1),
+                        "speed": round(sps, 2), "speedUnit": "samples/s",
+                        "samplesPerSec": round(sps, 2),
+                        "positions": len(positions),
+                        "batchSize": batch_size, "learningRate": 2e-3,
+                        "modelParams": model_params,
+                        "device": device.type, "deviceName": live_gpu.get("name", str(device)),
+                        "mixedPrecision": runtime_flags["mixedPrecision"],
+                        "tf32": runtime_flags["tf32"], "channelsLast": runtime_flags["channelsLast"],
+                        "metricsHistory": cur_hist, "gpu": live_gpu, **telemetry,
+                    },
+                })
+                last_emit_at = now
+                await asyncio.sleep(0)
+
+        # End-of-epoch metrics
+        if cum_samples > 0:
+            metrics_history.append({
+                "epoch": len(metrics_history) + 1,
+                "loss": round(cum_loss / cum_samples, 6),
+                "acc": round((cum_acc / cum_samples) * 100.0, 2),
+                "mae": round(cum_mae / cum_samples, 6),
+            })
+            cum_loss = cum_acc = cum_mae = 0.0
+            cum_samples = 0
+
+
 # ---------------------------------------------------------------------------
-# Curriculum training: Tactical → Bootstrap → MCTS
+# Curriculum training: Tactical → Supervised → Bootstrap → Self-Play
 # ---------------------------------------------------------------------------
 
 
@@ -1363,13 +1563,13 @@ async def train_variant(
     model = _maybe_compile_model(model, device, runtime_flags)
 
     # Curriculum parameters
-    bootstrap_games = int(kwargs.get("bootstrapGames", 40))
+    bootstrap_games = int(kwargs.get("bootstrapGames", 64))
     selfplay_iterations = int(kwargs.get("mctsIterations", 3))
-    selfplay_games = int(kwargs.get("mctsGamesPerIter", 20))
+    selfplay_games = int(kwargs.get("mctsGamesPerIter", 32))
     tactical_epochs = min(2, epochs)
     supervised_epochs = min(12, epochs) if board_size <= 5 else min(3, epochs)
-    bootstrap_epochs = min(3, epochs)
-    selfplay_epochs_per_iter = min(3, epochs)
+    bootstrap_steps = 500 if board_size <= 5 else 300
+    selfplay_steps_per_iter = 500 if board_size <= 5 else 300
 
     live_gpu = get_gpu_info()
     await callback({
@@ -1456,8 +1656,8 @@ async def train_variant(
         )
         all_positions.extend(bootstrap_positions)
 
-        await _run_training_epochs(
-            model, bootstrap_positions, bootstrap_epochs, batch_size, device, runtime_flags,
+        await _run_training_steps(
+            model, bootstrap_positions, bootstrap_steps, batch_size, device, runtime_flags,
             callback, metrics_history,
             phase="bootstrap", stage="training", completed_phases=completed_phases,
             selfplay_stats=bootstrap_stats,
@@ -1497,8 +1697,8 @@ async def train_variant(
             seed_positions=seed_replay,
             minimax_positions=minimax_positions,
         )
-        await _run_training_epochs(
-            model, train_pool, selfplay_epochs_per_iter, batch_size, device, runtime_flags,
+        await _run_training_steps(
+            model, train_pool, selfplay_steps_per_iter, batch_size, device, runtime_flags,
             callback, metrics_history,
             phase="self_play", stage="training", completed_phases=completed_phases,
             selfplay_stats=sp_stats,
@@ -1509,6 +1709,21 @@ async def train_variant(
             **common,
         )
         torch.save(model.state_dict(), model_path)
+
+        # Tactical accuracy eval
+        if board_size <= 9:
+            tac_acc = _compute_tactical_accuracy(model, board_size, win_len, device)
+            logger.info("Self-play %d/%d tactical accuracy: %.1f%%", it, selfplay_iterations, tac_acc)
+            await callback({
+                "type": "train.progress",
+                "payload": {
+                    "phase": "self_play", "stage": "eval", "variant": variant,
+                    "completedPhases": completed_phases or [],
+                    "iteration": it, "totalIterations": selfplay_iterations,
+                    "tacticalAccuracy": tac_acc,
+                    "message": f"Tactical accuracy: {tac_acc}%",
+                },
+            })
 
     # ── Done ───────────────────────────────────────────────────────────
     from gomoku_api.ws.predict_service import clear_cached_model
