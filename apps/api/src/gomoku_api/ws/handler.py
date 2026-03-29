@@ -38,6 +38,11 @@ async def _run_training(variant: str, cb, **kwargs):
         _active_train_tasks.pop(variant, None)
 
 
+def _is_training_active(variant: str) -> bool:
+    task = _active_train_tasks.get(variant)
+    return task is not None and not task.done()
+
+
 async def _send(ws: WebSocket, msg: dict) -> None:
     """Send JSON to websocket, ignoring errors if disconnected."""
     try:
@@ -110,6 +115,9 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         await _send(ws, {"type": "predict.result", "payload": result})
 
     elif msg_type in ("train_ttt3", "train"):
+        if _is_training_active("ttt3"):
+            await _send(ws, {"type": "train.rejected", "payload": {"variant": "ttt3", "reason": "already running"}})
+            return
         epochs = min(max(int(payload.get("epochs", 30)), 1), 50)
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 4096)
         cb = await _ws_callback(ws)
@@ -118,6 +126,9 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         await _send(ws, {"type": "train.accepted", "payload": {"variant": "ttt3"}})
 
     elif msg_type == "train_ttt5":
+        if _is_training_active("ttt5"):
+            await _send(ws, {"type": "train.rejected", "payload": {"variant": "ttt5", "reason": "already running"}})
+            return
         epochs = min(max(int(payload.get("epochs", 30)), 1), 60)
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 4096)
         cb = await _ws_callback(ws)
@@ -130,13 +141,16 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         await _send(ws, {"type": "train.accepted", "payload": {"variant": "ttt5"}})
 
     elif msg_type == "train_gomoku":
+        variant_g = payload.get("variant", "gomoku15")
+        if _is_training_active(variant_g):
+            await _send(ws, {"type": "train.rejected", "payload": {"variant": variant_g, "reason": "already running"}})
+            return
         epochs = min(max(int(payload.get("epochs", 30)), 1), 60)
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 4096)
-        variant = payload.get("variant", "gomoku15")
         cb = await _ws_callback(ws)
-        task = asyncio.create_task(_run_training(variant, cb, epochs=epochs, batch_size=batch_size, data_count=5000))
-        _active_train_tasks[variant] = task
-        await _send(ws, {"type": "train.accepted", "payload": {"variant": variant}})
+        task = asyncio.create_task(_run_training(variant_g, cb, epochs=epochs, batch_size=batch_size, data_count=5000))
+        _active_train_tasks[variant_g] = task
+        await _send(ws, {"type": "train.accepted", "payload": {"variant": variant_g}})
 
     elif msg_type == "generate_dataset":
         variant = payload.get("variant", "ttt5")

@@ -1630,11 +1630,12 @@ async def train_variant(
         tactical_shard = await _generate_tactical_curriculum_positions(
             tactical_shard_count, board_size, win_len, callback
         )
-        supervised_positions = tactical_shard + minimax_positions
-        random.shuffle(supervised_positions)
-        all_positions.extend(supervised_positions)
+        supervised_pool = tactical_shard + minimax_positions
+        random.shuffle(supervised_pool)
+        # NB: supervised_pool is NOT added to all_positions — minimax_positions
+        # are passed separately to _build_train_pool to avoid double-counting.
         await _run_training_epochs(
-            model, all_positions, supervised_epochs, batch_size, device, runtime_flags,
+            model, supervised_pool, supervised_epochs, batch_size, device, runtime_flags,
             callback, metrics_history,
             phase="supervised", stage="training", completed_phases=completed_phases,
             overall_started_at=started_at, overall_percent_base=10, overall_percent_range=10,
@@ -1685,16 +1686,13 @@ async def train_variant(
         )
         all_positions.extend(sp_positions)
 
-        # Train on recent + replay
+        # Train on recent + replay (tactical and minimax are separate buckets)
         replay_tail = all_positions[:-len(sp_positions)] if sp_positions else list(all_positions)
-        seed_replay = tactical_positions[: min(len(tactical_positions), max(data_count // 4, 256))]
-        if bootstrap_positions:
-            seed_replay = seed_replay + bootstrap_positions[: min(len(bootstrap_positions), max(data_count // 6, 128))]
         train_pool = _build_train_pool(
             sp_positions,
             replay_tail[-max(data_count, len(replay_tail) // 2):],
             data_count=data_count,
-            seed_positions=seed_replay,
+            seed_positions=tactical_positions,
             minimax_positions=minimax_positions,
         )
         await _run_training_steps(
