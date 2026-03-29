@@ -1,16 +1,17 @@
-"""FastAPI application factory."""
+"""FastAPI application factory with WebSocket support for legacy Vue client."""
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 from gomoku_api.config import settings
 from gomoku_api.routers import engine_router, health_router, training_router
 from gomoku_api.services.engine_adapter import EngineAdapter
 from gomoku_api.services.train_service import TrainService
+from gomoku_api.ws.handler import ws_handler
 
 
 @asynccontextmanager
@@ -40,6 +41,11 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(engine_router)
     app.include_router(training_router)
+
+    @app.websocket("/")
+    async def websocket_root(websocket: WebSocket):
+        """Legacy Vue.js client WebSocket endpoint (ws://host:port/)."""
+        await ws_handler(websocket)
 
     return app
 
