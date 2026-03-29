@@ -92,11 +92,11 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeResponse(BaseModel):
     best_move: int = Field(..., alias="bestMove")
     value: float = Field(..., ge=-1, le=1)
-    confidence: float = Field(..., ge=0, le=1)
+    confidence: float = Field(0.0, ge=0, le=1)
     source: EngineSource
-    depth: int = Field(..., ge=0)
-    nodes_searched: int = Field(..., ge=0, alias="nodesSearched")
-    time_ms: int = Field(..., ge=0, alias="timeMs")
+    depth: int = Field(0, ge=0)
+    nodes_searched: int = Field(0, ge=0, alias="nodesSearched")
+    time_ms: float = Field(0, ge=0, alias="timeMs")
     top_moves: list[MoveCandidate] = Field(default_factory=list, alias="topMoves")
     pv_line: list[int] = Field(default_factory=list, alias="pvLine")
     policy: Optional[list[float]] = None

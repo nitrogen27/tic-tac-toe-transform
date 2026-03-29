@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 import shutil
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,7 +35,8 @@ class EngineAdapter:
     _available: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
-        self._available = shutil.which(self.binary_path) is not None
+        binary = Path(self.binary_path)
+        self._available = binary.is_file() or shutil.which(self.binary_path) is not None
 
     @property
     def available(self) -> bool:
@@ -51,11 +53,24 @@ class EngineAdapter:
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Send a JSON command to the engine binary via stdin and read JSON from stdout."""
+        # Build position payload matching the C++ CLI protocol
+        pos_data = position.model_dump(by_alias=True)
+        cli_position = {
+            "boardSize": pos_data["boardSize"],
+            "winLength": pos_data["winLength"],
+            "cells": pos_data["cells"],
+            "sideToMove": pos_data["currentPlayer"],
+            "moveCount": sum(1 for c in pos_data["cells"] if c != 0),
+            "lastMove": pos_data.get("lastMove", -1),
+            "moveHistory": [],
+        }
         payload = {
             "command": command,
-            "position": position.model_dump(by_alias=True),
-            "options": options or {},
+            "position": cli_position,
         }
+        if options:
+            payload["options"] = options
+            payload.update(options)
         stdin_bytes = json.dumps(payload).encode()
 
         if not self._available:
@@ -103,17 +118,26 @@ class EngineAdapter:
     # High-level helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_source(source: str) -> str:
+        """Map engine source strings (e.g. 'alpha-beta') to enum values ('alpha_beta')."""
+        return source.replace("-", "_")
+
     async def analyze(self, req: AnalyzeRequest) -> AnalyzeResponse:
         raw = await self.execute(
             "analyze",
             req.position,
             {"topK": req.top_k, "timeLimitMs": req.time_limit_ms, "includePv": req.include_pv},
         )
+        raw["source"] = self._normalize_source(raw.get("source", "alpha_beta"))
+        raw.setdefault("confidence", 0.0)
+        raw["timeMs"] = int(raw.get("timeMs", 0))
+        raw.setdefault("topMoves", raw.get("hints", []))
         return AnalyzeResponse(**raw)
 
     async def best_move(self, req: BestMoveRequest) -> BestMoveResponse:
         raw = await self.execute(
-            "best_move",
+            "best-move",
             req.position,
             {"timeLimitMs": req.time_limit_ms},
         )
@@ -124,16 +148,19 @@ class EngineAdapter:
             row=move // bs,
             col=move % bs,
             value=raw.get("value", 0.0),
-            source=EngineSource(raw.get("source", "alpha_beta")),
+            source=EngineSource(self._normalize_source(raw.get("source", "alpha_beta"))),
         )
 
     async def suggest(self, req: SuggestRequest) -> SuggestResponse:
         raw = await self.execute(
             "suggest",
             req.position,
-            {"topK": req.top_k},
+            {"topN": req.top_k},
         )
-        candidates = [MoveCandidate(**m) for m in raw.get("topMoves", raw.get("suggestions", []))]
+        candidates = [
+            MoveCandidate(**m)
+            for m in raw.get("hints", raw.get("topMoves", raw.get("suggestions", [])))
+        ]
         return SuggestResponse(suggestions=candidates)
 
     def info(self) -> EngineInfo:
