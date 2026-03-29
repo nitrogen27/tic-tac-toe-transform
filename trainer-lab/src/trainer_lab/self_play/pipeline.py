@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from trainer_lab.config import ModelConfig, TrainConfig, SelfPlayConfig
 from trainer_lab.data.encoder import board_to_tensor
+from trainer_lab.data.policy import pad_policy_target
 from trainer_lab.evaluation.eval_script import evaluate_vs_random
 from trainer_lab.export.onnx_export import export_to_onnx
 from trainer_lab.models.resnet import PolicyValueResNet
@@ -118,7 +119,7 @@ class SelfPlayPipeline:
         for p in positions:
             tensor = board_to_tensor(p)
             planes_list.append(tensor)
-            policy_list.append(torch.tensor(p["policy"], dtype=torch.float32))
+            policy_list.append(pad_policy_target(p["policy"], p["board_size"], self.model_cfg.board_max))
             value_list.append(torch.tensor([p["value"]], dtype=torch.float32))
 
         dataset = TensorDataset(

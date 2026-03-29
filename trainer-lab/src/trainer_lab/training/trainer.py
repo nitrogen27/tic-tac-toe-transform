@@ -50,13 +50,14 @@ def train_epoch(
         planes, policy_target, value_target = _to_device(
             (planes, policy_target, value_target), device
         )
+        legal_mask = planes[:, 2].reshape(planes.size(0), -1)
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp and device.type == "cuda"):
             policy_logits, value_pred = model(planes)
             loss, ploss, vloss = criterion(
-                policy_logits, value_pred, policy_target, value_target
+                policy_logits, value_pred, policy_target, value_target, legal_mask=legal_mask
             )
 
         if scaler is not None and device.type == "cuda":
@@ -70,7 +71,7 @@ def train_epoch(
         total_loss += loss.item()
         total_ploss += ploss.item()
         total_vloss += vloss.item()
-        total_pacc += policy_accuracy(policy_logits.detach(), policy_target)
+        total_pacc += policy_accuracy(policy_logits.detach(), policy_target, legal_mask=legal_mask)
         total_vmae += value_mae(value_pred.detach(), value_target)
         n_batches += 1
 

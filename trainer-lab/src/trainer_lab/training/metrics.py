@@ -8,6 +8,7 @@ import torch
 def policy_accuracy(
     policy_logits: torch.Tensor,
     policy_target: torch.Tensor,
+    legal_mask: torch.Tensor | None = None,
 ) -> float:
     """Top-1 accuracy: fraction of samples where argmax(logits) == argmax(target).
 
@@ -16,6 +17,8 @@ def policy_accuracy(
     policy_logits : [B, 256]
     policy_target : [B, 256]
     """
+    if legal_mask is not None:
+        policy_logits = policy_logits + (1.0 - legal_mask) * (-1e8)
     pred = policy_logits.argmax(dim=1)
     label = policy_target.argmax(dim=1)
     return (pred == label).float().mean().item()

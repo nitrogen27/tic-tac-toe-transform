@@ -39,6 +39,10 @@ def _prepare_runtime(device: torch.device) -> dict[str, bool]:
 def _maybe_compile_model(model: PolicyValueResNet, device: torch.device, runtime: dict[str, bool]) -> PolicyValueResNet:
     if device.type != "cuda" or not hasattr(torch, "compile"):
         return model
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return model
     compile_mode = "reduce-overhead"
     try:
         compiled = torch.compile(model, mode=compile_mode, fullgraph=False)

@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from trainer_lab.data.encoder import board_to_tensor
+from trainer_lab.data.policy import pad_policy_target
 from trainer_lab.data.augmentation import augment_sample
 
 
@@ -45,7 +46,7 @@ class PositionDataset(Dataset):
                 records = json.load(f)
             for rec in records:
                 planes = board_to_tensor(rec)
-                policy = torch.tensor(rec["policy"], dtype=torch.float32)
+                policy = pad_policy_target(rec["policy"], rec["board_size"])
                 value = torch.tensor(rec["value"], dtype=torch.float32)
 
                 if self.augment:

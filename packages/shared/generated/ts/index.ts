@@ -3,9 +3,11 @@
 export const schemaRegistry = {
   analyze_request: "schemas/analyze-request.schema.json",
   analyze_response: "schemas/analyze-response.schema.json",
-  model_artifact: "schemas/model-artifact.schema.json",
+  analyze: "schemas/analyze.schema.json",
+  enums: "schemas/enums.schema.json",
+  model_artifact: "schemas/model_artifact.schema.json",
   position: "schemas/position.schema.json",
-  train_job: "schemas/train-job.schema.json",
+  train_job: "schemas/train_job.schema.json",
 } as const;
 
 export type SchemaName = keyof typeof schemaRegistry;
