@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from pathlib import Path
 
 from gomoku_api.ws import predict_service
 
@@ -83,3 +84,102 @@ def test_model_predict_creates_forcing_threat_when_policy_prefers_quiet_move(mon
     assert result["tacticalReason"] == "create_forcing_threat"
     assert result["tacticalOverride"] is True
     assert result["forcingThreatsAfterMove"] >= 2
+
+
+def test_model_predict_uses_value_head_when_safe_moves_are_tactically_equal(monkeypatch) -> None:
+    board = [
+        1, 0, 0, 0, 0,
+        0, 2, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 2, 0,
+        0, 0, 0, 0, 1,
+    ]
+    logits = [-8.0] * 256
+    logits[_policy_index(1)] = 10.0   # policy prefers move 1
+    logits[_policy_index(12)] = 6.0   # but value will prefer center move 12
+    model = DummyModel(logits)
+    monkeypatch.setattr(predict_service, "_get_model", lambda variant: model)
+    monkeypatch.setattr(
+        predict_service,
+        "_evaluate_afterstate_values",
+        lambda model, board, current, board_size, candidate_moves: {move: (0.9 if move == 12 else -0.2) for move in candidate_moves},
+    )
+
+    result = predict_service._model_predict(board, current=1, variant="ttt5", board_size=5)
+
+    assert result["move"] == 12
+    assert result["tacticalReason"] == "policy_value"
+    assert result["valueGuided"] is True
+    assert result["afterstateValue"] == 0.9
+
+
+def test_model_predict_pure_mode_skips_hybrid_tactical_override(monkeypatch) -> None:
+    board = [
+        2, 0, 0, 0, 0,
+        2, 0, 0, 0, 0,
+        2, 0, 1, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+    ]
+    logits = [-8.0] * 256
+    logits[_policy_index(24)] = 10.0
+    logits[_policy_index(15)] = 1.0
+    model = DummyModel(logits)
+    monkeypatch.setattr(predict_service, "_get_model", lambda variant: model)
+    monkeypatch.setattr(
+        predict_service,
+        "_evaluate_afterstate_values",
+        lambda model, board, current, board_size, candidate_moves: {move: (0.9 if move == 24 else -0.1) for move in candidate_moves},
+    )
+
+    result = predict_service._model_predict(board, current=1, variant="ttt5", board_size=5, decision_mode="pure")
+
+    assert result["move"] == 24
+    assert result["decisionMode"] == "pure"
+    assert result["tacticalReason"] in {"model_policy", "policy_value"}
+    assert result["tacticalOverride"] is False
+
+
+def test_model_predict_pure_mode_without_checkpoint_does_not_use_strong_tactical_fallback(monkeypatch) -> None:
+    board = [
+        2, 0, 0, 0, 0,
+        2, 0, 0, 0, 0,
+        2, 0, 1, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+    ]
+    monkeypatch.setattr(predict_service, "_get_model", lambda variant: None)
+
+    result = predict_service._model_predict(board, current=1, variant="ttt5", board_size=5, decision_mode="pure")
+
+    assert result["decisionMode"] == "pure"
+    assert result["fallback"] is True
+    assert result["tacticalReason"] == "no_model_checkpoint"
+    assert result["move"] != 15
+
+
+def test_get_model_falls_back_to_candidate_checkpoint(tmp_path, monkeypatch) -> None:
+    saved_dir = tmp_path / "saved"
+    variant_dir = saved_dir / "ttt5_resnet"
+    variant_dir.mkdir(parents=True)
+
+    from trainer_lab.config import ModelConfig
+    from trainer_lab.models.resnet import PolicyValueResNet
+
+    cfg = ModelConfig()
+    model = PolicyValueResNet(
+        in_channels=cfg.in_channels,
+        res_filters=96,
+        res_blocks=8,
+        policy_filters=cfg.policy_filters,
+        value_fc=160,
+        board_max=cfg.board_max,
+    )
+    torch.save(model.state_dict(), variant_dir / "candidate.pt")
+
+    monkeypatch.setattr(predict_service, "SAVED_DIR", Path(saved_dir))
+    predict_service.clear_cached_model("ttt5")
+
+    loaded = predict_service._get_model("ttt5")
+
+    assert loaded is not None

@@ -7,6 +7,7 @@ import pytest
 from gomoku_api.ws.train_service_ws import (
     _build_repair_pool,
     _build_train_pool,
+    _checkpoint_selection_score,
     _choose_rapid_cycle_strategy,
     _compute_target_sanity_metrics,
     _merge_failure_bank,
@@ -15,6 +16,7 @@ from gomoku_api.ws.train_service_ws import (
     _policy_cell_index,
     _resolve_engine_sampling_bounds,
     _sample_engine_position,
+    _soft_policy_from_engine_hints,
     _variant_model_hparams,
 )
 from trainer_lab.config import ModelConfig
@@ -225,3 +227,52 @@ def test_choose_rapid_cycle_strategy_biases_engine_generation_toward_midgame() -
     assert strategy["engineCount"] > 50
     assert strategy["tacticalRatio"] <= 0.35
     assert strategy["failureSlice"] == 384
+
+
+def test_soft_policy_from_engine_hints_creates_distribution_not_one_hot() -> None:
+    board = [0] * 25
+    hints = [
+        {"move": 12, "score": 10.0},
+        {"move": 7, "score": 9.0},
+        {"move": 17, "score": 8.5},
+    ]
+
+    policy = _soft_policy_from_engine_hints(12, board, 5, hints)
+
+    assert abs(sum(policy) - 1.0) < 1e-6
+    assert policy[(12 // 5) * 16 + (12 % 5)] > policy[(17 // 5) * 16 + (17 % 5)] > 0.0
+    assert sum(1 for value in policy if value > 0) >= 3
+
+
+def test_checkpoint_selection_score_prefers_decisive_wins_over_draw_heavy_line() -> None:
+    draw_heavy = {
+        "winrate": 0.25,
+        "decisiveWinRate": 0.0,
+        "drawRate": 0.5,
+    }
+    winning = {
+        "winrate": 0.5,
+        "decisiveWinRate": 0.5,
+        "drawRate": 0.0,
+    }
+
+    assert _checkpoint_selection_score(winning, 9) > _checkpoint_selection_score(draw_heavy, 9)
+
+
+def test_checkpoint_selection_score_uses_side_balance_as_tiebreaker() -> None:
+    skewed = {
+        "winrate": 0.5,
+        "decisiveWinRate": 0.5,
+        "drawRate": 0.0,
+        "winrateAsP1": 0.75,
+        "winrateAsP2": 0.25,
+    }
+    balanced = {
+        "winrate": 0.5,
+        "decisiveWinRate": 0.5,
+        "drawRate": 0.0,
+        "winrateAsP1": 0.5,
+        "winrateAsP2": 0.5,
+    }
+
+    assert _checkpoint_selection_score(balanced, 9) > _checkpoint_selection_score(skewed, 9)

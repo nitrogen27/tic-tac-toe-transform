@@ -11,6 +11,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from gomoku_api.ws.game_service import GameService
 from gomoku_api.ws.gpu_info import get_gpu_info
+from gomoku_api.ws.commentary_service import analyze_move_commentary
 from gomoku_api.ws.predict_service import predict
 from gomoku_api.ws.offline_gen import generate_engine_dataset, generate_minimax_dataset
 from gomoku_api.ws.training_diagnostics import run_training_diagnostics
@@ -124,8 +125,20 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         current = payload.get("current", 1)
         mode = payload.get("mode", "model")
         variant = payload.get("variant", None)
-        result = await predict(board, current, mode, variant)
+        decision_mode = payload.get("modelDecisionMode", payload.get("decisionMode", "hybrid"))
+        result = await predict(board, current, mode, variant, model_decision_mode=decision_mode)
         await _send(ws, {"type": "predict.result", "payload": result})
+
+    elif msg_type == "comment_move":
+        result = analyze_move_commentary(
+            payload.get("boardBefore", []),
+            int(payload.get("move", -1)),
+            int(payload.get("current", 1)),
+            variant=payload.get("variant"),
+            style=str(payload.get("style", "coach")),
+            actor=str(payload.get("actor", "player")),
+        )
+        await _send(ws, {"type": "commentary.result", "payload": result})
 
     elif msg_type in ("train_ttt3", "train"):
         if _is_training_active("ttt3"):

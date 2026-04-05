@@ -164,12 +164,98 @@ def _uniform_legal_probs(board: list[int]) -> list[float]:
     return [p if cell == 0 else 0.0 for cell in board]
 
 
+def _pure_fallback_move(board: list[int]) -> tuple[int, list[float]]:
+    probs_raw = _uniform_legal_probs(board)
+    legal = [idx for idx, cell in enumerate(board) if cell == 0]
+    if not legal:
+        return -1, probs_raw
+    # Honest pure fallback: no tactical help if there is no checkpoint.
+    return legal[0], probs_raw
+
+
+def _evaluate_afterstate_values(
+    model: Any,
+    board: list[int],
+    current: int,
+    board_size: int,
+    candidate_moves: list[int],
+) -> dict[int, float]:
+    from trainer_lab.data.encoder import board_to_tensor
+
+    if not candidate_moves:
+        return {}
+
+    device = next(model.parameters()).device
+    opponent = 2 if current == 1 else 1
+    tensors: list[torch.Tensor] = []
+    for move in candidate_moves:
+        after = list(board)
+        after[move] = current
+        pos_dict = {
+            "board_size": board_size,
+            "board": _flat_to_board2d(after, board_size, opponent),
+            "current_player": 1,
+            "last_move": list(divmod(move, board_size)),
+        }
+        tensors.append(board_to_tensor(pos_dict))
+
+    batch = torch.stack(tensors, dim=0).to(device)
+    if device.type == "cuda":
+        batch = batch.contiguous(memory_format=torch.channels_last)
+
+    model.eval()
+    with torch.inference_mode():
+        _, values = model(batch)
+
+    values_cpu = values.view(-1).detach().cpu().tolist()
+    # Values are from the next side-to-move perspective (opponent), so negate.
+    return {
+        move: float(max(-1.0, min(1.0, -value)))
+        for move, value in zip(candidate_moves, values_cpu)
+    }
+
+
+def _select_policy_value_move(
+    board: list[int],
+    probs_raw: list[float],
+    value_scores: dict[int, float] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    legal = [idx for idx, cell in enumerate(board) if cell == 0]
+    if not legal:
+        return -1, {
+            "tacticalReason": "no_legal_moves",
+            "tacticalOverride": False,
+            "valueGuided": False,
+            "unsafeMovesFiltered": 0,
+        }
+
+    value_scores = value_scores or {}
+    best_move = max(
+        legal,
+        key=lambda move: (
+            float(value_scores.get(move, 0.0)),
+            probs_raw[move],
+        ),
+    )
+    model_best = max(legal, key=lambda move: probs_raw[move])
+    used_value = abs(float(value_scores.get(best_move, 0.0))) > 1e-6
+    reason = "policy_value" if used_value and best_move != model_best else "model_policy"
+    return best_move, {
+        "tacticalReason": reason,
+        "tacticalOverride": False,
+        "valueGuided": used_value,
+        "afterstateValue": round(float(value_scores.get(best_move, 0.0)), 4),
+        "unsafeMovesFiltered": 0,
+    }
+
+
 def _select_threat_aware_move(
     board: list[int],
     current: int,
     board_size: int,
     win_len: int,
     probs_raw: list[float],
+    value_scores: dict[int, float] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Choose a move using model probabilities plus hard tactical safety rules.
 
@@ -236,6 +322,7 @@ def _select_threat_aware_move(
             "opponentForkResponses": opponent_fork_responses,
             "selfImmediateWinsNext": len(self_immediate_next),
             "modelProb": probs_raw[move],
+            "afterstateValue": float((value_scores or {}).get(move, 0.0)),
         }
 
         key = (
@@ -246,6 +333,7 @@ def _select_threat_aware_move(
             -len(opp_immediate_wins),
             -opponent_fork_responses,
             len(self_immediate_next),
+            evaluation["afterstateValue"],
             probs_raw[move],
         )
         if best_key is None or key > best_key:
@@ -266,6 +354,8 @@ def _select_threat_aware_move(
         reason = "block_immediate"
     elif best_eval["createsFork"]:
         reason = "create_forcing_threat"
+    elif best_eval["safeNow"] and best_eval["safeVsFork"] and abs(best_eval["afterstateValue"]) > 1e-6 and best_move != model_best:
+        reason = "policy_value"
     elif best_eval["safeNow"] and best_eval["safeVsFork"] and best_move != model_best:
         reason = "reject_unsafe_model_move"
     elif not best_eval["safeNow"] or not best_eval["safeVsFork"]:
@@ -281,6 +371,81 @@ def _select_threat_aware_move(
         "forcingThreatsAfterMove": best_eval["selfImmediateWinsNext"],
         "opponentThreatsAfterMove": best_eval["opponentImmediateWins"],
         "opponentForkResponses": best_eval["opponentForkResponses"],
+        "valueGuided": reason == "policy_value",
+        "afterstateValue": round(best_eval["afterstateValue"], 4),
+    }
+
+
+def _loaded_model_decision(
+    board: list[int],
+    current: int,
+    board_size: int,
+    win_length: int,
+    model: Any,
+    *,
+    decision_mode: str = "hybrid",
+) -> dict[str, Any]:
+    """Run the shared loaded-model decision path used by predict and arena.
+
+    This keeps arena/confirm evaluation aligned with the real bot behavior:
+    the same board encoding, policy softmax, afterstate value scoring, and
+    hybrid/pure move selection logic are used everywhere.
+    """
+    from trainer_lab.data.encoder import board_to_tensor
+
+    resolved_mode = "pure" if str(decision_mode).strip().lower() == "pure" else "hybrid"
+    pos_dict = {
+        "board_size": board_size,
+        "board": _flat_to_board2d(board, board_size, current),
+        "current_player": 1,
+        "last_move": None,
+    }
+    tensor = board_to_tensor(pos_dict).unsqueeze(0)
+    device = next(model.parameters()).device
+    tensor = tensor.to(device)
+    if device.type == "cuda":
+        tensor = tensor.contiguous(memory_format=torch.channels_last)
+
+    model.eval()
+    with torch.inference_mode():
+        policy_logits, value = model(tensor)
+
+    logits = policy_logits.squeeze(0).cpu()
+    legal_flat = [i for i, v in enumerate(board) if v == 0]
+    probs_raw = [0.0] * len(board)
+
+    mask = torch.full_like(logits, float("-inf"))
+    for idx in legal_flat:
+        r, c = divmod(idx, board_size)
+        mask[r * 16 + c] = 0.0
+    probs_tensor = F.softmax(logits + mask, dim=0)
+
+    for idx in legal_flat:
+        r, c = divmod(idx, board_size)
+        probs_raw[idx] = probs_tensor[r * 16 + c].item()
+
+    value_scores = _evaluate_afterstate_values(model, board, current, board_size, legal_flat)
+    if resolved_mode == "pure":
+        best_move, tactical_meta = _select_policy_value_move(board, probs_raw, value_scores=value_scores)
+    else:
+        best_move, tactical_meta = _select_threat_aware_move(
+            board,
+            current,
+            board_size,
+            win_length,
+            probs_raw,
+            value_scores=value_scores,
+        )
+    confidence = probs_raw[best_move] if best_move >= 0 else 0.0
+
+    return {
+        "move": best_move,
+        "confidence": round(confidence, 4),
+        "probs": [round(p, 6) for p in probs_raw],
+        "decisionMode": resolved_mode,
+        "value": round(value.item(), 4),
+        "afterstateValue": round(value_scores.get(best_move, 0.0), 4) if best_move >= 0 else 0.0,
+        **tactical_meta,
     }
 
 
@@ -369,9 +534,14 @@ def _get_model(variant: str):
     if variant in _loaded_models:
         return _loaded_models[variant]
 
-    # Prefer champion.pt (verified model), fall back to legacy model.pt
+    # Prefer champion.pt (verified model), then candidate.pt (latest trained
+    # model), then legacy model.pt. This keeps pure-model mode usable even
+    # when a fresh training run has produced only candidate.pt and promotion
+    # has not happened yet.
     variant_dir = SAVED_DIR / f"{variant}_resnet"
     model_path = variant_dir / "champion.pt"
+    if not model_path.exists():
+        model_path = variant_dir / "candidate.pt"
     if not model_path.exists():
         model_path = variant_dir / "model.pt"
     if not model_path.exists():
@@ -422,68 +592,59 @@ def _get_model(variant: str):
         return None
 
 
-def _model_predict(board: list[int], current: int, variant: str, board_size: int) -> dict:
+def _model_predict(
+    board: list[int],
+    current: int,
+    variant: str,
+    board_size: int,
+    *,
+    decision_mode: str = "hybrid",
+) -> dict:
     """Use PyTorch model for prediction."""
     win_length = 4 if board_size == 5 else 5
     if variant == "ttt3":
         win_length = 3
+    resolved_mode = "pure" if str(decision_mode).strip().lower() == "pure" else "hybrid"
     model = _get_model(variant)
     if model is None:
-        probs_raw = _uniform_legal_probs(board)
-        best_move, tactical_meta = _select_threat_aware_move(board, current, board_size, win_length, probs_raw)
+        if resolved_mode == "pure":
+            best_move, probs_raw = _pure_fallback_move(board)
+            tactical_meta = {
+                "tacticalReason": "no_model_checkpoint",
+                "tacticalOverride": False,
+                "valueGuided": False,
+                "unsafeMovesFiltered": 0,
+                "afterstateValue": 0.0,
+            }
+        else:
+            probs_raw = _uniform_legal_probs(board)
+            best_move, tactical_meta = _select_threat_aware_move(board, current, board_size, win_length, probs_raw)
         return {
             "move": best_move,
             "confidence": round(probs_raw[best_move], 4) if best_move >= 0 else 0.0,
             "probs": [round(p, 6) for p in probs_raw],
             "mode": "model",
-            "isRandom": False,
+            "isRandom": resolved_mode == "pure",
             "fallback": True,
+            "decisionMode": resolved_mode,
             **tactical_meta,
         }
 
     try:
-        from trainer_lab.data.encoder import board_to_tensor
-
-        pos_dict = {
-            "board_size": board_size,
-            "board": _flat_to_board2d(board, board_size, current),
-            "current_player": 1,
-            "last_move": None,
-        }
-        tensor = board_to_tensor(pos_dict).unsqueeze(0)
-        device = next(model.parameters()).device
-        tensor = tensor.to(device)
-
-        with torch.inference_mode():
-            policy_logits, value = model(tensor)
-
-        logits = policy_logits.squeeze(0).cpu()
-        # Mask to valid cells only (board uses 16×16 padded grid)
-        legal_flat = [i for i, v in enumerate(board) if v == 0]
-        probs_raw = [0.0] * len(board)
-
-        mask = torch.full_like(logits, float("-inf"))
-        for idx in legal_flat:
-            r, c = divmod(idx, board_size)
-            mask[r * 16 + c] = 0.0
-        probs_tensor = F.softmax(logits + mask, dim=0)
-
-        for idx in legal_flat:
-            r, c = divmod(idx, board_size)
-            probs_raw[idx] = probs_tensor[r * 16 + c].item()
-
-        best_move, tactical_meta = _select_threat_aware_move(board, current, board_size, win_length, probs_raw)
-        confidence = probs_raw[best_move] if best_move >= 0 else 0.0
+        selection = _loaded_model_decision(
+            board,
+            current,
+            board_size,
+            win_length,
+            model,
+            decision_mode=resolved_mode,
+        )
 
         return {
-            "move": best_move,
-            "confidence": round(confidence, 4),
-            "probs": [round(p, 6) for p in probs_raw],
             "mode": "model",
             "isRandom": False,
             "fallback": False,
-            "value": round(value.item(), 4),
-            **tactical_meta,
+            **selection,
         }
     except Exception as exc:
         logger.error("Model predict error: %s", exc)
@@ -496,6 +657,7 @@ def _model_predict(board: list[int], current: int, variant: str, board_size: int
             "mode": "model",
             "isRandom": False,
             "fallback": True,
+            "decisionMode": resolved_mode,
             **tactical_meta,
         }
 
@@ -509,7 +671,13 @@ def clear_cached_model(variant: str) -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def predict(board: list[int], current: int, mode: str = "model", variant: str | None = None) -> dict:
+async def predict(
+    board: list[int],
+    current: int,
+    mode: str = "model",
+    variant: str | None = None,
+    model_decision_mode: str = "hybrid",
+) -> dict:
     """Predict next move. Dispatches to minimax, C++ engine, or PyTorch model."""
     n = len(board)
 
@@ -545,4 +713,4 @@ async def predict(board: list[int], current: int, mode: str = "model", variant: 
         else:
             return await _engine_predict(board, current, board_size, win_length)
     else:
-        return _model_predict(board, current, variant, board_size)
+        return _model_predict(board, current, variant, board_size, decision_mode=model_decision_mode)

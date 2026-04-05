@@ -1,10 +1,12 @@
 """Arena evaluation: model vs model and model vs algorithm.
 
-Quick Arena (model vs model): 8-16 paired games, greedy policy, fast.
+Quick Arena (model vs model): 8-16 paired games, fast.
 Strong Arena (model vs engine): 10-20 paired games, uses persistent C++ engine.
 
 Paired matches ensure fairness: each pair = 2 games with swapped sides.
-All games use greedy (argmax) policy with tactical overrides (win/block).
+All games use the same policy + value + tactical decision path as the real bot,
+so confirm/quick evaluation measures the deployed behavior instead of a stale
+greedy-policy approximation.
 """
 
 from __future__ import annotations
@@ -16,9 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 import torch
-import torch.nn.functional as F
-
-from trainer_lab.data.encoder import board_to_tensor
+from gomoku_api.ws.predict_service import _loaded_model_decision
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,24 @@ class ArenaResult:
             return 0.0
         return (self.wins_b + 0.5 * self.draws) / self.total
 
+    @property
+    def decisive_winrate_a(self) -> float:
+        if self.total == 0:
+            return 0.0
+        return self.wins_a / self.total
+
+    @property
+    def decisive_winrate_b(self) -> float:
+        if self.total == 0:
+            return 0.0
+        return self.wins_b / self.total
+
+    @property
+    def draw_rate(self) -> float:
+        if self.total == 0:
+            return 0.0
+        return self.draws / self.total
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "winsA": self.wins_a,
@@ -54,24 +72,15 @@ class ArenaResult:
             "total": self.total,
             "winrateA": round(self.winrate_a, 4),
             "winrateB": round(self.winrate_b, 4),
+            "decisiveWinrateA": round(self.decisive_winrate_a, 4),
+            "decisiveWinrateB": round(self.decisive_winrate_b, 4),
+            "drawRate": round(self.draw_rate, 4),
         }
 
 
 # ---------------------------------------------------------------------------
 # Board helpers (reuse patterns from train_service_ws)
 # ---------------------------------------------------------------------------
-
-
-def _flat_to_board2d(board: list[int], board_size: int) -> list[list[int]]:
-    return [
-        [board[row * board_size + col] for col in range(board_size)]
-        for row in range(board_size)
-    ]
-
-
-def _policy_cell_index(flat_index: int, board_size: int) -> int:
-    row, col = divmod(flat_index, board_size)
-    return row * 16 + col
 
 
 def _nxn_winner(board: list[int], n: int, win_len: int, last_move: int) -> int:
@@ -126,44 +135,35 @@ def _model_greedy_move(
     model: torch.nn.Module,
     device: torch.device,
 ) -> int:
-    """Select a move using greedy argmax from model policy + tactical overrides."""
-    legal = [i for i, c in enumerate(board) if c == 0]
-    if not legal:
-        return -1
+    """Select a move using the same decision path as predict_service."""
+    selection = _model_greedy_decision(
+        board,
+        board_size,
+        win_len,
+        current,
+        model,
+        device,
+    )
+    return int(selection.get("move", -1))
 
-    # Tactical overrides first
-    winning = _find_immediate_move(board, board_size, win_len, current)
-    if winning is not None:
-        return winning
-    opponent = 2 if current == 1 else 1
-    blocking = _find_immediate_move(board, board_size, win_len, opponent)
-    if blocking is not None:
-        return blocking
 
-    # Model inference
-    board_2d = _flat_to_board2d(board, board_size)
-    pos_dict = {
-        "board_size": board_size,
-        "board": board_2d,
-        "current_player": current,
-        "last_move": None,
-    }
-    planes = board_to_tensor(pos_dict).unsqueeze(0).to(device)
-    if device.type == "cuda":
-        planes = planes.contiguous(memory_format=torch.channels_last)
-
-    model.eval()
-    with torch.inference_mode():
-        logits, _ = model(planes)
-
-    logits = logits.squeeze(0).cpu()
-    mask = torch.full_like(logits, float("-inf"))
-    for m in legal:
-        mask[_policy_cell_index(m, board_size)] = 0.0
-    probs = F.softmax(logits + mask, dim=0)
-
-    best = max(legal, key=lambda m: probs[_policy_cell_index(m, board_size)].item())
-    return best
+def _model_greedy_decision(
+    board: list[int],
+    board_size: int,
+    win_len: int,
+    current: int,
+    model: torch.nn.Module,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Return the full shared decision payload used by the real bot."""
+    return _loaded_model_decision(
+        board,
+        current,
+        board_size,
+        win_len,
+        model,
+        decision_mode="hybrid",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +274,8 @@ async def arena_match(
                     "arenaLosses": wins_champion,
                     "arenaDraws": draws,
                     "winrateVsChampion": round((wins_candidate + 0.5 * draws) / max(games_done, 1), 4),
+                    "decisiveWinRate": round(wins_candidate / max(games_done, 1), 4),
+                    "drawRate": round(draws / max(games_done, 1), 4),
                     "elapsed": round(elapsed, 1),
                 },
             })
@@ -375,6 +377,8 @@ async def arena_vs_algorithm(
                     "arenaLosses": wins_engine,
                     "arenaDraws": draws,
                     "winrateVsAlgorithm": round((wins_candidate + 0.5 * draws) / max(games_done, 1), 4),
+                    "decisiveWinRate": round(wins_candidate / max(games_done, 1), 4),
+                    "drawRate": round(draws / max(games_done, 1), 4),
                     "elapsed": round(elapsed, 1),
                 },
             })

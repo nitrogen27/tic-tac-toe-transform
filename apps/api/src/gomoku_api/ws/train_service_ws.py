@@ -54,6 +54,36 @@ def _count_model_parameters(model: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
 
 
+def _clone_model_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def _restore_model_state_dict(model: torch.nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    model.load_state_dict(state_dict)
+
+
+def _checkpoint_selection_score(summary: dict[str, Any], cycle: int) -> tuple[float, float, float, float, int]:
+    """Rank candidate checkpoints by actual game strength.
+
+    Priority:
+    1. decisive wins first,
+    2. then total winrate,
+    3. then balanced strength across both sides,
+    4. then lower draw rate,
+    5. then later cycle as a tie-break.
+    """
+    decisive = float(summary.get("decisiveWinRate", 0.0) or 0.0)
+    winrate = float(summary.get("winrate", 0.0) or 0.0)
+    winrate_as_p1 = float(summary.get("winrateAsP1", winrate) or winrate)
+    winrate_as_p2 = float(summary.get("winrateAsP2", winrate) or winrate)
+    balanced_side = min(winrate_as_p1, winrate_as_p2)
+    draw_rate = float(summary.get("drawRate", 0.0) or 0.0)
+    return (decisive, winrate, balanced_side, -draw_rate, int(cycle))
+
+
 def _variant_model_hparams(board_size: int, cfg: Any, *, variant: str = "", model_profile: str | None = None, manifest: dict[str, Any] | None = None) -> tuple[str, tuple[int, int, int]]:
     return _shared_variant_model_hparams(
         variant or f"gomoku{board_size}",
@@ -142,6 +172,53 @@ def _one_hot_policy(move: int, board_size: int) -> list[float]:
     if move >= 0:
         policy[_policy_cell_index(move, board_size)] = 1.0
     return policy
+
+
+def _soft_policy_from_engine_hints(
+    best_move: int,
+    board: list[int],
+    board_size: int,
+    hints: list[dict[str, Any]] | None,
+) -> list[float]:
+    """Build a soft target distribution from engine hints / top moves."""
+    padded = [0.0] * 256
+    legal = [idx for idx, cell in enumerate(board) if cell == 0]
+    if not legal:
+        return padded
+
+    scored: list[tuple[int, float]] = []
+    for hint in hints or []:
+        try:
+            move = int(hint.get("move", -1))
+            score = float(hint.get("score", 0.0))
+        except Exception:
+            continue
+        if move < 0 or move >= len(board) or board[move] != 0:
+            continue
+        scored.append((move, score))
+
+    if not scored:
+        return _one_hot_policy(best_move, board_size)
+
+    max_score = max(score for _, score in scored)
+    weights: list[tuple[int, float]] = []
+    total = 0.0
+    for move, score in scored:
+        weight = math.exp((score - max_score) / 2.5)
+        weights.append((move, weight))
+        total += weight
+
+    if total <= 0:
+        return _one_hot_policy(best_move, board_size)
+
+    for move, weight in weights:
+        padded[_policy_cell_index(move, board_size)] = weight / total
+
+    if best_move >= 0 and board[best_move] == 0 and padded[_policy_cell_index(best_move, board_size)] == 0.0:
+        padded[_policy_cell_index(best_move, board_size)] = 1.0
+        return _normalize_policy_vector(padded)
+
+    return _normalize_policy_vector(padded)
 
 
 def _find_immediate_move(board: list[int], board_size: int, win_len: int, player: int) -> int | None:
@@ -1038,17 +1115,20 @@ async def _generate_engine_labeled_positions(
 
         board, current, last_move = sampled
         phase_bucket = _classify_engine_phase(board_size, sum(1 for cell in board if cell != 0))
-        move, value = await engine_eval.best_move_with_value(board, current, board_size, win_len)
+        analysis = await engine_eval.analyze_position(board, current, board_size, win_len)
+        move = int(analysis.get("bestMove", -1))
+        value = max(-1.0, min(1.0, float(analysis.get("value", 0.0))))
         if move < 0 or move >= len(board) or board[move] != 0:
             continue
+        hints = await engine_eval.suggest_moves(board, current, board_size, win_len, top_n=5)
 
         positions.append({
             "board_size": board_size,
             "board": _flat_to_board2d(board, board_size),
             "current_player": current,
             "last_move": list(divmod(last_move, board_size)) if last_move >= 0 else None,
-            "policy": _one_hot_policy(move, board_size),
-            "value": max(-1.0, min(1.0, float(value))),
+            "policy": _soft_policy_from_engine_hints(move, board, board_size, hints),
+            "value": value,
             "source": source,
             "phaseBucket": phase_bucket,
             "sampleWeight": 1.0,
@@ -1083,17 +1163,20 @@ async def _relabel_positions_with_engine(
     for idx, pos in enumerate(positions, 1):
         board = _board2d_to_flat(pos["board"])
         current = int(pos["current_player"])
-        move, value = await engine_eval.best_move_with_value(board, current, board_size, win_len)
+        analysis = await engine_eval.analyze_position(board, current, board_size, win_len)
+        move = int(analysis.get("bestMove", -1))
+        value = max(-1.0, min(1.0, float(analysis.get("value", 0.0))))
         if move < 0 or move >= len(board) or board[move] != 0:
             continue
+        hints = await engine_eval.suggest_moves(board, current, board_size, win_len, top_n=5)
 
         relabeled.append({
             "board_size": board_size,
             "board": pos["board"],
             "current_player": current,
             "last_move": pos.get("last_move"),
-            "policy": _one_hot_policy(move, board_size),
-            "value": max(-1.0, min(1.0, float(value))),
+            "policy": _soft_policy_from_engine_hints(move, board, board_size, hints),
+            "value": value,
         })
 
         if callback is not None and (idx - last_reported >= 24 or idx == len(positions)):
@@ -1137,12 +1220,27 @@ async def _run_engine_exam(
     stage: str = "engine_eval",
     collect_failures: bool = True,
 ) -> tuple[Any, list[dict[str, Any]], dict[str, Any]]:
-    from gomoku_api.ws.arena_eval import ArenaResult, _model_greedy_move
+    from gomoku_api.ws.arena_eval import ArenaResult, _model_greedy_decision
 
     wins = losses = draws = 0
     total_games = max(num_pairs * 2, 1)
     raw_failures: list[dict[str, Any]] = []
     started_at = time.monotonic()
+    side_stats: dict[int, dict[str, int]] = {
+        1: {"wins": 0, "losses": 0, "draws": 0, "total": 0},
+        2: {"wins": 0, "losses": 0, "draws": 0, "total": 0},
+    }
+    candidate_move_count = 0
+    tactical_override_count = 0
+    value_guided_count = 0
+    model_policy_count = 0
+    unsafe_moves_filtered_total = 0
+    decision_reason_counts: dict[str, int] = {}
+
+    def _side_rate(side: int, numerator: str, *, draw_weight: float = 0.0) -> float:
+        bucket = side_stats[side]
+        total = max(bucket["total"], 1)
+        return (bucket[numerator] + draw_weight * bucket["draws"]) / total
 
     for pair in range(num_pairs):
         for candidate_side in (1, 2):
@@ -1165,7 +1263,18 @@ async def _run_engine_exam(
                         "current_player": current,
                         "last_move": list(divmod(last_move, board_size)) if last_move >= 0 else None,
                     })
-                    move = _model_greedy_move(board, board_size, win_len, current, model, device)
+                    decision = _model_greedy_decision(board, board_size, win_len, current, model, device)
+                    move = int(decision.get("move", -1))
+                    candidate_move_count += 1
+                    if bool(decision.get("tacticalOverride")):
+                        tactical_override_count += 1
+                    if bool(decision.get("valueGuided")):
+                        value_guided_count += 1
+                    if str(decision.get("tacticalReason", "")) == "model_policy":
+                        model_policy_count += 1
+                    unsafe_moves_filtered_total += int(decision.get("unsafeMovesFiltered", 0) or 0)
+                    reason = str(decision.get("tacticalReason", "unknown") or "unknown")
+                    decision_reason_counts[reason] = decision_reason_counts.get(reason, 0) + 1
                 else:
                     move = await engine_eval.best_move(board, current, board_size, win_len)
 
@@ -1181,25 +1290,40 @@ async def _run_engine_exam(
                 current = 2 if current == 1 else 1
 
             candidate_lost = False
+            side_stats[candidate_side]["total"] += 1
             if forfeit_by != 0:
                 if forfeit_by == candidate_side:
                     losses += 1
+                    side_stats[candidate_side]["losses"] += 1
                     candidate_lost = True
                 else:
                     wins += 1
+                    side_stats[candidate_side]["wins"] += 1
             elif winner == candidate_side:
                 wins += 1
+                side_stats[candidate_side]["wins"] += 1
             elif winner != 0:
                 losses += 1
+                side_stats[candidate_side]["losses"] += 1
                 candidate_lost = True
             else:
                 draws += 1
+                side_stats[candidate_side]["draws"] += 1
 
             if candidate_lost:
                 raw_failures.extend(candidate_states[-max_failure_turns_per_game:])
 
         games_done = (pair + 1) * 2
         winrate = (wins + 0.5 * draws) / max(games_done, 1)
+        decisive_winrate = wins / max(games_done, 1)
+        draw_rate = draws / max(games_done, 1)
+        winrate_as_p1 = _side_rate(1, "wins", draw_weight=0.5)
+        winrate_as_p2 = _side_rate(2, "wins", draw_weight=0.5)
+        balanced_side_winrate = min(winrate_as_p1, winrate_as_p2)
+        tactical_override_rate = tactical_override_count / max(candidate_move_count, 1)
+        value_guided_rate = value_guided_count / max(candidate_move_count, 1)
+        model_policy_rate = model_policy_count / max(candidate_move_count, 1)
+        avg_unsafe_filtered = unsafe_moves_filtered_total / max(candidate_move_count, 1)
         prev_wr = previous_result.get("winrate") if previous_result else None
         delta_wr = None if prev_wr is None else round(winrate - prev_wr, 4)
         trend = "flat"
@@ -1226,6 +1350,17 @@ async def _run_engine_exam(
                 "arenaLosses": losses,
                 "arenaDraws": draws,
                 "winrateVsAlgorithm": round(winrate, 4),
+                "decisiveWinRate": round(decisive_winrate, 4),
+                "drawRate": round(draw_rate, 4),
+                "winrateAsP1": round(winrate_as_p1, 4),
+                "winrateAsP2": round(winrate_as_p2, 4),
+                "balancedSideWinrate": round(balanced_side_winrate, 4),
+                "tacticalOverrideCount": tactical_override_count,
+                "candidateMoveCount": candidate_move_count,
+                "tacticalOverrideRate": round(tactical_override_rate, 4),
+                "valueGuidedRate": round(value_guided_rate, 4),
+                "modelPolicyRate": round(model_policy_rate, 4),
+                "avgUnsafeMovesFiltered": round(avg_unsafe_filtered, 4),
                 "deltaWinrate": delta_wr,
                 "progressTrend": trend,
                 "elapsed": round(elapsed, 1),
@@ -1253,6 +1388,22 @@ async def _run_engine_exam(
         "losses": losses,
         "draws": draws,
         "winrate": result.winrate_a,
+        "decisiveWinRate": result.decisive_winrate_a,
+        "drawRate": result.draw_rate,
+        "winrateAsP1": round(_side_rate(1, "wins", draw_weight=0.5), 4),
+        "winrateAsP2": round(_side_rate(2, "wins", draw_weight=0.5), 4),
+        "decisiveWinRateAsP1": round(_side_rate(1, "wins"), 4),
+        "decisiveWinRateAsP2": round(_side_rate(2, "wins"), 4),
+        "drawRateAsP1": round(_side_rate(1, "draws"), 4),
+        "drawRateAsP2": round(_side_rate(2, "draws"), 4),
+        "balancedSideWinrate": round(min(_side_rate(1, "wins", draw_weight=0.5), _side_rate(2, "wins", draw_weight=0.5)), 4),
+        "candidateMoveCount": candidate_move_count,
+        "tacticalOverrideCount": tactical_override_count,
+        "tacticalOverrideRate": round(tactical_override_count / max(candidate_move_count, 1), 4),
+        "valueGuidedRate": round(value_guided_count / max(candidate_move_count, 1), 4),
+        "modelPolicyRate": round(model_policy_count / max(candidate_move_count, 1), 4),
+        "avgUnsafeMovesFiltered": round(unsafe_moves_filtered_total / max(candidate_move_count, 1), 4),
+        "decisionReasonCounts": dict(sorted(decision_reason_counts.items())),
         "newFailures": len(relabeled),
     }
     return result, relabeled, summary
@@ -3037,6 +3188,10 @@ async def train_variant(
     current_engine_count = engine_per_cycle
     current_failure_slice = 256
     repair_effectiveness_history: list[float] = []
+    best_quick_checkpoint_state: dict[str, torch.Tensor] | None = None
+    best_quick_checkpoint_summary: dict[str, Any] | None = None
+    best_quick_checkpoint_cycle: int | None = None
+    best_quick_checkpoint_score: tuple[float, float, float, int] | None = None
 
     for cycle in range(1, cycle_count + 1):
         cycle_base = base_percent + (cycle - 1) * cycle_percent
@@ -3126,6 +3281,7 @@ async def train_variant(
             **common,
         )
         registry.save_candidate(model, generation=cycle, metrics={"phase": "turbo_train", "cycle": cycle})
+        pre_repair_state = _clone_model_state_dict(model)
 
         cycle_failures: list[dict[str, Any]] = []
         exam_result = None
@@ -3158,10 +3314,24 @@ async def train_variant(
                     winrate_history.append({
                         "cycle": cycle,
                         "winrate": round(exam_summary_current.get("winrate", 0), 4),
+                        "decisiveWinRate": round(exam_summary_current.get("decisiveWinRate", 0), 4),
+                        "drawRate": round(exam_summary_current.get("drawRate", 0), 4),
+                        "winrateAsP1": round(exam_summary_current.get("winrateAsP1", 0), 4),
+                        "winrateAsP2": round(exam_summary_current.get("winrateAsP2", 0), 4),
+                        "balancedSideWinrate": round(exam_summary_current.get("balancedSideWinrate", 0), 4),
+                        "tacticalOverrideRate": round(exam_summary_current.get("tacticalOverrideRate", 0), 4),
+                        "valueGuidedRate": round(exam_summary_current.get("valueGuidedRate", 0), 4),
+                        "modelPolicyRate": round(exam_summary_current.get("modelPolicyRate", 0), 4),
                         "wins": exam_summary_current.get("wins", 0),
                         "losses": exam_summary_current.get("losses", 0),
                         "draws": exam_summary_current.get("draws", 0),
                     })
+                    current_score = _checkpoint_selection_score(exam_summary_current, cycle)
+                    if best_quick_checkpoint_score is None or current_score > best_quick_checkpoint_score:
+                        best_quick_checkpoint_score = current_score
+                        best_quick_checkpoint_state = pre_repair_state
+                        best_quick_checkpoint_summary = dict(exam_summary_current)
+                        best_quick_checkpoint_cycle = cycle
             else:
                 await callback({
                     "type": "train.progress",
@@ -3265,6 +3435,8 @@ async def train_variant(
                 "failureBankSize": len(failure_bank),
                 "newFailures": len(cycle_failures),
                 "winrateVsAlgorithm": round(exam_result.winrate_a, 4) if exam_result is not None else None,
+                "decisiveWinRate": round(exam_result.decisive_winrate_a, 4) if exam_result is not None else None,
+                "drawRate": round(exam_result.draw_rate, 4) if exam_result is not None else None,
                 "percent": round(cycle_base + cycle_percent * 0.90, 1),
                 "elapsed": round(time.monotonic() - started_at, 1),
             },
@@ -3322,6 +3494,50 @@ async def train_variant(
     from gomoku_api.ws.promotion import evaluate_promotion
 
     quick_result = None
+    selected_checkpoint_cycle = None
+    selected_checkpoint_summary = None
+    if best_quick_checkpoint_state is not None:
+        _restore_model_state_dict(model, best_quick_checkpoint_state)
+        selected_checkpoint_cycle = best_quick_checkpoint_cycle
+        selected_checkpoint_summary = dict(best_quick_checkpoint_summary or {})
+        registry.save_candidate(
+            model,
+            generation=cycle_count,
+            metrics={
+                "phase": "checkpoint_selection",
+                "cycle": selected_checkpoint_cycle,
+                "winrate": selected_checkpoint_summary.get("winrate"),
+                "decisiveWinRate": selected_checkpoint_summary.get("decisiveWinRate"),
+            },
+        )
+        await callback({
+            "type": "train.progress",
+            "payload": {
+                "phase": "checkpoint_selection",
+                "stage": "best_quick_probe",
+                "variant": variant,
+                "cycle": selected_checkpoint_cycle,
+                "selectedCheckpointCycle": selected_checkpoint_cycle,
+                "selectedCheckpointWinrate": selected_checkpoint_summary.get("winrate"),
+                "selectedCheckpointDecisiveWinRate": selected_checkpoint_summary.get("decisiveWinRate"),
+                "selectedCheckpointDrawRate": selected_checkpoint_summary.get("drawRate"),
+                "message": "Restored best pre-repair checkpoint before final confirm exam",
+            },
+        })
+        selected_validation = await _run_validation_snapshot(
+            model,
+            holdout_bank,
+            frozen_suites,
+            device,
+            callback,
+            variant=variant,
+            cycle=cycle_count,
+            total_cycles=cycle_count,
+            previous_holdout=last_validation,
+        )
+        validation_history.append(dict(selected_validation))
+        last_validation = selected_validation
+
     if registry.has_champion():
         from trainer_lab.config import ModelConfig as _MC
         from trainer_lab.models.resnet import PolicyValueResNet as _PVR
@@ -3355,6 +3571,7 @@ async def train_variant(
 
     # Confirm exam: separate from quick probes, used for promotion only
     confirm_result = strong_result
+    confirm_summary: dict[str, Any] | None = None
     if engine_available and engine_eval is not None:
         confirm_result, _, confirm_summary = await _run_engine_exam(
             model,
@@ -3367,7 +3584,7 @@ async def train_variant(
             cycle=cycle_count + 1,
             total_cycles=cycle_count,
             num_pairs=10,
-            previous_result=previous_exam,
+            previous_result=selected_checkpoint_summary or previous_exam,
             phase="confirm_exam",
             stage="engine_eval",
             collect_failures=False,
@@ -3459,13 +3676,59 @@ async def train_variant(
         "championGeneration": manifest.get("current_champion_generation"),
         "promoted": promoted_this_run,
         "cycles": cycle_count,
+        "selectedCheckpointCycle": selected_checkpoint_cycle,
     }
+    if selected_checkpoint_summary:
+        done_payload["selectedCheckpointWinrate"] = round(float(selected_checkpoint_summary.get("winrate", 0.0) or 0.0), 4)
+        done_payload["selectedCheckpointDecisiveWinRate"] = round(float(selected_checkpoint_summary.get("decisiveWinRate", 0.0) or 0.0), 4)
+        done_payload["selectedCheckpointDrawRate"] = round(float(selected_checkpoint_summary.get("drawRate", 0.0) or 0.0), 4)
+        done_payload["selectedCheckpointWinrateAsP1"] = round(float(selected_checkpoint_summary.get("winrateAsP1", 0.0) or 0.0), 4)
+        done_payload["selectedCheckpointWinrateAsP2"] = round(float(selected_checkpoint_summary.get("winrateAsP2", 0.0) or 0.0), 4)
+        done_payload["selectedCheckpointBalancedSideWinrate"] = round(float(selected_checkpoint_summary.get("balancedSideWinrate", 0.0) or 0.0), 4)
     if quick_result:
         done_payload["winrateVsChampion"] = round(quick_result.winrate_a, 4)
+        done_payload["decisiveWinRateVsChampion"] = round(quick_result.decisive_winrate_a, 4)
     if strong_result:
         done_payload["winrateVsAlgorithm"] = round(strong_result.winrate_a, 4)
+        done_payload["decisiveWinRate"] = round(strong_result.decisive_winrate_a, 4)
+        done_payload["drawRate"] = round(strong_result.draw_rate, 4)
+    final_exam_summary = confirm_summary or selected_checkpoint_summary or previous_exam
+    if final_exam_summary:
+        for key in (
+            "winrateAsP1",
+            "winrateAsP2",
+            "balancedSideWinrate",
+            "tacticalOverrideRate",
+            "valueGuidedRate",
+            "modelPolicyRate",
+            "avgUnsafeMovesFiltered",
+        ):
+            if final_exam_summary.get(key) is not None:
+                done_payload[key] = round(float(final_exam_summary.get(key, 0.0) or 0.0), 4)
+        if final_exam_summary.get("decisionReasonCounts") is not None:
+            done_payload["decisionReasonCounts"] = dict(final_exam_summary.get("decisionReasonCounts") or {})
     if winrate_history:
         done_payload["winrateHistory"] = winrate_history
+    if confirm_result is not None:
+        done_payload["confirmWins"] = confirm_result.wins_a
+        done_payload["confirmLosses"] = confirm_result.wins_b
+        done_payload["confirmDraws"] = confirm_result.draws
+        done_payload["confirmDecisiveWinRate"] = round(confirm_result.decisive_winrate_a, 4)
+        done_payload["confirmDrawRate"] = round(confirm_result.draw_rate, 4)
+    if confirm_summary:
+        for key in (
+            "winrateAsP1",
+            "winrateAsP2",
+            "balancedSideWinrate",
+            "tacticalOverrideRate",
+            "valueGuidedRate",
+            "modelPolicyRate",
+            "avgUnsafeMovesFiltered",
+        ):
+            if confirm_summary.get(key) is not None:
+                done_payload[f"confirm{key[0].upper()}{key[1:]}"] = round(float(confirm_summary.get(key, 0.0) or 0.0), 4)
+        if confirm_summary.get("decisionReasonCounts") is not None:
+            done_payload["confirmDecisionReasonCounts"] = dict(confirm_summary.get("decisionReasonCounts") or {})
     if validation_history:
         done_payload["validationHistory"] = validation_history
         latest_validation = validation_history[-1]

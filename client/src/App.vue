@@ -256,6 +256,30 @@
               <span v-if="ttt5Progress.winrateVsAlgorithm != null" class="strength-pill">
                 vs engine: {{ (ttt5Progress.winrateVsAlgorithm * 100).toFixed(1) }}%
               </span>
+              <span v-if="ttt5Progress.decisiveWinRate != null" class="strength-pill">
+                decisive: {{ (ttt5Progress.decisiveWinRate * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.drawRate != null" class="strength-pill">
+                draw: {{ (ttt5Progress.drawRate * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.winrateAsP1 != null" class="strength-pill">
+                as P1: {{ (ttt5Progress.winrateAsP1 * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.winrateAsP2 != null" class="strength-pill">
+                as P2: {{ (ttt5Progress.winrateAsP2 * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.balancedSideWinrate != null" class="strength-pill">
+                balanced: {{ (ttt5Progress.balancedSideWinrate * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.tacticalOverrideRate != null" class="strength-pill">
+                overrides: {{ (ttt5Progress.tacticalOverrideRate * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.valueGuidedRate != null" class="strength-pill">
+                value-guided: {{ (ttt5Progress.valueGuidedRate * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.modelPolicyRate != null" class="strength-pill">
+                model-policy: {{ (ttt5Progress.modelPolicyRate * 100).toFixed(1) }}%
+              </span>
               <span v-if="ttt5Progress.deltaWinrate != null" class="strength-pill">
                 delta: {{ (ttt5Progress.deltaWinrate * 100).toFixed(1) }}%
               </span>
@@ -406,6 +430,26 @@
           <span>Алгоритм (minimax)</span>
         </label>
       </div>
+      <div class="mode-selector" v-if="gameMode === 'model'">
+        <label class="mode-label">
+          <input type="radio" v-model="modelDecisionMode" value="hybrid" :disabled="training || clearing || autoPlaying" />
+          <span>Гибрид (нейронка + safety)</span>
+        </label>
+        <label class="mode-label">
+          <input type="radio" v-model="modelDecisionMode" value="pure" :disabled="training || clearing || autoPlaying" />
+          <span>Чистая модель</span>
+        </label>
+      </div>
+      <div v-if="gameMode === 'model'" class="setting-hint game-hint">
+        <small>
+          <template v-if="modelDecisionMode === 'hybrid'">
+            Гибридный режим: сеть выбирает ход, но сервер страхует от простых тактических зевков.
+          </template>
+          <template v-else>
+            Чистый режим: ход выбирается только моделью (policy + value) без программных tactical overrides.
+          </template>
+        </small>
+      </div>
       <div class="pause-control" v-if="gameType === 'auto'">
         <label class="pause-label">
           Пауза между ходами (мс):
@@ -436,6 +480,38 @@
           Уверенность: {{ (modelConfidence * 100).toFixed(1) }}%
         </span>
       </div>
+      <div class="commentary-controls" v-if="gameType === 'human'">
+        <label class="mode-label">
+          <input type="checkbox" v-model="commentaryEnabled" />
+          <span>Комментарии к ходам</span>
+        </label>
+        <label class="pause-label" v-if="commentaryEnabled">
+          Стиль:
+          <select v-model="commentaryStyle">
+            <option value="coach">Коуч</option>
+            <option value="emotional">Эмоции</option>
+            <option value="hint">Подсказки</option>
+          </select>
+        </label>
+      </div>
+      <div v-if="commentaryEnabled" class="commentary-panel">
+        <div class="commentary-header">Коуч позиции</div>
+        <div v-if="latestCommentary" class="commentary-card" :class="getCommentaryClass(latestCommentary.mood)">
+          <div class="commentary-title">
+            {{ latestCommentary.actor === 'bot' ? 'Разбор ответа бота' : 'Разбор вашего хода' }}
+          </div>
+          <div class="commentary-text">{{ latestCommentary.text }}</div>
+          <div class="commentary-meta">
+            <span v-if="latestCommentary.advantageLabel">Оценка: {{ latestCommentary.advantageLabel }}</span>
+            <span v-if="latestCommentary.bestMoveLabel && latestCommentary.bestMoveLabel !== latestCommentary.moveLabel">Сильнее: {{ latestCommentary.bestMoveLabel }}</span>
+            <span v-if="latestCommentary.opponentThreatsAfter > 0">Угроз после хода: {{ latestCommentary.opponentThreatsAfter }}</span>
+            <span v-if="latestCommentary.forcingThreatsAfter > 0">Ваше давление: {{ latestCommentary.forcingThreatsAfter }}</span>
+          </div>
+        </div>
+        <div v-else class="commentary-empty">
+          После ходов здесь появится живой разбор: опасности, потеря темпа, перехват инициативы и подсказки.
+        </div>
+      </div>
     </section>
   </div>
 </template>
@@ -460,10 +536,14 @@ const current = ref(1) // 1 = X (человек/модель), 2 = O (бот/а�
 const waiting = ref(false) // Флаг ожидания ответа от сервера
 const status = ref('Ваш ход (X)')
 const gameMode = ref('model') // 'model' или 'algorithm' (для режима human)
+const modelDecisionMode = ref('hybrid') // 'hybrid' или 'pure' для model-mode
 const gameType = ref('human') // 'human' или 'auto'
 const gameOver = ref(false) // Игра завершена
 const autoPlaying = ref(false) // Автоматическая игра идет
 const pauseMs = ref(1000) // Пауза между ходами в мс
+const commentaryEnabled = ref(true)
+const commentaryStyle = ref('coach')
+const commentaryEntries = ref([])
 let autoGameInterval = null
 const historyCount = ref(0) // Количество сохраненных ходов
 const autoTrainAfterGame = ref(false) // Автоматическое дообучение после игры
@@ -634,6 +714,7 @@ const policyCanvas = ref(null) // Canvas for policy heatmap
 const hasWinrateChartData = computed(() => winrateHistory.value.length > 0 || confirmWinrateHistory.value.length > 0)
 const latestQuickProbe = computed(() => winrateHistory.value.length ? winrateHistory.value[winrateHistory.value.length - 1] : null)
 const latestConfirmExam = computed(() => confirmWinrateHistory.value.length ? confirmWinrateHistory.value[confirmWinrateHistory.value.length - 1] : null)
+const latestCommentary = computed(() => commentaryEntries.value.length ? commentaryEntries.value[0] : null)
 
 function hasExamCounts(point) {
   if (!point) return false
@@ -643,8 +724,44 @@ function hasExamCounts(point) {
 function formatExamSummary(point, label) {
   if (!point) return ''
   const base = `${label}: ${(Number(point.winrate || 0) * 100).toFixed(1)}%`
-  if (!hasExamCounts(point)) return base
-  return `${base} · W${point.wins}/L${point.losses}/D${point.draws}`
+  const decisive = point.decisiveWinRate != null ? ` · DW${(Number(point.decisiveWinRate || 0) * 100).toFixed(1)}%` : ''
+  const draw = point.drawRate != null ? ` · DR${(Number(point.drawRate || 0) * 100).toFixed(1)}%` : ''
+  const sideSplit = point.winrateAsP1 != null && point.winrateAsP2 != null
+    ? ` · P1 ${(Number(point.winrateAsP1 || 0) * 100).toFixed(0)} / P2 ${(Number(point.winrateAsP2 || 0) * 100).toFixed(0)}`
+    : ''
+  if (!hasExamCounts(point)) return `${base}${decisive}${draw}${sideSplit}`
+  return `${base}${decisive}${draw}${sideSplit} · W${point.wins}/L${point.losses}/D${point.draws}`
+}
+
+function getCommentaryClass(mood) {
+  if (mood === 'positive') return 'commentary-positive'
+  if (mood === 'warning') return 'commentary-warning'
+  if (mood === 'danger') return 'commentary-danger'
+  return 'commentary-neutral'
+}
+
+function pushCommentaryEntry(entry) {
+  commentaryEntries.value = [entry, ...commentaryEntries.value].slice(0, 12)
+}
+
+function requestMoveCommentary(boardBefore, move, currentPlayer, actor = 'player') {
+  if (!commentaryEnabled.value) return
+  if (!ws.value || ws.value.readyState !== WebSocket.OPEN) return
+  try {
+    ws.value.send(JSON.stringify({
+      type: 'comment_move',
+      payload: {
+        boardBefore,
+        move,
+        current: currentPlayer,
+        variant: variant.value,
+        style: commentaryStyle.value,
+        actor,
+      },
+    }))
+  } catch (e) {
+    console.warn('[Commentary] Failed to request commentary:', e)
+  }
 }
 
 function formatTime(seconds) {
@@ -768,6 +885,14 @@ function upsertWinratePoint(historyRef, point) {
   const nextPoint = {
     cycle,
     winrate: Number(point.winrate || 0),
+    decisiveWinRate: point.decisiveWinRate != null ? Number(point.decisiveWinRate || 0) : null,
+    drawRate: point.drawRate != null ? Number(point.drawRate || 0) : null,
+    winrateAsP1: point.winrateAsP1 != null ? Number(point.winrateAsP1 || 0) : null,
+    winrateAsP2: point.winrateAsP2 != null ? Number(point.winrateAsP2 || 0) : null,
+    balancedSideWinrate: point.balancedSideWinrate != null ? Number(point.balancedSideWinrate || 0) : null,
+    tacticalOverrideRate: point.tacticalOverrideRate != null ? Number(point.tacticalOverrideRate || 0) : null,
+    valueGuidedRate: point.valueGuidedRate != null ? Number(point.valueGuidedRate || 0) : null,
+    modelPolicyRate: point.modelPolicyRate != null ? Number(point.modelPolicyRate || 0) : null,
     wins: Number(point.wins || 0),
     losses: Number(point.losses || 0),
     draws: Number(point.draws || 0),
@@ -1043,6 +1168,14 @@ function connectWS() {
                   upsertWinratePoint(winrateHistory, {
                     cycle,
                     winrate: _p.winrateVsAlgorithm,
+                    decisiveWinRate: _p.decisiveWinRate,
+                    drawRate: _p.drawRate,
+                    winrateAsP1: _p.winrateAsP1,
+                    winrateAsP2: _p.winrateAsP2,
+                    balancedSideWinrate: _p.balancedSideWinrate,
+                    tacticalOverrideRate: _p.tacticalOverrideRate,
+                    valueGuidedRate: _p.valueGuidedRate,
+                    modelPolicyRate: _p.modelPolicyRate,
                     wins: _p.arenaWins || 0,
                     losses: _p.arenaLosses || 0,
                     draws: _p.arenaDraws || 0,
@@ -1052,6 +1185,14 @@ function connectWS() {
                   upsertWinratePoint(confirmWinrateHistory, {
                     cycle,
                     winrate: _p.winrateVsAlgorithm,
+                    decisiveWinRate: _p.decisiveWinRate,
+                    drawRate: _p.drawRate,
+                    winrateAsP1: _p.winrateAsP1,
+                    winrateAsP2: _p.winrateAsP2,
+                    balancedSideWinrate: _p.balancedSideWinrate,
+                    tacticalOverrideRate: _p.tacticalOverrideRate,
+                    valueGuidedRate: _p.valueGuidedRate,
+                    modelPolicyRate: _p.modelPolicyRate,
                     wins: _p.arenaWins || 0,
                     losses: _p.arenaLosses || 0,
                     draws: _p.arenaDraws || 0,
@@ -1076,6 +1217,11 @@ function connectWS() {
               else if (p.phase === 'mcts') statusText = `MCTS ${p.iteration || ''}/${p.totalIterations || ''}`
               if (p.epoch > 0) statusText += ` | Epoch ${p.epoch}/${p.totalEpochs}`
               if (p.winrateVsAlgorithm != null) statusText += ` | WR: ${(p.winrateVsAlgorithm * 100).toFixed(1)}%`
+              if (p.winrateAsP1 != null && p.winrateAsP2 != null) statusText += ` | P1/P2: ${(p.winrateAsP1 * 100).toFixed(0)}/${(p.winrateAsP2 * 100).toFixed(0)}`
+              if (p.decisiveWinRate != null) statusText += ` | DW: ${(p.decisiveWinRate * 100).toFixed(1)}%`
+              if (p.drawRate != null) statusText += ` | DR: ${(p.drawRate * 100).toFixed(1)}%`
+              if (p.tacticalOverrideRate != null) statusText += ` | OV: ${(p.tacticalOverrideRate * 100).toFixed(0)}%`
+              if (p.valueGuidedRate != null) statusText += ` | VG: ${(p.valueGuidedRate * 100).toFixed(0)}%`
               if (p.deltaWinrate != null) statusText += ` | Δ ${(p.deltaWinrate * 100).toFixed(1)}%`
               if (p.holdoutPolicyAcc != null) statusText += ` | Holdout: ${p.holdoutPolicyAcc}%`
               if (p.frozenBlockAcc != null) statusText += ` | Block: ${p.frozenBlockAcc}%`
@@ -1173,6 +1319,8 @@ function connectWS() {
         let doneStatus = `Обучение завершено за ${totalTime}`
         if (p.winrateVsChampion != null) doneStatus += ` | vs champion: ${(p.winrateVsChampion * 100).toFixed(1)}%`
         if (p.winrateVsAlgorithm != null) doneStatus += ` | vs engine: ${(p.winrateVsAlgorithm * 100).toFixed(1)}%`
+        if (p.decisiveWinRate != null) doneStatus += ` | decisive: ${(p.decisiveWinRate * 100).toFixed(1)}%`
+        if (p.drawRate != null) doneStatus += ` | draw: ${(p.drawRate * 100).toFixed(1)}%`
         if (p.holdoutPolicyAcc != null) doneStatus += ` | holdout: ${p.holdoutPolicyAcc}%`
         if (p.frozenBlockAcc != null) doneStatus += ` | block: ${p.frozenBlockAcc}%`
         if (p.frozenWinAcc != null) doneStatus += ` | win: ${p.frozenWinAcc}%`
@@ -1186,6 +1334,14 @@ function connectWS() {
             .map(item => ({
               cycle: Number(item.cycle || 0),
               winrate: Number(item.winrate || 0),
+              decisiveWinRate: item.decisiveWinRate != null ? Number(item.decisiveWinRate || 0) : null,
+              drawRate: item.drawRate != null ? Number(item.drawRate || 0) : null,
+              winrateAsP1: item.winrateAsP1 != null ? Number(item.winrateAsP1 || 0) : null,
+              winrateAsP2: item.winrateAsP2 != null ? Number(item.winrateAsP2 || 0) : null,
+              balancedSideWinrate: item.balancedSideWinrate != null ? Number(item.balancedSideWinrate || 0) : null,
+              tacticalOverrideRate: item.tacticalOverrideRate != null ? Number(item.tacticalOverrideRate || 0) : null,
+              valueGuidedRate: item.valueGuidedRate != null ? Number(item.valueGuidedRate || 0) : null,
+              modelPolicyRate: item.modelPolicyRate != null ? Number(item.modelPolicyRate || 0) : null,
               wins: Number(item.wins || 0),
               losses: Number(item.losses || 0),
               draws: Number(item.draws || 0),
@@ -1198,6 +1354,14 @@ function connectWS() {
           upsertWinratePoint(confirmWinrateHistory, {
             cycle: confirmCycle,
             winrate: p.winrateVsAlgorithm,
+            decisiveWinRate: p.confirmDecisiveWinRate ?? p.decisiveWinRate ?? previousConfirm?.decisiveWinRate ?? null,
+            drawRate: p.confirmDrawRate ?? p.drawRate ?? previousConfirm?.drawRate ?? null,
+            winrateAsP1: p.confirmWinrateAsP1 ?? p.winrateAsP1 ?? previousConfirm?.winrateAsP1 ?? null,
+            winrateAsP2: p.confirmWinrateAsP2 ?? p.winrateAsP2 ?? previousConfirm?.winrateAsP2 ?? null,
+            balancedSideWinrate: p.confirmBalancedSideWinrate ?? p.balancedSideWinrate ?? previousConfirm?.balancedSideWinrate ?? null,
+            tacticalOverrideRate: p.confirmTacticalOverrideRate ?? p.tacticalOverrideRate ?? previousConfirm?.tacticalOverrideRate ?? null,
+            valueGuidedRate: p.confirmValueGuidedRate ?? p.valueGuidedRate ?? previousConfirm?.valueGuidedRate ?? null,
+            modelPolicyRate: p.confirmModelPolicyRate ?? p.modelPolicyRate ?? previousConfirm?.modelPolicyRate ?? null,
             wins: p.confirmWins ?? previousConfirm?.wins ?? 0,
             losses: p.confirmLosses ?? previousConfirm?.losses ?? 0,
             draws: p.confirmDraws ?? previousConfirm?.draws ?? 0,
@@ -1214,6 +1378,7 @@ function connectWS() {
           console.log('[WS] Received predict.result, resetting waiting')
           waiting.value = false
           const move = msg.payload.move
+          const boardBeforeBotMove = [...board.value]
 
           // Store policy probabilities for heatmap
           if (msg.payload.probs && Array.isArray(msg.payload.probs)) {
@@ -1276,6 +1441,7 @@ function connectWS() {
               saveMove(board.value, move, 2)
               
               board.value[move] = 2
+              requestMoveCommentary(boardBeforeBotMove, move, 2, 'bot')
               current.value = 1
               
               // Проверяем победу после хода бота
@@ -1312,6 +1478,7 @@ function connectWS() {
           winrateHistory.value = []
           confirmWinrateHistory.value = []
           modelConfidence.value = null
+          commentaryEntries.value = []
           // Сбросить игру — старая модель больше не существует
           reset()
           status.value = '🗑️ Модель очищена. Обучите новую модель для игры.'
@@ -1343,6 +1510,9 @@ function connectWS() {
           historyCount.value = msg.payload.count || 0
           console.log('[WS] Game finished, error patterns generated')
           currentGameId = null
+        }
+        if (msg.type === 'commentary.result') {
+          pushCommentaryEntry(msg.payload)
         }
         if (msg.type === 'error') {
           console.error('[WS] Server error:', msg.error)
@@ -1538,6 +1708,7 @@ function reset() {
   gameOver.value = false
   waiting.value = false
   modelConfidence.value = null
+  commentaryEntries.value = []
   currentGameMoves = []
   currentGameId = null
 }
@@ -1700,6 +1871,7 @@ async function makeAutoMove() {
           current: 1,
           mode: 'model',
           variant: variant.value,
+          modelDecisionMode: modelDecisionMode.value,
         }
       }))
     } catch (e) {
@@ -1767,12 +1939,14 @@ function humanMove(idx) {
   if (!currentGameId && gameMode.value === 'model') {
     startGameTracking()
   }
+  const boardBeforeMove = [...board.value]
   
   // Сохраняем ход человека для обучения
   saveMove(board.value, idx, 1)
   
   // Делаем ход
   board.value[idx] = 1
+  requestMoveCommentary(boardBeforeMove, idx, 1, 'player')
   current.value = 2
   
   // Проверяем победу после хода человека
@@ -1785,15 +1959,16 @@ function humanMove(idx) {
   waiting.value = true
   status.value = 'Ожидание хода бота...'
   try {
-    ws.value.send(JSON.stringify({
-      type: 'predict',
-      payload: {
-        board: board.value,
-        current: 2,
-        mode: gameMode.value,
-        variant: variant.value,
-      }
-    }))
+      ws.value.send(JSON.stringify({
+        type: 'predict',
+        payload: {
+          board: board.value,
+          current: 2,
+          mode: gameMode.value,
+          variant: variant.value,
+          modelDecisionMode: modelDecisionMode.value,
+        }
+      }))
     console.log('[HumanMove] Predict request sent')
   } catch (e) {
     console.error('[HumanMove] Error sending predict:', e)
@@ -2251,6 +2426,76 @@ onMounted(() => {
 .strength-pill.rejected {
   background: rgba(198, 40, 40, 0.1);
   color: #c62828;
+}
+
+.commentary-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.commentary-panel {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(243,247,255,0.95));
+  border: 1px solid rgba(21, 101, 192, 0.12);
+}
+
+.commentary-header {
+  font-size: 0.78em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #5c6f91;
+  margin-bottom: 8px;
+}
+
+.commentary-card {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #ffffff;
+  border-left: 4px solid #90a4ae;
+  box-shadow: 0 2px 10px rgba(21, 101, 192, 0.05);
+}
+
+.commentary-card.commentary-positive {
+  border-left-color: #2e7d32;
+}
+
+.commentary-card.commentary-warning {
+  border-left-color: #f9a825;
+}
+
+.commentary-card.commentary-danger {
+  border-left-color: #c62828;
+}
+
+.commentary-title {
+  font-weight: 700;
+  color: #2a3550;
+  margin-bottom: 4px;
+}
+
+.commentary-text {
+  color: #2f3b52;
+  line-height: 1.45;
+}
+
+.commentary-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  font-size: 0.84em;
+  color: #62738d;
+}
+
+.commentary-empty {
+  font-size: 0.92em;
+  color: #71819a;
 }
 
 .sparkline-container {

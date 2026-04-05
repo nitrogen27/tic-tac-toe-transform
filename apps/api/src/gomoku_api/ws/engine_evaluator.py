@@ -92,14 +92,13 @@ class EngineEvaluator:
 
             raise RuntimeError("Engine request retry budget exhausted")
 
-    async def best_move(
+    def _build_position_payload(
         self,
         board: list[int],
         current: int,
         board_size: int,
         win_len: int,
-    ) -> int:
-        """Get engine's best move for the given position."""
+    ) -> dict[str, Any]:
         cells = []
         for v in board:
             if v == 1:
@@ -109,21 +108,61 @@ class EngineEvaluator:
             else:
                 cells.append(0)
 
-        payload = {
-            "command": "best-move",
-            "position": {
-                "boardSize": board_size,
-                "winLength": win_len,
-                "cells": cells,
-                "sideToMove": 1 if current == 1 else -1,
-                "moveCount": sum(1 for c in cells if c != 0),
-                "lastMove": -1,
-                "moveHistory": [],
-            },
+        return {
+            "boardSize": board_size,
+            "winLength": win_len,
+            "cells": cells,
+            "sideToMove": 1 if current == 1 else -1,
+            "moveCount": sum(1 for c in cells if c != 0),
+            "lastMove": -1,
+            "moveHistory": [],
         }
 
+    async def analyze_position(
+        self,
+        board: list[int],
+        current: int,
+        board_size: int,
+        win_len: int,
+    ) -> dict[str, Any]:
+        payload = {
+            "command": "best-move",
+            "position": self._build_position_payload(board, current, board_size, win_len),
+        }
+        return await self._send_request(payload)
+
+    async def suggest_moves(
+        self,
+        board: list[int],
+        current: int,
+        board_size: int,
+        win_len: int,
+        *,
+        top_n: int = 5,
+    ) -> list[dict[str, Any]]:
+        payload = {
+            "command": "suggest",
+            "position": self._build_position_payload(board, current, board_size, win_len),
+            "topN": int(max(1, top_n)),
+        }
         try:
             result = await self._send_request(payload)
+            hints = result.get("hints", [])
+            return [hint for hint in hints if isinstance(hint, dict)]
+        except Exception as exc:
+            logger.error("Engine suggest_moves failed: %s", exc)
+            return []
+
+    async def best_move(
+        self,
+        board: list[int],
+        current: int,
+        board_size: int,
+        win_len: int,
+    ) -> int:
+        """Get engine's best move for the given position."""
+        try:
+            result = await self.analyze_position(board, current, board_size, win_len)
             return result.get("bestMove", -1)
         except Exception as exc:
             logger.error("Engine best_move failed: %s", exc)
@@ -137,30 +176,8 @@ class EngineEvaluator:
         win_len: int,
     ) -> tuple[int, float]:
         """Get engine's best move plus value for the given position."""
-        cells = []
-        for v in board:
-            if v == 1:
-                cells.append(1)
-            elif v == 2:
-                cells.append(-1)
-            else:
-                cells.append(0)
-
-        payload = {
-            "command": "best-move",
-            "position": {
-                "boardSize": board_size,
-                "winLength": win_len,
-                "cells": cells,
-                "sideToMove": 1 if current == 1 else -1,
-                "moveCount": sum(1 for c in cells if c != 0),
-                "lastMove": -1,
-                "moveHistory": [],
-            },
-        }
-
         try:
-            result = await self._send_request(payload)
+            result = await self.analyze_position(board, current, board_size, win_len)
             move = int(result.get("bestMove", -1))
             value = float(result.get("value", 0.0))
             value = max(-1.0, min(1.0, value))

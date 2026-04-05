@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import random
 import time
 from pathlib import Path
@@ -129,6 +130,49 @@ def _one_hot_policy(move: int, board_size: int) -> list[float]:
         row, col = divmod(move, board_size)
         padded[row * 16 + col] = 1.0
     return padded
+
+
+def _normalize_padded_policy(policy: list[float]) -> list[float]:
+    total = sum(policy)
+    if total <= 0:
+        return policy
+    return [float(v / total) for v in policy]
+
+
+def _soft_policy_from_engine_hints(
+    best_move: int,
+    board: list[int],
+    board_size: int,
+    hints: list[dict[str, Any]] | None,
+) -> list[float]:
+    padded = [0.0] * 256
+    scored: list[tuple[int, float]] = []
+    for hint in hints or []:
+        try:
+            move = int(hint.get("move", -1))
+            score = float(hint.get("score", 0.0))
+        except Exception:
+            continue
+        if move < 0 or move >= len(board) or board[move] != 0:
+            continue
+        scored.append((move, score))
+
+    if not scored:
+        return _one_hot_policy(best_move, board_size)
+
+    max_score = max(score for _, score in scored)
+    total = 0.0
+    for move, score in scored:
+        weight = math.exp((score - max_score) / 2.5)
+        padded[(move // board_size) * 16 + (move % board_size)] = weight
+        total += weight
+
+    if total <= 0:
+        return _one_hot_policy(best_move, board_size)
+
+    if best_move >= 0 and board[best_move] == 0 and padded[(best_move // board_size) * 16 + (best_move % board_size)] == 0.0:
+        padded[(best_move // board_size) * 16 + (best_move % board_size)] = 1.0
+    return _normalize_padded_policy(padded)
 
 
 def _classify_engine_phase(board_size: int, occupied_cells: int) -> str:
@@ -356,17 +400,20 @@ async def generate_engine_dataset(
 
             board, current, last_move = sampled
             phase_bucket = _classify_engine_phase(board_size, sum(1 for cell in board if cell != 0))
-            move, value = await engine_eval.best_move_with_value(board, current, board_size, win_len)
+            analysis = await engine_eval.analyze_position(board, current, board_size, win_len)
+            move = int(analysis.get("bestMove", -1))
+            value = max(-1.0, min(1.0, float(analysis.get("value", 0.0))))
             if move < 0 or move >= len(board) or board[move] != 0:
                 continue
+            hints = await engine_eval.suggest_moves(board, current, board_size, win_len, top_n=5)
 
             positions.append({
                 "board_size": board_size,
                 "board": _flat_to_board2d(board, board_size),
                 "current_player": current,
                 "last_move": list(divmod(last_move, board_size)) if last_move >= 0 else None,
-                "policy": _one_hot_policy(move, board_size),
-                "value": max(-1.0, min(1.0, float(value))),
+                "policy": _soft_policy_from_engine_hints(move, board, board_size, hints),
+                "value": value,
                 "source": "engine",
                 "phaseBucket": phase_bucket,
                 "sampleWeight": 1.0,
