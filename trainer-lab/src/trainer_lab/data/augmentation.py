@@ -77,6 +77,7 @@ def augment_sample(
     planes: torch.Tensor,
     policy: torch.Tensor,
     value: float | torch.Tensor,
+    board_size: int = 16,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Return all 8 D4 symmetry variants of a single sample.
 
@@ -85,6 +86,10 @@ def augment_sample(
     planes : Tensor [6, 16, 16]
     policy : Tensor [256]   (flat probability / target vector)
     value  : float or scalar Tensor
+    board_size : int
+        Actual board size.  For boards smaller than 16, rotations are applied
+        only to the top-left board_size×board_size subgrid so that policy mass
+        never leaks into the padded region.
 
     Returns
     -------
@@ -95,7 +100,16 @@ def augment_sample(
 
     results: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     for fn in _TRANSFORMS:
-        aug_planes = fn(planes.clone())
-        aug_policy = _transform_policy(policy.clone(), fn)
+        if board_size >= 16:
+            aug_planes = fn(planes.clone())
+            aug_policy = _transform_policy(policy.clone(), fn)
+        else:
+            bs = board_size
+            aug_planes = torch.zeros_like(planes)
+            aug_planes[:, :bs, :bs] = fn(planes[:, :bs, :bs].clone())
+            pol_grid = policy.view(1, 16, 16)
+            aug_pol_grid = torch.zeros_like(pol_grid)
+            aug_pol_grid[:, :bs, :bs] = fn(pol_grid[:, :bs, :bs].clone())
+            aug_policy = aug_pol_grid.reshape(256)
         results.append((aug_planes, aug_policy, value.clone()))
     return results

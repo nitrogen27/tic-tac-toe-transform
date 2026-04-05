@@ -123,6 +123,59 @@ def _policy_to_256(policy: list[float], board_size: int) -> list[float]:
     return padded
 
 
+def _one_hot_policy(move: int, board_size: int) -> list[float]:
+    padded = [0.0] * 256
+    if move >= 0:
+        row, col = divmod(move, board_size)
+        padded[row * 16 + col] = 1.0
+    return padded
+
+
+def _sample_engine_position(board_size: int, win_len: int, rng: random.Random) -> tuple[list[int], int, int] | None:
+    total_cells = board_size * board_size
+    r = rng.random()
+    if board_size <= 5:
+        if r < 0.05:
+            low, high = 0, min(3, total_cells - 1)
+        elif r < 0.20:
+            low, high = min(4, total_cells - 1), min(10, total_cells - 1)
+        elif r < 0.50:
+            low, high = min(11, total_cells - 1), min(16, total_cells - 1)
+        else:
+            low, high = min(17, total_cells - 1), total_cells - 1
+    else:
+        if r < 0.20:
+            low, high = 0, min(3, total_cells - 1)
+        elif r < 0.60:
+            low, high = min(4, total_cells - 1), min(10, total_cells - 1)
+        elif r < 0.90:
+            low, high = min(11, total_cells - 1), min(18, total_cells - 1)
+        else:
+            low, high = min(19, total_cells - 1), total_cells - 1
+
+    if high < low:
+        low = 0
+    plies = rng.randint(low, high) if high > 0 else 0
+    board = [0] * total_cells
+    current = 1
+    last_move = -1
+
+    for _ in range(plies):
+        legal = [idx for idx, cell in enumerate(board) if cell == 0]
+        if not legal:
+            return None
+        move = rng.choice(legal)
+        board[move] = current
+        last_move = move
+        if _nxn_winner(board, board_size, win_len, move) != 0:
+            return None
+        current = 2 if current == 1 else 1
+
+    if all(cell != 0 for cell in board):
+        return None
+    return board, current, last_move
+
+
 async def generate_minimax_dataset(
     variant: str,
     count: int = 5000,
@@ -220,6 +273,76 @@ async def generate_minimax_dataset(
     return output_path
 
 
+async def generate_engine_dataset(
+    variant: str,
+    count: int = 10_000,
+    callback: TRAIN_CALLBACK | None = None,
+) -> Path:
+    """Generate engine-labeled offline dataset via persistent engine worker."""
+    from gomoku_api.ws.engine_evaluator import EngineEvaluator
+
+    board_size, win_len = _resolve_variant(variant)
+
+    output_dir = SAVED_DIR / "datasets"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{variant}_engine.json"
+
+    positions: list[dict[str, Any]] = []
+    started_at = time.monotonic()
+    last_reported = 0
+    attempts = 0
+    rng = random.Random(f"{variant}:engine:{count}")
+    max_attempts = max(count * 25, 500)
+
+    async with EngineEvaluator() as engine_eval:
+        while len(positions) < count and attempts < max_attempts:
+            attempts += 1
+            sampled = _sample_engine_position(board_size, win_len, rng)
+            if sampled is None:
+                continue
+
+            board, current, last_move = sampled
+            move, value = await engine_eval.best_move_with_value(board, current, board_size, win_len)
+            if move < 0 or move >= len(board) or board[move] != 0:
+                continue
+
+            positions.append({
+                "board_size": board_size,
+                "board": _flat_to_board2d(board, board_size),
+                "current_player": current,
+                "last_move": list(divmod(last_move, board_size)) if last_move >= 0 else None,
+                "policy": _one_hot_policy(move, board_size),
+                "value": max(-1.0, min(1.0, float(value))),
+                "source": "engine",
+                "sampleWeight": 1.0,
+            })
+
+            if callback and (len(positions) - last_reported >= 100 or len(positions) >= count):
+                last_reported = len(positions)
+                elapsed = time.monotonic() - started_at
+                speed = len(positions) / max(elapsed, 0.01)
+                eta = (count - len(positions)) / max(speed, 0.01)
+                await callback({
+                    "type": "dataset.progress",
+                    "payload": {
+                        "generated": min(len(positions), count),
+                        "total": count,
+                        "percent": round(100.0 * min(len(positions), count) / count, 1),
+                        "elapsed": round(elapsed, 1),
+                        "eta": round(eta, 1),
+                        "speed": round(speed, 1),
+                        "message": f"Generated {min(len(positions), count)}/{count} engine positions",
+                        "stage": "engine_dataset",
+                    },
+                })
+                await asyncio.sleep(0)
+
+    positions = positions[:count]
+    output_path.write_text(json.dumps(positions, separators=(",", ":")), encoding="utf-8")
+    logger.info("Saved %d engine positions to %s", len(positions), output_path)
+    return output_path
+
+
 # ── CLI entry point ───────────────────────────────────────────────────
 
 async def _cli_callback(event: dict[str, Any]) -> None:
@@ -233,15 +356,19 @@ async def _cli_callback(event: dict[str, Any]) -> None:
 async def _main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Generate offline minimax dataset")
+    parser = argparse.ArgumentParser(description="Generate offline dataset")
     parser.add_argument("variant", choices=["ttt3", "ttt5"], help="Game variant")
     parser.add_argument("--count", type=int, default=5000, help="Number of positions")
+    parser.add_argument("--mode", choices=["minimax", "engine"], default="minimax", help="Dataset generator")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
-    print(f"Generating {args.count} minimax positions for {args.variant}...")
+    print(f"Generating {args.count} {args.mode} positions for {args.variant}...")
     started = time.monotonic()
-    path = await generate_minimax_dataset(args.variant, args.count, _cli_callback)
+    if args.mode == "engine":
+        path = await generate_engine_dataset(args.variant, args.count, _cli_callback)
+    else:
+        path = await generate_minimax_dataset(args.variant, args.count, _cli_callback)
     elapsed = time.monotonic() - started
     print(f"Done: {path} ({elapsed:.1f}s)")
 

@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 
 from gomoku_api.ws.train_service_ws import (
+    _build_repair_pool,
     _build_train_pool,
+    _compute_target_sanity_metrics,
+    _merge_failure_bank,
+    _merge_position_bank,
     _generate_tactical_curriculum_positions,
     _policy_cell_index,
     _variant_model_hparams,
@@ -33,14 +37,41 @@ async def test_generate_tactical_curriculum_positions_returns_one_hot_targets() 
         assert pos["policy"][move] == 1.0
 
 
+@pytest.mark.asyncio
+async def test_generate_tactical_curriculum_positions_respects_motif_filter() -> None:
+    async def callback(_event: dict) -> None:
+        return None
+
+    positions = await _generate_tactical_curriculum_positions(
+        count=12,
+        board_size=5,
+        win_len=4,
+        callback=callback,
+        motif_filter="block",
+    )
+
+    assert len(positions) == 12
+    assert all(pos["motif"] == "block" for pos in positions)
+
+
 def test_variant_model_hparams_scale_up_ttt5() -> None:
     cfg = ModelConfig()
-    ttt5 = _variant_model_hparams(5, cfg)
-    gomoku15 = _variant_model_hparams(15, cfg)
+    ttt5_profile, ttt5 = _variant_model_hparams(5, cfg, variant="ttt5")
+    gomoku15_profile, gomoku15 = _variant_model_hparams(15, cfg, variant="gomoku15")
 
+    assert ttt5_profile == "standard"
+    assert gomoku15_profile == "standard"
     assert ttt5 == (96, 8, 160)
     assert gomoku15[0] >= 128
     assert gomoku15[1] >= 8
+
+
+def test_variant_model_hparams_supports_ttt5_small_profile() -> None:
+    cfg = ModelConfig()
+    profile, ttt5_small = _variant_model_hparams(5, cfg, variant="ttt5", model_profile="small")
+
+    assert profile == "small"
+    assert ttt5_small == (64, 6, 128)
 
 
 def test_policy_cell_index_maps_inside_padded_grid() -> None:
@@ -59,3 +90,91 @@ def test_build_train_pool_keeps_seed_samples() -> None:
     assert len(pool) == 10
     assert any(item.startswith("latest-") for item in ids)
     assert any(item.startswith("seed-") for item in ids)
+
+
+def test_merge_failure_bank_deduplicates_and_caps() -> None:
+    pos_a = {"board_size": 5, "board": [[0] * 5 for _ in range(5)], "current_player": 1, "last_move": None}
+    pos_b = {"board_size": 5, "board": [[0, 1, 0, 0, 0]] + [[0] * 5 for _ in range(4)], "current_player": 2, "last_move": [0, 1]}
+    merged = _merge_failure_bank([pos_a], [pos_a, pos_b], max_size=2)
+
+    assert len(merged) == 2
+    assert merged[-1]["current_player"] == 2
+
+
+def test_merge_position_bank_deduplicates_d4_equivalents_and_increases_weight() -> None:
+    base = {
+        "board_size": 5,
+        "board": [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+        ],
+        "current_player": 1,
+        "last_move": [1, 1],
+        "policy": [0.0] * 256,
+        "value": 0.5,
+        "source": "engine",
+    }
+    base["policy"][2] = 1.0
+
+    rotated = {
+        "board_size": 5,
+        "board": [
+            [0, 0, 0, 0, 1],
+            [0, 0, 0, 2, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+        ],
+        "current_player": 1,
+        "last_move": [1, 3],
+        "policy": [0.0] * 256,
+        "value": 0.75,
+        "source": "engine",
+    }
+    rotated["policy"][13] = 1.0
+
+    merged = _merge_position_bank([base], [rotated], max_size=8)
+
+    assert len(merged) == 1
+    assert merged[0]["mergeCount"] == 2
+    assert merged[0]["sampleWeight"] > 1.0
+
+
+def test_merge_position_bank_keeps_policy_target_legal_after_d4_canonicalization() -> None:
+    base = {
+        "board_size": 5,
+        "board": [
+            [0, 0, 0, 0, 1],
+            [0, 0, 0, 2, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+        ],
+        "current_player": 1,
+        "last_move": [1, 3],
+        "policy": [0.0] * 256,
+        "value": 0.5,
+        "source": "engine",
+    }
+    base["policy"][13] = 1.0
+
+    merged = _merge_position_bank([], [base], max_size=8)
+    sanity = _compute_target_sanity_metrics(merged)
+
+    assert len(merged) == 1
+    assert sanity["legalTargetRate"] == 100.0
+
+
+def test_build_repair_pool_prioritizes_failure_samples() -> None:
+    failure = [{"id": f"failure-{idx}"} for idx in range(10)]
+    anchor = [{"id": f"anchor-{idx}"} for idx in range(10)]
+    tactical = [{"id": f"tactical-{idx}"} for idx in range(10)]
+
+    pool = _build_repair_pool(failure, anchor, tactical, data_count=12)
+    ids = [item["id"] for item in pool]
+
+    assert len(pool) == 12
+    assert sum(item.startswith("failure-") for item in ids) >= 6

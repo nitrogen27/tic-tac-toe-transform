@@ -27,7 +27,11 @@
     "docker:ps": "docker-compose -f docker-compose.gpu.yml ps",
     "docker:up:cpu": "docker-compose -f docker-compose.yml up -d --build",
     "docker:logs:cpu": "docker-compose -f docker-compose.yml logs -f",
-    "benchmark": "node server/benchmark.mjs"
+    "benchmark": "node server/benchmark.mjs",
+    "start:legacy-ui-api": "powershell -ExecutionPolicy Bypass -File scripts/start-legacy-ui-api.ps1",
+    "stop:legacy-ui-api": "powershell -ExecutionPolicy Bypass -File scripts/stop-legacy-ui-api.ps1",
+    "start:train-metrics": "powershell -ExecutionPolicy Bypass -File scripts/start-training-metrics-monitor.ps1 -Variant ttt5",
+    "stop:train-metrics": "powershell -ExecutionPolicy Bypass -File scripts/stop-training-metrics-monitor.ps1 -Variant ttt5"
   },
   "devDependencies": {
     "concurrently": "^9.0.0"

@@ -14,6 +14,8 @@ import torch
 import torch.nn.functional as F
 
 from gomoku_api.config import settings
+from gomoku_api.ws.model_profiles import variant_model_hparams
+from gomoku_api.ws.model_registry import ModelRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -173,22 +175,16 @@ def _maybe_compile_model(model: Any) -> Any:
         return model
 
 
-def _variant_model_hparams(variant: str, board_size: int, cfg: Any) -> tuple[int, int, int]:
-    if board_size <= 3:
-        return 32, 3, 64
-    if board_size <= 5:
-        return 96, 8, 160
-    if board_size <= 9:
-        return 96, 6, 160
-    return cfg.res_filters, cfg.res_blocks, max(cfg.value_fc, 192)
-
-
 def _get_model(variant: str):
     """Load or return cached PyTorch model."""
     if variant in _loaded_models:
         return _loaded_models[variant]
 
-    model_path = SAVED_DIR / f"{variant}_resnet" / "model.pt"
+    # Prefer champion.pt (verified model), fall back to legacy model.pt
+    variant_dir = SAVED_DIR / f"{variant}_resnet"
+    model_path = variant_dir / "champion.pt"
+    if not model_path.exists():
+        model_path = variant_dir / "model.pt"
     if not model_path.exists():
         return None
 
@@ -197,6 +193,7 @@ def _get_model(variant: str):
         from trainer_lab.models.resnet import PolicyValueResNet
 
         cfg = ModelConfig()
+        manifest = ModelRegistry(variant).read_manifest()
         if variant == "ttt3":
             board_size = 3
         elif variant == "ttt5":
@@ -205,7 +202,12 @@ def _get_model(variant: str):
             board_size = int(variant.replace("gomoku", ""))
         else:
             board_size = 15
-        res_filters, res_blocks, value_fc = _variant_model_hparams(variant, board_size, cfg)
+        model_profile, (res_filters, res_blocks, value_fc) = variant_model_hparams(
+            variant,
+            board_size,
+            cfg,
+            manifest=manifest,
+        )
         model = PolicyValueResNet(
             in_channels=cfg.in_channels,
             res_filters=res_filters,
@@ -224,7 +226,7 @@ def _get_model(variant: str):
             model = model.cuda()
             model = _maybe_compile_model(model)
         _loaded_models[variant] = model
-        logger.info("Loaded model for %s from %s", variant, model_path)
+        logger.info("Loaded model for %s from %s (profile=%s)", variant, model_path, model_profile)
         return model
     except Exception as exc:
         logger.error("Failed to load model %s: %s", variant, exc)

@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help codegen build-engine test-engine bench-engine api web train dev-up dev-down legacy-up legacy-down clean
+.PHONY: help codegen build-engine test-engine bench-engine api web train dev-up dev-down legacy-up legacy-down legacy-ui-api-up legacy-ui-api-down train-metrics-up train-metrics-down clean
 
 help:
 	@echo "Gomoku Platform V3 — Build Targets"
@@ -23,6 +23,10 @@ help:
 	@echo "    make dev-down        - Stop new platform services"
 	@echo "    make legacy-up       - Start legacy server+client (GPU)"
 	@echo "    make legacy-down     - Stop legacy services"
+	@echo "    make legacy-ui-api-up   - Start old Vue UI (5173) + new FastAPI backend (8080)"
+	@echo "    make legacy-ui-api-down - Stop old Vue UI + new FastAPI backend"
+	@echo "    make train-metrics-up   - Start external JSONL training monitor (VARIANT=ttt5)"
+	@echo "    make train-metrics-down - Stop external training monitor (VARIANT=ttt5)"
 
 codegen:
 	bash packages/shared/codegen.sh
@@ -58,6 +62,18 @@ legacy-up:
 
 legacy-down:
 	docker compose -f docker-compose.gpu.yml down
+
+legacy-ui-api-up:
+	powershell -ExecutionPolicy Bypass -File scripts/start-legacy-ui-api.ps1
+
+legacy-ui-api-down:
+	powershell -ExecutionPolicy Bypass -File scripts/stop-legacy-ui-api.ps1
+
+train-metrics-up:
+	powershell -ExecutionPolicy Bypass -File scripts/start-training-metrics-monitor.ps1 -Variant "$(if $(VARIANT),$(VARIANT),ttt5)"
+
+train-metrics-down:
+	powershell -ExecutionPolicy Bypass -File scripts/stop-training-metrics-monitor.ps1 -Variant "$(if $(VARIANT),$(VARIANT),ttt5)"
 
 clean:
 	rm -rf engine-core/build

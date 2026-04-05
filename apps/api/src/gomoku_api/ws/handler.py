@@ -12,7 +12,8 @@ from fastapi import WebSocket, WebSocketDisconnect
 from gomoku_api.ws.game_service import GameService
 from gomoku_api.ws.gpu_info import get_gpu_info
 from gomoku_api.ws.predict_service import predict
-from gomoku_api.ws.offline_gen import generate_minimax_dataset
+from gomoku_api.ws.offline_gen import generate_engine_dataset, generate_minimax_dataset
+from gomoku_api.ws.training_diagnostics import run_training_diagnostics
 from gomoku_api.ws.train_service_ws import clear_model, train_variant
 
 logger = logging.getLogger(__name__)
@@ -26,14 +27,26 @@ _active_train_tasks: dict[str, asyncio.Task] = {}
 
 async def _run_training(variant: str, cb, **kwargs):
     """Wrapper that runs train_variant as a background task."""
+    from gomoku_api.ws.training_run_logger import TrainingRunLogger
+
+    run_logger = TrainingRunLogger(variant)
+
+    async def logged_cb(event: dict[str, Any]) -> None:
+        run_logger.log(event)
+        await cb(event)
+
     try:
-        await train_variant(variant, cb, **kwargs)
+        await train_variant(variant, logged_cb, **kwargs)
     except asyncio.CancelledError:
         logger.info("Training cancelled [%s]", variant)
-        await cb({"type": "train.cancelled", "payload": {"variant": variant}})
+        event = {"type": "train.cancelled", "payload": {"variant": variant}}
+        run_logger.log(event)
+        await cb(event)
     except Exception as exc:
         logger.error("Training failed [%s]: %s", variant, exc, exc_info=True)
-        await cb({"type": "train.error", "payload": {"error": str(exc), "variant": variant}})
+        event = {"type": "train.error", "payload": {"error": str(exc), "variant": variant}}
+        run_logger.log(event)
+        await cb(event)
     finally:
         _active_train_tasks.pop(variant, None)
 
@@ -133,9 +146,11 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 4096)
         cb = await _ws_callback(ws)
         extra = {}
-        for key in ("bootstrapGames", "mctsIterations", "mctsGamesPerIter"):
+        for key in ("bootstrapGames", "mctsIterations", "mctsGamesPerIter", "foundationDatasetCount", "offlineDatasetLimit", "examThresholdAcc", "modelProfile"):
             if key in payload:
                 extra[key] = payload[key]
+        if "preferOfflineDataset" in payload:
+            extra["preferOfflineDataset"] = payload["preferOfflineDataset"]
         task = asyncio.create_task(_run_training("ttt5", cb, epochs=epochs, batch_size=batch_size, data_count=5000, **extra))
         _active_train_tasks["ttt5"] = task
         await _send(ws, {"type": "train.accepted", "payload": {"variant": "ttt5"}})
@@ -158,6 +173,26 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         cb = await _ws_callback(ws)
         path = await generate_minimax_dataset(variant, count, cb)
         await _send(ws, {"type": "dataset.done", "payload": {"path": str(path), "count": count, "variant": variant}})
+
+    elif msg_type == "generate_engine_dataset":
+        variant = payload.get("variant", "ttt5")
+        count = min(max(int(payload.get("count", 10000)), 100), 100000)
+        cb = await _ws_callback(ws)
+        path = await generate_engine_dataset(variant, count, cb)
+        await _send(ws, {"type": "dataset.done", "payload": {"path": str(path), "count": count, "variant": variant, "mode": "engine"}})
+
+    elif msg_type == "run_training_diagnostics":
+        variant = payload.get("variant", "ttt5")
+        report = await run_training_diagnostics(
+            variant,
+            dataset_limit=min(max(int(payload.get("datasetLimit", 256)), 64), 4096),
+            holdout_ratio=min(max(float(payload.get("holdoutRatio", 0.2)), 0.05), 0.4),
+            tiny_steps=min(max(int(payload.get("tinySteps", 32)), 8), 256),
+            batch_size=min(max(int(payload.get("batchSize", 128)), 16), 1024),
+            model_profile=str(payload.get("modelProfile", "auto")),
+            include_quick_probe=bool(payload.get("includeQuickProbe", True)),
+        )
+        await _send(ws, {"type": "training.diagnostics", "payload": report})
 
     elif msg_type == "clear_model":
         variant = payload.get("variant", "all")
@@ -190,14 +225,20 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         # Optional auto-train (fire-and-forget)
         if payload.get("autoTrain"):
             variant = payload.get("variant", "ttt3")
-            cb = await _ws_callback(ws)
-            epochs = min(max(int(payload.get("epochs", 3)), 1), 10)
-            batch_size = min(max(int(payload.get("incrementalBatchSize", 256)), 32), 1024)
-            task = asyncio.create_task(_run_training(variant, cb, epochs=epochs, batch_size=batch_size, data_count=1000))
-            _active_train_tasks[variant] = task
+            if _is_training_active(variant):
+                await _send(ws, {"type": "train.rejected", "payload": {"variant": variant, "reason": "already running"}})
+            else:
+                cb = await _ws_callback(ws)
+                epochs = min(max(int(payload.get("epochs", 3)), 1), 10)
+                batch_size = min(max(int(payload.get("incrementalBatchSize", 256)), 32), 1024)
+                task = asyncio.create_task(_run_training(variant, cb, epochs=epochs, batch_size=batch_size, data_count=1000))
+                _active_train_tasks[variant] = task
 
     elif msg_type == "train_on_games":
         variant = payload.get("variant", "ttt3")
+        if _is_training_active(variant):
+            await _send(ws, {"type": "train.rejected", "payload": {"variant": variant, "reason": "already running"}})
+            return
         epochs = min(max(int(payload.get("epochs", 3)), 1), 10)
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 1024)
         cb = await _ws_callback(ws)

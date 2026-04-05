@@ -139,7 +139,7 @@
           </div>
         </div>
         <!-- TTT5 Interactive Training Panel -->
-        <div v-if="training && ttt5Progress && ttt5Progress.phase && !datasetProgress && !backgroundProgress" class="ttt5-training-panel">
+        <div v-if="ttt5Progress && ttt5Progress.phase && !datasetProgress && !backgroundProgress" class="ttt5-training-panel">
           <!-- Phase badges -->
           <div class="phase-badges">
             <template v-if="isLegacyStructuredPhase(ttt5Progress.phase)">
@@ -181,6 +181,10 @@
 
           <!-- Counters row -->
           <div class="training-counters">
+            <div class="counter" v-if="ttt5Progress.cycle > 0 || ttt5Progress.iteration > 0">
+              <span class="counter-label">Cycle</span>
+              <span class="counter-value">{{ ttt5Progress.cycle || ttt5Progress.iteration || 0 }}<span class="counter-total">/{{ ttt5Progress.totalCycles || ttt5Progress.totalIterations || 1 }}</span></span>
+            </div>
             <div class="counter" v-if="ttt5Progress.totalGames > 0">
               <span class="counter-label">Games</span>
               <span class="counter-value">{{ ttt5Progress.game || 0 }}<span class="counter-total">/{{ ttt5Progress.totalGames }}</span></span>
@@ -203,13 +207,17 @@
             </div>
           </div>
 
-          <!-- Epoch/batch detail -->
+          <!-- Training metrics -->
           <div v-if="ttt5Progress.epoch > 0" class="epoch-detail">
             <span class="epoch-text">Epoch {{ ttt5Progress.epoch }}/{{ ttt5Progress.totalEpochs }}</span>
             <span v-if="ttt5Progress.batch > 0" class="batch-text">(batch {{ ttt5Progress.batch }}/{{ ttt5Progress.totalBatches }})</span>
             <span v-if="ttt5Progress.loss" class="metric-text">loss: {{ ttt5Progress.loss }}</span>
-            <span v-if="ttt5Progress.accuracy" class="metric-text acc-text">acc: {{ ttt5Progress.accuracy }}%</span>
+            <span v-if="ttt5Progress.policyTop1Acc" class="metric-text acc-text">policyAcc: {{ ttt5Progress.policyTop1Acc }}%</span>
+            <span v-else-if="ttt5Progress.accuracy" class="metric-text acc-text">policyAcc: {{ ttt5Progress.accuracy }}%</span>
+            <span v-if="ttt5Progress.teacherMassOnPred" class="metric-text">tMass: {{ ttt5Progress.teacherMassOnPred }}</span>
+            <span v-if="ttt5Progress.policyKL" class="metric-text">KL: {{ ttt5Progress.policyKL }}</span>
             <span v-if="ttt5Progress.mae" class="metric-text">MAE: {{ ttt5Progress.mae }}</span>
+            <span v-if="ttt5Progress.valueSignAgreement" class="metric-text">vSign: {{ ttt5Progress.valueSignAgreement }}%</span>
           </div>
           <div v-if="hasRuntimeDiagnostics(ttt5Progress)" class="runtime-grid">
             <span v-if="ttt5Progress.deviceName" class="runtime-pill">device: {{ ttt5Progress.deviceName }}</span>
@@ -225,16 +233,85 @@
             <span v-if="ttt5Progress.gpuPowerW" class="runtime-pill">Power: {{ ttt5Progress.gpuPowerW }} W</span>
           </div>
 
-          <!-- Self-play stats -->
+          <!-- Self-play data generation stats (not model strength) -->
           <div v-if="ttt5Progress.selfPlayStats && (ttt5Progress.selfPlayStats.wins > 0 || ttt5Progress.selfPlayStats.losses > 0 || ttt5Progress.selfPlayStats.draws > 0)" class="selfplay-stats">
-            Self-play: <span class="sp-win">W {{ ttt5Progress.selfPlayStats.wins }}</span> /
+            Data gen: <span class="sp-win">W {{ ttt5Progress.selfPlayStats.wins }}</span> /
             <span class="sp-loss">L {{ ttt5Progress.selfPlayStats.losses }}</span> /
             <span class="sp-draw">D {{ ttt5Progress.selfPlayStats.draws }}</span>
+          </div>
+
+          <!-- Strength metrics (arena results) -->
+          <div v-if="
+            ttt5Progress.winrateVsChampion != null ||
+            ttt5Progress.winrateVsAlgorithm != null ||
+            ttt5Progress.promotionDecision != null ||
+            (ttt5Progress.holdoutPolicyAcc ?? trainingMeta?.holdoutPolicyAcc) != null ||
+            (ttt5Progress.frozenBlockAcc ?? trainingMeta?.frozenBlockAcc) != null
+          " class="strength-block">
+            <div class="strength-header">Strength</div>
+            <div class="strength-metrics">
+              <span v-if="ttt5Progress.winrateVsChampion != null" class="strength-pill">
+                vs champion: {{ (ttt5Progress.winrateVsChampion * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.winrateVsAlgorithm != null" class="strength-pill">
+                vs engine: {{ (ttt5Progress.winrateVsAlgorithm * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.deltaWinrate != null" class="strength-pill">
+                delta: {{ (ttt5Progress.deltaWinrate * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.progressTrend" class="strength-pill">
+                trend: {{ ttt5Progress.progressTrend }}
+              </span>
+              <span v-if="ttt5Progress.arenaWins != null" class="strength-pill">
+                arena: W{{ ttt5Progress.arenaWins }}/L{{ ttt5Progress.arenaLosses }}/D{{ ttt5Progress.arenaDraws }}
+              </span>
+              <span v-if="ttt5Progress.failureBankSize != null" class="strength-pill">
+                failures: {{ ttt5Progress.failureBankSize }}
+              </span>
+              <span v-if="ttt5Progress.fixedErrors != null" class="strength-pill">
+                fixed: {{ ttt5Progress.fixedErrors }}
+              </span>
+              <span v-if="ttt5Progress.regressedErrors != null" class="strength-pill">
+                regressed: {{ ttt5Progress.regressedErrors }}
+              </span>
+              <span v-if="ttt5Progress.correctedRate != null" class="strength-pill">
+                corrected: {{ (ttt5Progress.correctedRate * 100).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.tacticalAccuracy != null" class="strength-pill">
+                tactical: {{ ttt5Progress.tacticalAccuracy }}%
+              </span>
+              <span v-if="(ttt5Progress.holdoutPolicyAcc ?? trainingMeta?.holdoutPolicyAcc) != null" class="strength-pill">
+                holdout: {{ (ttt5Progress.holdoutPolicyAcc ?? trainingMeta?.holdoutPolicyAcc).toFixed(1) }}%
+              </span>
+              <span v-if="(ttt5Progress.holdoutPolicyKL ?? trainingMeta?.holdoutPolicyKL) != null" class="strength-pill">
+                holdout KL: {{ (ttt5Progress.holdoutPolicyKL ?? trainingMeta?.holdoutPolicyKL).toFixed(4) }}
+              </span>
+              <span v-if="(ttt5Progress.frozenBlockAcc ?? trainingMeta?.frozenBlockAcc) != null" class="strength-pill">
+                frozen block: {{ (ttt5Progress.frozenBlockAcc ?? trainingMeta?.frozenBlockAcc).toFixed(1) }}%
+              </span>
+              <span v-if="(ttt5Progress.frozenWinAcc ?? trainingMeta?.frozenWinAcc) != null" class="strength-pill">
+                frozen win: {{ (ttt5Progress.frozenWinAcc ?? trainingMeta?.frozenWinAcc).toFixed(1) }}%
+              </span>
+              <span v-if="(ttt5Progress.frozenMidAcc ?? trainingMeta?.frozenMidAcc) != null" class="strength-pill">
+                frozen mid: {{ (ttt5Progress.frozenMidAcc ?? trainingMeta?.frozenMidAcc).toFixed(1) }}%
+              </span>
+              <span v-if="(ttt5Progress.frozenLateAcc ?? trainingMeta?.frozenLateAcc) != null" class="strength-pill">
+                frozen late: {{ (ttt5Progress.frozenLateAcc ?? trainingMeta?.frozenLateAcc).toFixed(1) }}%
+              </span>
+              <span v-if="ttt5Progress.promotionDecision != null" class="strength-pill" :class="ttt5Progress.promoted ? 'promoted' : 'rejected'">
+                {{ ttt5Progress.promoted ? 'PROMOTED' : 'not promoted' }}
+              </span>
+            </div>
           </div>
 
           <!-- Training Charts (uPlot) -->
           <div v-if="metricsHistory.length > 1" class="training-charts">
             <div ref="lossChartEl" class="uplot-chart"></div>
+          </div>
+
+          <!-- Winrate vs Engine Chart -->
+          <div v-if="winrateHistory.length > 0" class="training-charts winrate-chart-block">
+            <div ref="winrateChartEl" class="uplot-chart"></div>
           </div>
         </div>
 
@@ -378,9 +455,9 @@ const mainTrainingBatchSize = ref(1024)
 const activePreset = ref('medium') // 'light', 'medium', 'deep', 'custom'
 
 const PRESETS = {
-  light:  { epochs: 10, batchSize: 512,  bootstrapGames: 50,  mctsIterations: 2, mctsGamesPerIter: 20,  label: 'Лёгкое', desc: '10 эпох · batch 512 · 50 bootstrap · 2×20 self-play' },
-  medium: { epochs: 25, batchSize: 1024, bootstrapGames: 100, mctsIterations: 3, mctsGamesPerIter: 40,  label: 'Среднее', desc: '25 эпох · batch 1024 · 100 bootstrap · 3×40 self-play' },
-  deep:   { epochs: 50, batchSize: 2048, bootstrapGames: 200, mctsIterations: 5, mctsGamesPerIter: 100, label: 'Глубокое', desc: '50 эпох · batch 2048 · 200 bootstrap · 5×100 self-play' },
+  light:  { epochs: 10, batchSize: 512,  bootstrapGames: 50,  mctsIterations: 2, mctsGamesPerIter: 20,  label: 'Лёгкое', desc: '10 эпох · batch 512 · 50 teacher-pos · 2 коротких exam cycles' },
+  medium: { epochs: 25, batchSize: 1024, bootstrapGames: 100, mctsIterations: 3, mctsGamesPerIter: 40,  label: 'Среднее', desc: '25 эпох · batch 1024 · 100 teacher-pos · 3 exam/repair cycles' },
+  deep:   { epochs: 50, batchSize: 2048, bootstrapGames: 200, mctsIterations: 5, mctsGamesPerIter: 100, label: 'Глубокое', desc: '50 эпох · batch 2048 · 200 teacher-pos · 5 exam/repair cycles' },
 }
 
 const presetDescription = computed(() => PRESETS[activePreset.value]?.desc || '')
@@ -525,9 +602,12 @@ let trainingTimerInterval = null
 let gpuPollInterval = null
 
 const metricsHistory = ref([]) // For training charts
+const winrateHistory = ref([]) // Winrate vs engine per exam cycle
 const lossChartEl = ref(null) // uPlot loss chart container
 const accChartEl = ref(null) // uPlot accuracy chart container
+const winrateChartEl = ref(null) // uPlot winrate chart container
 let lossChart = null
+let winrateChart = null
 let accChart = null
 const lastProbs = ref(null) // Last policy probabilities from bot
 const policyCanvas = ref(null) // Canvas for policy heatmap
@@ -549,7 +629,23 @@ function formatPositionCount(progress) {
 }
 
 function getPhaseLabel(name) {
-  const labels = { tactical: 'Tactical', supervised: 'Supervised', bootstrap: 'Bootstrap', mcts: 'MCTS', self_play: 'Self-Play', training: 'PyTorch Training', preparing: 'Preparing', encoding: 'Encoding', evaluating: 'Evaluating' }
+  const labels = {
+    tactical: 'Tactical',
+    supervised: 'Supervised',
+    bootstrap: 'Bootstrap',
+    foundation: 'Foundation',
+    turbo_train: 'Turbo Train',
+    exam: 'Exam vs Engine',
+    repair: 'Repair Train',
+    repair_eval: 'Repair Eval',
+    promotion: 'Promotion Gate',
+    mcts: 'MCTS',
+    self_play: 'Self-Play',
+    training: 'PyTorch Training',
+    preparing: 'Preparing',
+    encoding: 'Encoding',
+    evaluating: 'Evaluating'
+  }
   return labels[name] || name
 }
 
@@ -632,9 +728,41 @@ function updateCharts() {
   }
 }
 
+function createWinrateChart() {
+  if (!winrateChartEl.value || winrateChart) return
+  if (!winrateChartEl.value.isConnected) return
+  const opts = {
+    width: winrateChartEl.value.offsetWidth || 600,
+    height: 180,
+    title: 'Winrate vs Engine',
+    cursor: { show: true },
+    scales: { x: { time: false }, y: { range: [0, 100] } },
+    axes: [
+      { stroke: '#666', font: '11px system-ui', size: 28, label: 'Cycle' },
+      { stroke: '#1565c0', font: '11px system-ui', size: 45, label: 'Winrate %' },
+    ],
+    series: [
+      { label: 'Cycle' },
+      { label: 'Winrate', stroke: '#1565c0', width: 2, fill: 'rgba(21,101,192,0.1)' },
+    ],
+  }
+  winrateChart = new uPlot(opts, [[0], [null]], winrateChartEl.value)
+}
+
+function updateWinrateChart() {
+  const data = winrateHistory.value
+  if (!data || data.length < 1) return
+  const cycles = data.map(d => d.cycle)
+  const winrates = data.map(d => (d.winrate || 0) * 100)
+  if (winrateChart) {
+    winrateChart.setData([cycles, winrates])
+  }
+}
+
 function destroyCharts() {
   if (lossChart) { lossChart.destroy(); lossChart = null }
   if (accChart) { accChart.destroy(); accChart = null }
+  if (winrateChart) { winrateChart.destroy(); winrateChart = null }
 }
 
 // ===== Policy Heatmap =====
@@ -844,14 +972,47 @@ function connectWS() {
               if (msg.payload.metricsHistory) {
                 metricsHistory.value = msg.payload.metricsHistory
               }
+              // Collect winrate data from exam phase completion
+              const _p = msg.payload
+              if (_p.phase === 'exam' && _p.winrateVsAlgorithm != null && _p.game === _p.totalGames) {
+                const cycle = _p.cycle || _p.iteration || winrateHistory.value.length + 1
+                const existing = winrateHistory.value.find(h => h.cycle === cycle)
+                if (!existing) {
+                  winrateHistory.value = [...winrateHistory.value, {
+                    cycle,
+                    winrate: _p.winrateVsAlgorithm,
+                    wins: _p.arenaWins || 0,
+                    losses: _p.arenaLosses || 0,
+                    draws: _p.arenaDraws || 0,
+                  }]
+                }
+              }
               // Build status text from structured data
               const p = msg.payload
               let statusText = ''
-              if (p.phase === 'tactical') statusText = `Tactical curriculum`
+              if (p.phase === 'foundation') statusText = `Foundation teacher`
+              else if (p.phase === 'turbo_train') statusText = `Turbo train ${p.iteration || p.cycle || ''}/${p.totalIterations || p.totalCycles || ''}`
+              else if (p.phase === 'exam') statusText = `Exam vs engine ${p.iteration || p.cycle || ''}/${p.totalIterations || p.totalCycles || ''}`
+              else if (p.phase === 'repair') statusText = `Repair train ${p.iteration || p.cycle || ''}/${p.totalIterations || p.totalCycles || ''}`
+              else if (p.phase === 'repair_eval') statusText = `Repair eval ${p.iteration || p.cycle || ''}/${p.totalIterations || p.totalCycles || ''}`
+              else if (p.phase === 'holdout') statusText = `Holdout & frozen benchmarks ${p.iteration || p.cycle || ''}/${p.totalIterations || p.totalCycles || ''}`
+              else if (p.phase === 'tactical') statusText = `Tactical curriculum`
               else if (p.phase === 'bootstrap') statusText = `Bootstrap`
+              else if (p.phase === 'self_play') statusText = `Self-play ${p.iteration || ''}/${p.totalIterations || ''}`
+              else if (p.phase === 'arena') statusText = `Arena evaluation`
+              else if (p.phase === 'confirm_exam') statusText = `Confirm exam (${p.game || 0}/${p.totalGames || 0})`
+              else if (p.phase === 'promotion') statusText = `Promotion gate`
               else if (p.phase === 'mcts') statusText = `MCTS ${p.iteration || ''}/${p.totalIterations || ''}`
               if (p.epoch > 0) statusText += ` | Epoch ${p.epoch}/${p.totalEpochs}`
-              if (p.accuracy) statusText += ` | Acc: ${p.accuracy}%`
+              if (p.winrateVsAlgorithm != null) statusText += ` | WR: ${(p.winrateVsAlgorithm * 100).toFixed(1)}%`
+              if (p.deltaWinrate != null) statusText += ` | Δ ${(p.deltaWinrate * 100).toFixed(1)}%`
+              if (p.holdoutPolicyAcc != null) statusText += ` | Holdout: ${p.holdoutPolicyAcc}%`
+              if (p.frozenBlockAcc != null) statusText += ` | Block: ${p.frozenBlockAcc}%`
+              if (p.frozenWinAcc != null) statusText += ` | Win: ${p.frozenWinAcc}%`
+              if (p.policyTop1Acc) statusText += ` | Acc: ${p.policyTop1Acc}%`
+              else if (p.accuracy) statusText += ` | Acc: ${p.accuracy}%`
+              if (p.fixedErrors != null) statusText += ` | Fixed: ${p.fixedErrors}`
+              if (p.regressedErrors != null) statusText += ` | Regr: ${p.regressedErrors}`
               if (p.loss) statusText += ` | Loss: ${p.loss}`
               status.value = statusText
             } else {
@@ -871,6 +1032,7 @@ function connectWS() {
           gpuTelemetry.value = extractGpuTelemetry(msg.payload)
           progress.value = { percent: 0, epoch: 0, epochs: msg.payload.epochs }
           ttt5Progress.value = { ...msg.payload, phase: 'preparing', percent: 0, elapsed: 0, eta: 0 }
+          winrateHistory.value = []
           // Не сбрасываем datasetProgress здесь - генерация еще не началась
           status.value = 'Подготовка к обучению...'
           console.log('[WS] Training started, epochs:', msg.payload.epochs)
@@ -911,17 +1073,42 @@ function connectWS() {
         if (trainingTimerInterval) { clearInterval(trainingTimerInterval); trainingTimerInterval = null }
         status.value = `Обучение ${msg.payload.variant} отменено`
       }
+      if (msg.type === 'model.promoted') {
+        const p = msg.payload
+        const wr = p.winrateVsChampion ? ` (wr ${(p.winrateVsChampion * 100).toFixed(1)}%)` : ''
+        status.value = `Model promoted: gen ${p.generation}${wr}`
+        console.log('[WS] Model promoted:', p)
+      }
+      if (msg.type === 'train.rejected') {
+        // Duplicate launch rejection — show user feedback
+        status.value = `Обучение ${msg.payload.variant} уже запущено`
+        console.log('[WS] Training rejected (duplicate):', msg.payload)
+      }
+      if (msg.type === 'promotion.rejected') {
+        const p = msg.payload
+        status.value = `Promotion rejected: ${p.reason}`
+        console.log('[WS] Promotion rejected:', p.reason)
+      }
       if (msg.type === 'train.done') {
         training.value = false
         datasetProgress.value = null
         // Stop timer & show final time
         if (trainingTimerInterval) { clearInterval(trainingTimerInterval); trainingTimerInterval = null }
         const totalTime = formatTime(Math.floor((Date.now() - trainingStartTime.value) / 1000))
-        ttt5Progress.value = null
-        trainingMeta.value = null
-        metricsHistory.value = []
-        status.value = `Обучение завершено за ${totalTime}`
-        console.log('[WS] Training completed')
+        const p = msg.payload
+        let doneStatus = `Обучение завершено за ${totalTime}`
+        if (p.winrateVsChampion != null) doneStatus += ` | vs champion: ${(p.winrateVsChampion * 100).toFixed(1)}%`
+        if (p.winrateVsAlgorithm != null) doneStatus += ` | vs engine: ${(p.winrateVsAlgorithm * 100).toFixed(1)}%`
+        if (p.holdoutPolicyAcc != null) doneStatus += ` | holdout: ${p.holdoutPolicyAcc}%`
+        if (p.frozenBlockAcc != null) doneStatus += ` | block: ${p.frozenBlockAcc}%`
+        if (p.frozenWinAcc != null) doneStatus += ` | win: ${p.frozenWinAcc}%`
+        if (p.failureBankSize != null) doneStatus += ` | failures: ${p.failureBankSize}`
+        if (p.promoted) doneStatus += ' | PROMOTED'
+        ttt5Progress.value = { ...(ttt5Progress.value || {}), ...p, phase: 'done' }
+        trainingMeta.value = { ...(trainingMeta.value || {}), ...p }
+        if (p.metricsHistory) metricsHistory.value = p.metricsHistory
+        status.value = doneStatus
+        console.log('[WS] Training completed:', p)
         // Обновляем статистику истории после обучения
         if (ws.value && ws.value.readyState === WebSocket.OPEN) {
           ws.value.send(JSON.stringify({ type: 'get_history_stats' }))
@@ -1536,6 +1723,19 @@ watch(metricsHistory, () => {
   }
 }, { deep: true })
 
+watch(winrateHistory, () => {
+  if (winrateHistory.value.length > 0) {
+    nextTick(() => {
+      if (winrateChart && winrateChartEl.value && !winrateChartEl.value.querySelector('canvas')) {
+        try { winrateChart.destroy() } catch (_) {}
+        winrateChart = null
+      }
+      if (!winrateChart && winrateChartEl.value) createWinrateChart()
+      updateWinrateChart()
+    })
+  }
+}, { deep: true })
+
 // Clear heatmap on board reset
 watch(board, () => {
   if (board.value.every(v => v === 0)) {
@@ -1912,6 +2112,48 @@ onMounted(() => {
 .sp-loss { color: #c62828; font-weight: 600; }
 .sp-draw { color: #f57c00; font-weight: 600; }
 
+.strength-block {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: rgba(33, 150, 243, 0.08);
+  border: 1px solid rgba(33, 150, 243, 0.25);
+  border-radius: 6px;
+}
+
+.strength-header {
+  font-size: 0.8em;
+  font-weight: 600;
+  color: #1565c0;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+
+.strength-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.strength-pill {
+  padding: 2px 8px;
+  background: rgba(33, 150, 243, 0.12);
+  border-radius: 4px;
+  font-size: 0.85em;
+  color: #1976d2;
+}
+
+.strength-pill.promoted {
+  background: rgba(46, 125, 50, 0.15);
+  color: #2e7d32;
+  font-weight: 600;
+}
+
+.strength-pill.rejected {
+  background: rgba(198, 40, 40, 0.1);
+  color: #c62828;
+}
+
 .sparkline-container {
   margin-top: 10px;
 }
@@ -1949,6 +2191,10 @@ onMounted(() => {
   background: white;
   border-radius: 8px;
   border: 1px solid #e0e0e0;
+}
+.winrate-chart-block {
+  border-color: rgba(21, 101, 192, 0.3);
+  background: rgba(21, 101, 192, 0.02);
 }
 .uplot-chart {
   width: 100%;

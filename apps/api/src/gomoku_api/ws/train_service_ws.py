@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import random
 import re
 import time
@@ -15,6 +16,10 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from gomoku_api.ws.gpu_info import get_gpu_info
+from gomoku_api.ws.model_profiles import (
+    current_model_profile_from_manifest,
+    variant_model_hparams as _shared_variant_model_hparams,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,20 +54,14 @@ def _count_model_parameters(model: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
 
 
-def _variant_model_hparams(board_size: int, cfg: Any) -> tuple[int, int, int]:
-    """Return variant-specific network size.
-
-    Small boards still use compact models, but 5x5 and larger boards get a
-    meaningfully wider/deeper network so the GPU has enough work and the model
-    has more capacity for tactics.
-    """
-    if board_size <= 3:
-        return 32, 3, 64
-    if board_size <= 5:
-        return 96, 8, 160
-    if board_size <= 9:
-        return 96, 6, 160
-    return cfg.res_filters, cfg.res_blocks, max(cfg.value_fc, 192)
+def _variant_model_hparams(board_size: int, cfg: Any, *, variant: str = "", model_profile: str | None = None, manifest: dict[str, Any] | None = None) -> tuple[str, tuple[int, int, int]]:
+    return _shared_variant_model_hparams(
+        variant or f"gomoku{board_size}",
+        board_size,
+        cfg,
+        model_profile=model_profile,
+        manifest=manifest,
+    )
 
 
 def _prepare_cuda_runtime(device: torch.device) -> dict[str, bool]:
@@ -129,6 +128,10 @@ def _flat_to_board2d(board: list[int], board_size: int) -> list[list[int]]:
     ]
 
 
+def _board2d_to_flat(board: list[list[int]]) -> list[int]:
+    return [cell for row in board for cell in row]
+
+
 def _policy_cell_index(flat_index: int, board_size: int) -> int:
     row, col = divmod(flat_index, board_size)
     return row * 16 + col
@@ -173,9 +176,15 @@ def _extract_telemetry(gpu_info: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compute_tactical_accuracy(
-    model: Any, board_size: int, win_len: int, device: Any, n_samples: int = 200
+    model: Any, board_size: int, win_len: int, device: Any, n_samples: int = 200,
+    motif_filter: str | None = None,
 ) -> float:
-    """Evaluate model on tactical positions (win/block). Returns accuracy 0-100."""
+    """Evaluate model on tactical positions. Returns accuracy 0-100.
+
+    Parameters
+    ----------
+    motif_filter : "win", "block", or None (both mixed).
+    """
     from trainer_lab.data.encoder import board_to_tensor
     import torch.nn.functional as F
 
@@ -187,7 +196,7 @@ def _compute_tactical_accuracy(
     with torch.no_grad():
         for _ in range(n_samples):
             board = [0] * (board_size * board_size)
-            motif = random.choice(("win", "block"))
+            motif = motif_filter or random.choice(("win", "block"))
             current = random.choice((1, 2))
             line_player = current if motif == "win" else (2 if current == 1 else 1)
             dr, dc = random.choice(directions)
@@ -260,6 +269,869 @@ async def _emit_dataset_progress(
             "workers": 1,
         },
     })
+
+
+def _position_last_move_index(position: dict[str, Any]) -> int:
+    last_move = position.get("last_move")
+    if not last_move:
+        return -1
+    row, col = last_move
+    return row * int(position["board_size"]) + col
+
+
+def _position_fingerprint(position: dict[str, Any]) -> tuple[Any, ...]:
+    board_2d = position.get("board") or []
+    return (
+        int(position.get("board_size", 0)),
+        tuple(_board2d_to_flat(board_2d)),
+        int(position.get("current_player", 0)),
+        tuple(position.get("last_move") or (-1, -1)),
+    )
+
+
+def _transform_square_tensor(grid: torch.Tensor, transform_idx: int) -> torch.Tensor:
+    if transform_idx == 0:
+        return grid
+    if transform_idx == 1:
+        return torch.rot90(grid, 1, dims=(0, 1))
+    if transform_idx == 2:
+        return torch.rot90(grid, 2, dims=(0, 1))
+    if transform_idx == 3:
+        return torch.rot90(grid, 3, dims=(0, 1))
+    if transform_idx == 4:
+        return grid.flip(0)
+    if transform_idx == 5:
+        return grid.flip(1)
+    if transform_idx == 6:
+        return grid.transpose(0, 1)
+    return torch.rot90(grid, 1, dims=(0, 1)).flip(0)
+
+
+def _transform_last_move(
+    last_move: list[int] | tuple[int, int] | None,
+    board_size: int,
+    transform_idx: int,
+) -> list[int] | None:
+    if not last_move:
+        return None
+    row, col = int(last_move[0]), int(last_move[1])
+    marker = torch.zeros((board_size, board_size), dtype=torch.int8)
+    marker[row, col] = 1
+    transformed = _transform_square_tensor(marker, transform_idx).reshape(-1)
+    flat_idx = int(transformed.argmax().item())
+    return [flat_idx // board_size, flat_idx % board_size]
+
+
+def _transform_policy_vector(policy: list[float], board_size: int, transform_idx: int) -> list[float]:
+    grid = torch.tensor(policy, dtype=torch.float32).reshape(16, 16)
+    if board_size >= 16:
+        transformed = _transform_square_tensor(grid, transform_idx)
+        return transformed.reshape(256).tolist()
+
+    transformed = torch.zeros_like(grid)
+    transformed[:board_size, :board_size] = _transform_square_tensor(
+        grid[:board_size, :board_size],
+        transform_idx,
+    )
+    return transformed.reshape(256).tolist()
+
+
+def _normalize_policy_vector(policy: list[float]) -> list[float]:
+    total = sum(policy)
+    if total <= 1e-8:
+        return policy
+    return [float(v / total) for v in policy]
+
+
+def _canonicalize_position(position: dict[str, Any]) -> dict[str, Any]:
+    if "_canonicalFingerprint" in position:
+        return position
+
+    board_size = int(position.get("board_size", 0))
+    board_tensor = torch.tensor(position.get("board") or [], dtype=torch.int16)
+    if board_tensor.numel() == 0:
+        canonical = dict(position)
+        canonical["_canonicalFingerprint"] = _position_fingerprint(position)
+        return canonical
+
+    best_key: tuple[Any, ...] | None = None
+    best_variant: dict[str, Any] | None = None
+    policy = position.get("policy")
+    current_player = int(position.get("current_player", 0))
+
+    for transform_idx in range(8):
+        board_variant = _transform_square_tensor(board_tensor, transform_idx)
+        last_move_variant = _transform_last_move(position.get("last_move"), board_size, transform_idx)
+        key = (
+            board_size,
+            tuple(int(v) for v in board_variant.reshape(-1).tolist()),
+            current_player,
+            tuple(last_move_variant or (-1, -1)),
+        )
+        if best_key is not None and key >= best_key:
+            continue
+
+        candidate = dict(position)
+        candidate["board"] = board_variant.tolist()
+        candidate["last_move"] = last_move_variant
+        if policy is not None:
+            candidate["policy"] = _transform_policy_vector(policy, board_size, transform_idx)
+        candidate["_canonicalFingerprint"] = key
+        best_key = key
+        best_variant = candidate
+
+    assert best_variant is not None
+    return best_variant
+
+
+def _position_bank_importance(position: dict[str, Any]) -> float:
+    source = position.get("source", "")
+    motif = position.get("motif", "")
+    sample_weight = float(position.get("sampleWeight", 1.0))
+    merge_count = float(position.get("mergeCount", 1))
+    importance = sample_weight + min(math.log2(max(merge_count, 1.0) + 1.0) * 0.15, 0.75)
+    if source == "failure":
+        importance += 0.35
+    elif source == "engine":
+        importance += 0.20
+    if motif in {"block", "win"}:
+        importance += 0.20
+    return importance
+
+
+def _merge_position_records(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    existing = _canonicalize_position(existing)
+    incoming = _canonicalize_position(incoming)
+
+    existing_count = float(existing.get("mergeCount", 1))
+    incoming_count = float(incoming.get("mergeCount", 1))
+    total_count = max(existing_count + incoming_count, 1.0)
+
+    prefer_incoming = incoming.get("source") == "engine" and existing.get("source") != "engine"
+    merged = dict(incoming if prefer_incoming else existing)
+
+    existing_policy = existing.get("policy")
+    incoming_policy = incoming.get("policy")
+    if isinstance(existing_policy, list) and isinstance(incoming_policy, list):
+        merged_policy = [
+            ((float(a) * existing_count) + (float(b) * incoming_count)) / total_count
+            for a, b in zip(existing_policy, incoming_policy)
+        ]
+        merged["policy"] = _normalize_policy_vector(merged_policy)
+
+    existing_value = float(existing.get("value", 0.0))
+    incoming_value = float(incoming.get("value", 0.0))
+    merged["value"] = ((existing_value * existing_count) + (incoming_value * incoming_count)) / total_count
+    merged["mergeCount"] = int(total_count)
+    merged["sampleWeight"] = round(min(1.0 + math.log2(total_count + 1.0) * 0.35, 3.0), 4)
+    merged["_canonicalFingerprint"] = existing.get("_canonicalFingerprint") or incoming.get("_canonicalFingerprint")
+    merged["_order"] = max(int(existing.get("_order", 0)), int(incoming.get("_order", 0)))
+    if existing.get("source") == "engine" or incoming.get("source") == "engine":
+        merged["source"] = "engine"
+    return merged
+
+
+def _sanitize_bank_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for pos in positions:
+        cleaned = {k: v for k, v in pos.items() if not k.startswith("_")}
+        sanitized.append(cleaned)
+    return sanitized
+
+
+def _merge_position_bank(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    *,
+    max_size: int,
+) -> list[dict[str, Any]]:
+    merged_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    order = 0
+
+    def ingest(raw_position: dict[str, Any]) -> None:
+        nonlocal order
+        canonical = _canonicalize_position(raw_position)
+        order += 1
+        canonical["_order"] = order
+        key = canonical["_canonicalFingerprint"]
+        if key in merged_by_key:
+            merged_by_key[key] = _merge_position_records(merged_by_key[key], canonical)
+            merged_by_key[key]["_order"] = order
+        else:
+            canonical.setdefault("mergeCount", 1)
+            canonical.setdefault("sampleWeight", 1.0)
+            merged_by_key[key] = canonical
+
+    for position in existing:
+        ingest(position)
+    for position in incoming:
+        ingest(position)
+
+    merged = list(merged_by_key.values())
+    if len(merged) > max_size:
+        merged.sort(key=lambda pos: (_position_bank_importance(pos), int(pos.get("_order", 0))))
+        merged = merged[-max_size:]
+    merged.sort(key=lambda pos: int(pos.get("_order", 0)))
+    return _sanitize_bank_positions(merged)
+
+
+def _split_holdout_positions(
+    positions: list[dict[str, Any]],
+    *,
+    holdout_ratio: float = 0.10,
+    max_holdout: int = 64,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if len(positions) < 8 or holdout_ratio <= 0:
+        return list(positions), []
+
+    holdout_count = min(max(int(round(len(positions) * holdout_ratio)), 1), max_holdout, len(positions) // 4)
+    holdout_indices = set(random.sample(range(len(positions)), holdout_count))
+    train_split: list[dict[str, Any]] = []
+    holdout_split: list[dict[str, Any]] = []
+    for idx, position in enumerate(positions):
+        if idx in holdout_indices:
+            held = dict(position)
+            held["source"] = held.get("source", "holdout")
+            holdout_split.append(held)
+        else:
+            train_split.append(position)
+    return train_split, holdout_split
+
+
+def _load_offline_dataset_positions(
+    variant: str,
+    *,
+    max_positions: int | None = None,
+) -> tuple[list[dict[str, Any]], Path | None, str | None]:
+    datasets_dir = SAVED_DIR / "datasets"
+    candidates = [
+        ("engine", datasets_dir / f"{variant}_engine.json"),
+        ("minimax", datasets_dir / f"{variant}_minimax.json"),
+    ]
+    for dataset_type, path in candidates:
+        if not path.exists():
+            continue
+        try:
+            positions = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to load offline dataset %s: %s", path, exc)
+            continue
+        if max_positions is not None and max_positions > 0:
+            positions = positions[:max_positions]
+        return positions, path, dataset_type
+    return [], None, None
+
+
+def _compute_target_sanity_metrics(positions: list[dict[str, Any]]) -> dict[str, float]:
+    from trainer_lab.data.encoder import board_to_tensor
+
+    if not positions:
+        return {}
+
+    policy_sum_error = 0.0
+    legal_target_hits = 0
+    non_finite_targets = 0
+    unique_fingerprints: set[tuple[Any, ...]] = set()
+
+    for position in positions:
+        policy = position.get("policy") or []
+        if not policy:
+            non_finite_targets += 1
+            continue
+
+        policy_sum_error += abs(float(sum(policy)) - 1.0)
+        if any(not math.isfinite(float(value)) for value in policy):
+            non_finite_targets += 1
+            continue
+
+        tensor = board_to_tensor(position)
+        legal_mask = tensor[2].reshape(-1)
+        target_idx = max(range(len(policy)), key=policy.__getitem__)
+        if target_idx < legal_mask.numel() and float(legal_mask[target_idx].item()) > 0.5:
+            legal_target_hits += 1
+
+        canonical = _canonicalize_position(position)
+        fingerprint = canonical.get("_canonicalFingerprint")
+        if isinstance(fingerprint, tuple):
+            unique_fingerprints.add(fingerprint)
+
+    total = max(len(positions), 1)
+    unique = len(unique_fingerprints) or total
+    return {
+        "policyMassMeanAbsError": round(policy_sum_error / total, 6),
+        "legalTargetRate": round((legal_target_hits / total) * 100.0, 2),
+        "nonFiniteTargetRate": round((non_finite_targets / total) * 100.0, 2),
+        "uniqueCanonicalPositions": float(unique),
+        "duplicateMergeRate": round(max(0.0, 1.0 - (unique / total)), 4),
+    }
+
+
+def _sample_positions(positions: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+    if count <= 0 or not positions:
+        return []
+    if len(positions) <= count:
+        return list(positions)
+    weights = torch.tensor([
+        max(float(position.get("sampleWeight", 1.0)), 0.05) * (1.0 + 0.30 * ((idx + 1) / max(len(positions), 1)))
+        for idx, position in enumerate(positions)
+    ], dtype=torch.float32)
+    picks = torch.multinomial(weights, num_samples=count, replacement=False).tolist()
+    return [positions[idx] for idx in picks]
+
+
+def _merge_failure_bank(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    *,
+    max_size: int,
+) -> list[dict[str, Any]]:
+    tagged_existing = [{**pos, "source": pos.get("source", "failure")} for pos in existing]
+    tagged_incoming = [{**pos, "source": pos.get("source", "failure")} for pos in incoming]
+    return _merge_position_bank(tagged_existing, tagged_incoming, max_size=max_size)
+
+
+def _build_repair_pool(
+    failure_bank: list[dict[str, Any]],
+    anchor_positions: list[dict[str, Any]],
+    tactical_positions: list[dict[str, Any]],
+    *,
+    data_count: int,
+) -> list[dict[str, Any]]:
+    """Prioritize recent mistakes while keeping anchor/tactical stability."""
+    if data_count <= 0:
+        return []
+
+    fail_quota = min(len(failure_bank), max(int(data_count * 0.65), 0))
+    anchor_quota = min(len(anchor_positions), max(int(data_count * 0.25), 0))
+    tactical_quota = min(len(tactical_positions), max(data_count - fail_quota - anchor_quota, 0))
+
+    pool: list[dict[str, Any]] = []
+    if fail_quota > 0:
+        pool.extend(_sample_positions(failure_bank, fail_quota))
+    if anchor_quota > 0:
+        pool.extend(_sample_positions(anchor_positions, anchor_quota))
+    if tactical_quota > 0:
+        pool.extend(_sample_positions(tactical_positions, tactical_quota))
+
+    if len(pool) < data_count:
+        leftovers = failure_bank + anchor_positions + tactical_positions
+        needed = min(data_count - len(pool), len(leftovers))
+        if needed > 0:
+            pool.extend(_sample_positions(leftovers, needed))
+
+    random.shuffle(pool)
+    return pool[:data_count]
+
+
+def _build_turbo_pool(
+    anchor_positions: list[dict[str, Any]],
+    tactical_positions: list[dict[str, Any]],
+    failure_bank: list[dict[str, Any]],
+    *,
+    data_count: int,
+    tactical_ratio: float = 0.20,
+) -> list[dict[str, Any]]:
+    """Anchor-heavy pool for high-throughput short training bursts."""
+    if data_count <= 0:
+        return []
+
+    anchor_ratio = max(0.10, 1.0 - tactical_ratio - 0.20)
+    anchor_quota = min(len(anchor_positions), max(int(data_count * anchor_ratio), 0))
+    tactical_quota = min(len(tactical_positions), max(int(data_count * tactical_ratio), 0))
+    failure_quota = min(len(failure_bank), max(data_count - anchor_quota - tactical_quota, 0))
+
+    pool: list[dict[str, Any]] = []
+    if anchor_quota > 0:
+        pool.extend(_sample_positions(anchor_positions, anchor_quota))
+    if tactical_quota > 0:
+        pool.extend(_sample_positions(tactical_positions, tactical_quota))
+    if failure_quota > 0:
+        pool.extend(_sample_positions(failure_bank, failure_quota))
+
+    if len(pool) < data_count:
+        leftovers = anchor_positions + tactical_positions + failure_bank
+        needed = min(data_count - len(pool), len(leftovers))
+        if needed > 0:
+            pool.extend(_sample_positions(leftovers, needed))
+
+    random.shuffle(pool)
+    return pool[:data_count]
+
+
+_BATCH_D4_TRANSFORMS = [
+    lambda p: p,                                          # identity
+    lambda p: torch.rot90(p, 1, [2, 3]),                  # rot90
+    lambda p: torch.rot90(p, 2, [2, 3]),                  # rot180
+    lambda p: torch.rot90(p, 3, [2, 3]),                  # rot270
+    lambda p: p.flip(2),                                  # mirror_v
+    lambda p: p.flip(3),                                  # mirror_h
+    lambda p: p.transpose(2, 3),                          # diag_main
+    lambda p: torch.rot90(p, 1, [2, 3]).flip(2),          # diag_anti
+]
+
+
+def _apply_random_d4_batch(
+    planes: torch.Tensor,
+    policy: torch.Tensor,
+    board_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply ONE random D4 transform to entire batch (planes + policy synced).
+
+    For boards smaller than 16×16, operates only on the board_size×board_size
+    subgrid to avoid rotating content outside the legal area.
+    """
+    fn = random.choice(_BATCH_D4_TRANSFORMS)
+    if board_size >= 16:
+        planes = fn(planes).contiguous()
+        pol_grid = fn(policy.reshape(-1, 1, 16, 16)).contiguous()
+        return planes, pol_grid.reshape(-1, 256)
+
+    # Extract subgrid, transform, place back
+    bs = board_size
+    sub_planes = planes[:, :, :bs, :bs].contiguous()
+    sub_planes = fn(sub_planes).contiguous()
+    new_planes = torch.zeros_like(planes)
+    new_planes[:, :, :bs, :bs] = sub_planes
+
+    pol_grid = policy.reshape(-1, 1, 16, 16)
+    sub_pol = pol_grid[:, :, :bs, :bs].contiguous()
+    sub_pol = fn(sub_pol).contiguous()
+    new_pol = torch.zeros_like(pol_grid)
+    new_pol[:, :, :bs, :bs] = sub_pol
+
+    return new_planes.contiguous(), new_pol.reshape(-1, 256)
+
+
+def _materialize_training_tensors(
+    positions: list[dict[str, Any]],
+    *,
+    augment: bool = False,
+    augment_mode: str = "full",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    from trainer_lab.data.augmentation import augment_sample
+    from trainer_lab.data.encoder import board_to_tensor
+
+    if not positions:
+        empty_planes = torch.empty((0, 6, 16, 16), dtype=torch.float32)
+        empty_policy = torch.empty((0, 256), dtype=torch.float32)
+        empty_value = torch.empty((0, 1), dtype=torch.float32)
+        return empty_planes, empty_policy, empty_value, 0
+
+    planes_list: list[torch.Tensor] = []
+    policy_list: list[torch.Tensor] = []
+    value_list: list[torch.Tensor] = []
+
+    do_full_augment = augment and augment_mode == "full"
+
+    for pos in positions:
+        planes = board_to_tensor(pos)
+        policy = torch.tensor(pos["policy"], dtype=torch.float32)
+        value_scalar = torch.tensor(float(pos["value"]), dtype=torch.float32)
+
+        if do_full_augment:
+            _bs = pos.get("board_size", 16)
+            for aug_planes, aug_policy, aug_value in augment_sample(planes, policy, value_scalar, board_size=_bs):
+                planes_list.append(aug_planes)
+                policy_list.append(aug_policy)
+                value_list.append(aug_value.view(1))
+        else:
+            planes_list.append(planes)
+            policy_list.append(policy)
+            value_list.append(value_scalar.view(1))
+
+    return (
+        torch.stack(planes_list),
+        torch.stack(policy_list),
+        torch.stack(value_list),
+        len(planes_list),
+    )
+
+
+def _score_policy_matches(
+    model: Any,
+    positions: list[dict[str, Any]],
+    device: Any,
+    *,
+    batch_size: int = 256,
+) -> list[bool]:
+    from trainer_lab.data.encoder import board_to_tensor
+
+    if not positions:
+        return []
+
+    encoded = torch.stack([board_to_tensor(p) for p in positions])
+    targets = torch.tensor([
+        max(range(len(p["policy"])), key=p["policy"].__getitem__)
+        for p in positions
+    ], dtype=torch.long)
+
+    results: list[bool] = []
+    model.eval()
+    with torch.inference_mode():
+        for start in range(0, encoded.size(0), batch_size):
+            planes = encoded[start : start + batch_size].to(device, non_blocking=device.type == "cuda")
+            if device.type == "cuda":
+                planes = planes.contiguous(memory_format=torch.channels_last)
+            logits, _ = model(planes)
+            legal_mask = planes[:, 2].reshape(planes.size(0), -1)
+            masked = logits + (1.0 - legal_mask) * (-1e8)
+            preds = masked.argmax(dim=1).cpu()
+            target_slice = targets[start : start + batch_size]
+            results.extend((preds == target_slice).tolist())
+    model.train()
+    return results
+
+
+def _evaluate_supervised_dataset(
+    model: Any,
+    positions: list[dict[str, Any]],
+    device: Any,
+    *,
+    batch_size: int = 256,
+) -> dict[str, float]:
+    from trainer_lab.training.metrics import (
+        policy_accuracy,
+        policy_kl_divergence,
+        teacher_mass_on_pred,
+        value_mae,
+        value_sign_agreement,
+    )
+
+    if not positions:
+        return {}
+
+    target_sanity = _compute_target_sanity_metrics(positions)
+    planes, policy, value, _ = _materialize_training_tensors(positions, augment=False)
+    if device.type == "cuda":
+        planes = planes.pin_memory()
+        policy = policy.pin_memory()
+        value = value.pin_memory()
+
+    model.eval()
+    total = 0
+    acc = tmass = pkl = vmae = vsign = 0.0
+    with torch.inference_mode():
+        for start in range(0, planes.size(0), batch_size):
+            batch_planes = planes[start : start + batch_size].to(device, non_blocking=device.type == "cuda")
+            batch_policy = policy[start : start + batch_size].to(device, non_blocking=device.type == "cuda")
+            batch_value = value[start : start + batch_size].to(device, non_blocking=device.type == "cuda")
+            if device.type == "cuda":
+                batch_planes = batch_planes.contiguous(memory_format=torch.channels_last)
+            logits, vpred = model(batch_planes)
+            legal_mask = batch_planes[:, 2].reshape(batch_planes.size(0), -1)
+            bs = batch_planes.size(0)
+            acc += policy_accuracy(logits, batch_policy, legal_mask=legal_mask) * bs
+            tmass += teacher_mass_on_pred(logits, batch_policy, legal_mask=legal_mask) * bs
+            pkl += policy_kl_divergence(logits, batch_policy, legal_mask=legal_mask) * bs
+            vmae += value_mae(vpred, batch_value) * bs
+            vsign += value_sign_agreement(vpred, batch_value) * bs
+            total += bs
+    model.train()
+
+    return {
+        "policyTop1Acc": round((acc / max(total, 1)) * 100.0, 2),
+        "teacherMassOnPred": round(tmass / max(total, 1), 4),
+        "policyKL": round(pkl / max(total, 1), 6),
+        "valueMAE": round(vmae / max(total, 1), 6),
+        "valueSignAgreement": round((vsign / max(total, 1)) * 100.0, 2),
+        **target_sanity,
+    }
+
+
+def _sample_engine_position(
+    board_size: int,
+    win_len: int,
+    *,
+    rng: random.Random | None = None,
+) -> tuple[list[int], int, int] | None:
+    rng = rng or random
+    total_cells = board_size * board_size
+    r = rng.random()
+    if board_size <= 5:
+        # 5×5: bias heavily toward endgame/tactical positions
+        if r < 0.05:
+            low, high = 0, min(3, total_cells - 1)
+        elif r < 0.20:
+            low, high = min(4, total_cells - 1), min(10, total_cells - 1)
+        elif r < 0.50:
+            low, high = min(11, total_cells - 1), min(16, total_cells - 1)
+        else:
+            low, high = min(17, total_cells - 1), total_cells - 1
+    else:
+        if r < 0.20:
+            low, high = 0, min(3, total_cells - 1)
+        elif r < 0.60:
+            low, high = min(4, total_cells - 1), min(10, total_cells - 1)
+        elif r < 0.90:
+            low, high = min(11, total_cells - 1), min(18, total_cells - 1)
+        else:
+            low, high = min(19, total_cells - 1), total_cells - 1
+
+    if high < low:
+        low = 0
+    plies = rng.randint(low, high) if high > 0 else 0
+    board = [0] * total_cells
+    current = 1
+    last_move = -1
+
+    for _ in range(plies):
+        legal = [idx for idx, cell in enumerate(board) if cell == 0]
+        if not legal:
+            return None
+        move = rng.choice(legal)
+        board[move] = current
+        last_move = move
+        if _nxn_winner(board, board_size, win_len, move) != 0:
+            return None
+        current = 2 if current == 1 else 1
+
+    if all(cell != 0 for cell in board):
+        return None
+    return board, current, last_move
+
+
+async def _generate_engine_labeled_positions(
+    count: int,
+    board_size: int,
+    win_len: int,
+    callback: TRAIN_CALLBACK,
+    engine_eval: Any,
+    *,
+    variant: str = "",
+    rng: random.Random | None = None,
+    source: str = "engine",
+) -> list[dict[str, Any]]:
+    positions: list[dict[str, Any]] = []
+    started_at = time.monotonic()
+    last_reported = 0
+    attempts = 0
+    max_attempts = max(count * 25, 200)
+    rng = rng or random
+
+    while len(positions) < count and attempts < max_attempts:
+        attempts += 1
+        sampled = _sample_engine_position(board_size, win_len, rng=rng)
+        if sampled is None:
+            continue
+
+        board, current, last_move = sampled
+        move, value = await engine_eval.best_move_with_value(board, current, board_size, win_len)
+        if move < 0 or move >= len(board) or board[move] != 0:
+            continue
+
+        positions.append({
+            "board_size": board_size,
+            "board": _flat_to_board2d(board, board_size),
+            "current_player": current,
+            "last_move": list(divmod(last_move, board_size)) if last_move >= 0 else None,
+            "policy": _one_hot_policy(move, board_size),
+            "value": max(-1.0, min(1.0, float(value))),
+            "source": source,
+            "sampleWeight": 1.0,
+        })
+
+        if len(positions) - last_reported >= 64 or len(positions) == count:
+            last_reported = len(positions)
+            await _emit_dataset_progress(
+                callback,
+                generated=len(positions),
+                total=count,
+                stage="engine_teacher",
+                message=f"Generated {len(positions)}/{count} engine-labeled positions",
+                start_time=started_at,
+            )
+            await asyncio.sleep(0)
+
+    return positions
+
+
+async def _relabel_positions_with_engine(
+    positions: list[dict[str, Any]],
+    board_size: int,
+    win_len: int,
+    engine_eval: Any,
+    callback: TRAIN_CALLBACK | None = None,
+) -> list[dict[str, Any]]:
+    relabeled: list[dict[str, Any]] = []
+    started_at = time.monotonic()
+    last_reported = 0
+
+    for idx, pos in enumerate(positions, 1):
+        board = _board2d_to_flat(pos["board"])
+        current = int(pos["current_player"])
+        move, value = await engine_eval.best_move_with_value(board, current, board_size, win_len)
+        if move < 0 or move >= len(board) or board[move] != 0:
+            continue
+
+        relabeled.append({
+            "board_size": board_size,
+            "board": pos["board"],
+            "current_player": current,
+            "last_move": pos.get("last_move"),
+            "policy": _one_hot_policy(move, board_size),
+            "value": max(-1.0, min(1.0, float(value))),
+        })
+
+        if callback is not None and (idx - last_reported >= 24 or idx == len(positions)):
+            last_reported = idx
+            elapsed = max(time.monotonic() - started_at, 0.01)
+            await callback({
+                "type": "train.progress",
+                "payload": {
+                    "phase": "repair",
+                    "stage": "relabel",
+                    "generated": idx,
+                    "total": len(positions),
+                    "positions": len(relabeled),
+                    "percent": round((idx / max(len(positions), 1)) * 100.0, 1),
+                    "elapsed": round(elapsed, 1),
+                    "speed": round(idx / elapsed, 2),
+                    "speedUnit": "pos/s",
+                },
+            })
+            await asyncio.sleep(0)
+
+    return relabeled
+
+
+async def _run_engine_exam(
+    model: Any,
+    board_size: int,
+    win_len: int,
+    device: Any,
+    callback: TRAIN_CALLBACK,
+    engine_eval: Any,
+    *,
+    variant: str,
+    cycle: int,
+    total_cycles: int,
+    num_pairs: int,
+    previous_result: dict[str, Any] | None = None,
+    max_failure_positions: int = 96,
+    max_failure_turns_per_game: int = 4,
+    phase: str = "exam",
+    stage: str = "engine_eval",
+    collect_failures: bool = True,
+) -> tuple[Any, list[dict[str, Any]], dict[str, Any]]:
+    from gomoku_api.ws.arena_eval import ArenaResult, _model_greedy_move
+
+    wins = losses = draws = 0
+    total_games = max(num_pairs * 2, 1)
+    raw_failures: list[dict[str, Any]] = []
+    started_at = time.monotonic()
+
+    for pair in range(num_pairs):
+        for candidate_side in (1, 2):
+            board = [0] * (board_size * board_size)
+            current = 1
+            last_move = -1
+            winner = 0
+            forfeit_by = 0
+            candidate_states: list[dict[str, Any]] = []
+
+            for _ in range(board_size * board_size):
+                legal = [i for i, c in enumerate(board) if c == 0]
+                if not legal:
+                    break
+
+                if current == candidate_side:
+                    candidate_states.append({
+                        "board_size": board_size,
+                        "board": _flat_to_board2d(board, board_size),
+                        "current_player": current,
+                        "last_move": list(divmod(last_move, board_size)) if last_move >= 0 else None,
+                    })
+                    move = _model_greedy_move(board, board_size, win_len, current, model, device)
+                else:
+                    move = await engine_eval.best_move(board, current, board_size, win_len)
+
+                if move < 0 or move >= len(board) or board[move] != 0:
+                    forfeit_by = current
+                    break
+
+                board[move] = current
+                last_move = move
+                winner = _nxn_winner(board, board_size, win_len, move)
+                if winner != 0:
+                    break
+                current = 2 if current == 1 else 1
+
+            candidate_lost = False
+            if forfeit_by != 0:
+                if forfeit_by == candidate_side:
+                    losses += 1
+                    candidate_lost = True
+                else:
+                    wins += 1
+            elif winner == candidate_side:
+                wins += 1
+            elif winner != 0:
+                losses += 1
+                candidate_lost = True
+            else:
+                draws += 1
+
+            if candidate_lost:
+                raw_failures.extend(candidate_states[-max_failure_turns_per_game:])
+
+        games_done = (pair + 1) * 2
+        winrate = (wins + 0.5 * draws) / max(games_done, 1)
+        prev_wr = previous_result.get("winrate") if previous_result else None
+        delta_wr = None if prev_wr is None else round(winrate - prev_wr, 4)
+        trend = "flat"
+        if delta_wr is not None:
+            if delta_wr > 0.02:
+                trend = "improving"
+            elif delta_wr < -0.02:
+                trend = "regressing"
+
+        elapsed = max(time.monotonic() - started_at, 0.01)
+        await callback({
+            "type": "train.progress",
+            "payload": {
+                "phase": phase,
+                "stage": stage,
+                "variant": variant,
+                "cycle": cycle,
+                "totalCycles": total_cycles,
+                "iteration": cycle,
+                "totalIterations": total_cycles,
+                "game": games_done,
+                "totalGames": total_games,
+                "arenaWins": wins,
+                "arenaLosses": losses,
+                "arenaDraws": draws,
+                "winrateVsAlgorithm": round(winrate, 4),
+                "deltaWinrate": delta_wr,
+                "progressTrend": trend,
+                "elapsed": round(elapsed, 1),
+                "speed": round(games_done / elapsed, 2),
+                "speedUnit": "g/s",
+                "positions": len(raw_failures),
+            },
+        })
+        await asyncio.sleep(0)
+
+    if collect_failures:
+        unique_raw = _merge_failure_bank([], raw_failures, max_size=max_failure_positions)
+        relabeled = await _relabel_positions_with_engine(
+            unique_raw,
+            board_size,
+            win_len,
+            engine_eval,
+            callback,
+        )
+    else:
+        relabeled = []
+    result = ArenaResult(wins_a=wins, wins_b=losses, draws=draws, total=total_games)
+    summary = {
+        "wins": wins,
+        "losses": losses,
+        "draws": draws,
+        "winrate": result.winrate_a,
+        "newFailures": len(relabeled),
+    }
+    return result, relabeled, summary
 
 
 # ---------------------------------------------------------------------------
@@ -652,20 +1524,24 @@ async def _generate_tactical_curriculum_positions(
     board_size: int,
     win_len: int,
     callback: TRAIN_CALLBACK,
+    *,
+    motif_filter: str | None = None,
+    rng: random.Random | None = None,
 ) -> list[dict[str, Any]]:
     """Generate immediate-win / immediate-block positions for strong tactical supervision."""
     directions = ((0, 1), (1, 0), (1, 1), (1, -1))
     positions: list[dict[str, Any]] = []
     started_at = time.monotonic()
     last_reported = 0
+    rng = rng or random
 
     while len(positions) < count:
         board = [0] * (board_size * board_size)
-        motif = random.choice(("win", "block"))
-        current_player = random.choice((1, 2))
+        motif = motif_filter or rng.choice(("win", "block"))
+        current_player = rng.choice((1, 2))
         line_player = current_player if motif == "win" else (2 if current_player == 1 else 1)
         target_player = current_player
-        direction = random.choice(directions)
+        direction = rng.choice(directions)
         dr, dc = direction
 
         # Pick a start cell where a full win_len segment fits.
@@ -679,8 +1555,8 @@ async def _generate_tactical_curriculum_positions(
         if not valid_starts:
             break
 
-        start_row, start_col = random.choice(valid_starts)
-        gap_index = random.randrange(win_len)
+        start_row, start_col = rng.choice(valid_starts)
+        gap_index = rng.randrange(win_len)
         target_move = (start_row + dr * gap_index) * board_size + (start_col + dc * gap_index)
 
         occupied: set[int] = {target_move}
@@ -694,16 +1570,16 @@ async def _generate_tactical_curriculum_positions(
             occupied.add(flat)
 
         # Add a few random context stones far from the tactical segment.
-        extra_stones = random.randint(0, max(2, board_size // 3))
+        extra_stones = rng.randint(0, max(2, board_size // 3))
         for _ in range(extra_stones):
             placed = False
             for _attempt in range(20):
-                move = random.randrange(board_size * board_size)
+                move = rng.randrange(board_size * board_size)
                 if move in occupied or board[move] != 0:
                     continue
                 if abs((move // board_size) - (target_move // board_size)) <= 1 and abs((move % board_size) - (target_move % board_size)) <= 1:
                     continue
-                board[move] = random.choice((1, 2))
+                board[move] = rng.choice((1, 2))
                 occupied.add(move)
                 placed = True
                 break
@@ -725,6 +1601,8 @@ async def _generate_tactical_curriculum_positions(
             "policy": policy,
             "value": value,
             "motif": motif,
+            "source": "tactical",
+            "sampleWeight": 1.0,
         })
 
         if len(positions) - last_reported >= 128 or len(positions) == count:
@@ -740,6 +1618,117 @@ async def _generate_tactical_curriculum_positions(
             await asyncio.sleep(0)
 
     return positions
+
+
+async def _build_frozen_benchmark_suites(
+    variant: str,
+    board_size: int,
+    win_len: int,
+    engine_eval: Any | None,
+) -> dict[str, list[dict[str, Any]]]:
+    async def _silent_callback(_event: dict[str, Any]) -> None:
+        return None
+
+    suites: dict[str, list[dict[str, Any]]] = {
+        "block": await _generate_tactical_curriculum_positions(
+            48,
+            board_size,
+            win_len,
+            _silent_callback,
+            motif_filter="block",
+            rng=random.Random(f"{variant}:block"),
+        ),
+        "win": await _generate_tactical_curriculum_positions(
+            48,
+            board_size,
+            win_len,
+            _silent_callback,
+            motif_filter="win",
+            rng=random.Random(f"{variant}:win"),
+        ),
+    }
+
+    if engine_eval is not None:
+        suites["mid"] = await _generate_engine_labeled_positions(
+            24,
+            board_size,
+            win_len,
+            _silent_callback,
+            engine_eval,
+            variant=variant,
+            rng=random.Random(f"{variant}:mid"),
+            source="benchmark",
+        )
+        suites["late"] = await _generate_engine_labeled_positions(
+            24,
+            board_size,
+            win_len,
+            _silent_callback,
+            engine_eval,
+            variant=variant,
+            rng=random.Random(f"{variant}:late"),
+            source="benchmark",
+        )
+    return suites
+
+
+async def _run_validation_snapshot(
+    model: Any,
+    holdout_positions: list[dict[str, Any]],
+    frozen_suites: dict[str, list[dict[str, Any]]],
+    device: Any,
+    callback: TRAIN_CALLBACK,
+    *,
+    variant: str,
+    cycle: int,
+    total_cycles: int,
+    previous_holdout: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "phase": "holdout",
+        "stage": "validation",
+        "variant": variant,
+        "cycle": cycle,
+        "totalCycles": total_cycles,
+        "iteration": cycle,
+        "totalIterations": total_cycles,
+    }
+
+    holdout_metrics = _evaluate_supervised_dataset(model, holdout_positions, device) if holdout_positions else {}
+    if holdout_metrics:
+        payload.update({
+            "holdoutPolicyAcc": holdout_metrics["policyTop1Acc"],
+            "holdoutTeacherMass": holdout_metrics["teacherMassOnPred"],
+            "holdoutPolicyKL": holdout_metrics["policyKL"],
+            "holdoutValueMAE": holdout_metrics["valueMAE"],
+            "holdoutValueSignAgreement": holdout_metrics["valueSignAgreement"],
+            "holdoutLegalTargetRate": holdout_metrics.get("legalTargetRate"),
+            "holdoutDuplicateMergeRate": holdout_metrics.get("duplicateMergeRate"),
+            "holdoutPolicyMassMeanAbsError": holdout_metrics.get("policyMassMeanAbsError"),
+            "holdoutNonFiniteTargetRate": holdout_metrics.get("nonFiniteTargetRate"),
+            "holdoutPositions": len(holdout_positions),
+        })
+        prev_acc = previous_holdout.get("holdoutPolicyAcc") if previous_holdout else None
+        if prev_acc is not None:
+            payload["holdoutDeltaAcc"] = round(holdout_metrics["policyTop1Acc"] - prev_acc, 2)
+
+    benchmark_results: dict[str, float] = {}
+    for name, suite_positions in frozen_suites.items():
+        if not suite_positions:
+            continue
+        suite_metrics = _evaluate_supervised_dataset(model, suite_positions, device)
+        benchmark_results[name] = suite_metrics.get("policyTop1Acc", 0.0)
+
+    if benchmark_results:
+        payload["frozenBlockAcc"] = round(benchmark_results.get("block", 0.0), 2)
+        payload["frozenWinAcc"] = round(benchmark_results.get("win", 0.0), 2)
+        if "mid" in benchmark_results:
+            payload["frozenMidAcc"] = round(benchmark_results["mid"], 2)
+        if "late" in benchmark_results:
+            payload["frozenLateAcc"] = round(benchmark_results["late"], 2)
+
+    await callback({"type": "train.progress", "payload": payload})
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1248,21 +2237,24 @@ async def _run_training_epochs(
     overall_started_at: float = 0.0,
     overall_percent_base: float = 0.0,
     overall_percent_range: float = 10.0,
+    augment: bool = False,
     **extra_fields: Any,
 ) -> None:
     """Run training epochs on positions, streaming progress to callback."""
-    from trainer_lab.data.encoder import board_to_tensor
     from trainer_lab.training.loss import GomokuLoss
-    from trainer_lab.training.metrics import policy_accuracy, value_mae
+    from trainer_lab.training.metrics import (
+        policy_accuracy, value_mae,
+        teacher_mass_on_pred, value_sign_agreement, policy_entropy, policy_kl_divergence,
+    )
 
     if not positions:
         return
 
-    planes_list = [board_to_tensor(p) for p in positions]
-    policy_list = [torch.tensor(p["policy"], dtype=torch.float32) for p in positions]
-    value_list = [torch.tensor([p["value"]], dtype=torch.float32) for p in positions]
-
-    dataset = TensorDataset(torch.stack(planes_list), torch.stack(policy_list), torch.stack(value_list))
+    all_planes, all_policy, all_value, effective_positions = _materialize_training_tensors(
+        positions,
+        augment=augment,
+    )
+    dataset = TensorDataset(all_planes, all_policy, all_value)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False,
                         pin_memory=device.type == "cuda")
 
@@ -1283,6 +2275,7 @@ async def _run_training_epochs(
 
     for epoch in range(1, num_epochs + 1):
         ep_loss = ep_ploss = ep_vloss = ep_acc = ep_mae = 0.0
+        ep_tmop = ep_vsa = ep_entropy = ep_kl = 0.0
         ep_samples = 0
 
         for bi, (planes, pol_t, val_t) in enumerate(loader, 1):
@@ -1307,15 +2300,27 @@ async def _run_training_epochs(
             bt = max(time.perf_counter() - step_t, 1e-6)
 
             bs = planes.size(0)
-            acc = policy_accuracy(logits.detach(), pol_t, legal_mask=legal_mask)
-            mae = value_mae(vpred.detach(), val_t)
+            det_logits = logits.detach()
+            det_vpred = vpred.detach()
+            acc = policy_accuracy(det_logits, pol_t, legal_mask=legal_mask)
+            mae = value_mae(det_vpred, val_t)
+            tmop = teacher_mass_on_pred(det_logits, pol_t, legal_mask=legal_mask)
+            vsa = value_sign_agreement(det_vpred, val_t)
+            p_entropy = policy_entropy(det_logits, legal_mask=legal_mask)
+            p_kl = policy_kl_divergence(det_logits, pol_t, legal_mask=legal_mask)
 
             ep_loss += loss.item() * bs; ep_ploss += pl.item() * bs; ep_vloss += vl.item() * bs
             ep_acc += acc * bs; ep_mae += mae * bs; ep_samples += bs; samples_seen += bs
+            ep_tmop += tmop * bs; ep_vsa += vsa * bs
+            ep_entropy += p_entropy * bs; ep_kl += p_kl * bs
 
             a_loss = ep_loss / max(ep_samples, 1)
             a_acc = (ep_acc / max(ep_samples, 1)) * 100.0
             a_mae = ep_mae / max(ep_samples, 1)
+            a_tmop = ep_tmop / max(ep_samples, 1)
+            a_vsa = (ep_vsa / max(ep_samples, 1)) * 100.0
+            a_entropy = ep_entropy / max(ep_samples, 1)
+            a_kl = ep_kl / max(ep_samples, 1)
 
             done_steps = (epoch - 1) * total_batches + bi
             elapsed = max(time.monotonic() - overall_started_at, 0.01)
@@ -1346,14 +2351,20 @@ async def _run_training_epochs(
                         "batch": bi, "totalBatches": total_batches, "batchesPerEpoch": total_batches,
                         "loss": round(a_loss, 6), "policyLoss": round(ep_ploss / max(ep_samples, 1), 6),
                         "valueLoss": round(ep_vloss / max(ep_samples, 1), 6),
-                        "accuracy": round(a_acc, 2), "acc": round(a_acc, 2), "mae": round(a_mae, 6),
+                        "accuracy": round(a_acc, 2), "acc": round(a_acc, 2),
+                        "policyTop1Acc": round(a_acc, 2),
+                        "teacherMassOnPred": round(a_tmop, 4),
+                        "valueSignAgreement": round(a_vsa, 2),
+                        "policyEntropy": round(a_entropy, 4),
+                        "policyKL": round(a_kl, 6),
+                        "mae": round(a_mae, 6),
                         "percent": round(pct, 1), "epochPercent": round(bi / max(total_batches, 1) * 100, 1),
                         "elapsed": round(elapsed, 1),
                         "eta": round((phase_elapsed / done_steps) * max(total_steps - done_steps, 0), 1),
                         "speed": round(sps, 2), "speedUnit": "samples/s",
                         "samplesPerSec": round(sps, 2), "batchesPerSec": round(done_steps / phase_elapsed, 3),
                         "batchTimeMs": round(bt * 1000, 2),
-                        "positions": len(positions), "effectivePositions": len(positions),
+                        "positions": len(positions), "effectivePositions": effective_positions,
                         "batchSize": batch_size, "learningRate": 2e-3,
                         "modelParams": model_params,
                         "device": device.type, "deviceName": live_gpu.get("name", str(device)),
@@ -1393,26 +2404,35 @@ async def _run_training_steps(
     overall_started_at: float = 0.0,
     overall_percent_base: float = 0.0,
     overall_percent_range: float = 10.0,
+    augment: bool = False,
+    augment_mode: str = "full",
+    time_budget: float = 0.0,
     **extra_fields: Any,
 ) -> None:
     """Step-based training with manual batching — keeps GPU busy longer."""
-    from trainer_lab.data.encoder import board_to_tensor
     from trainer_lab.training.loss import GomokuLoss
-    from trainer_lab.training.metrics import policy_accuracy, value_mae
+    from trainer_lab.training.metrics import (
+        policy_accuracy, value_mae,
+        teacher_mass_on_pred, value_sign_agreement, policy_entropy, policy_kl_divergence,
+    )
 
     if not positions or max_steps <= 0:
         return
 
     # Pre-stack tensors on CPU with pin_memory
-    all_planes = torch.stack([board_to_tensor(p) for p in positions])
-    all_policy = torch.stack([torch.tensor(p["policy"], dtype=torch.float32) for p in positions])
-    all_value = torch.stack([torch.tensor([p["value"]], dtype=torch.float32) for p in positions])
+    all_planes, all_policy, all_value, effective_positions = _materialize_training_tensors(
+        positions,
+        augment=augment,
+        augment_mode=augment_mode,
+    )
     if device.type == "cuda":
         all_planes = all_planes.pin_memory()
         all_policy = all_policy.pin_memory()
         all_value = all_value.pin_memory()
 
     n = all_planes.size(0)
+    use_random_augment = augment and augment_mode == "random"
+
     criterion = GomokuLoss(weight_value=0.5)
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
     use_amp = runtime_flags["mixedPrecision"] and device.type == "cuda"
@@ -1428,7 +2448,15 @@ async def _run_training_steps(
     step = 0
     epoch = 0
     cum_loss = cum_acc = cum_mae = 0.0
+    cum_tmop = cum_vsa = cum_entropy = cum_kl = 0.0
     cum_samples = 0
+
+    # EMA early stop state
+    ema_acc = 0.0
+    prev_ema = 0.0
+    plateau_count = 0
+    ema_alpha = 0.3
+    min_steps_for_stop = max(5, max_steps // 5)
 
     while step < max_steps:
         epoch += 1
@@ -1440,6 +2468,9 @@ async def _run_training_steps(
             planes = all_planes[idx].to(device, non_blocking=True)
             pol_t = all_policy[idx].to(device, non_blocking=True)
             val_t = all_value[idx].to(device, non_blocking=True)
+            if use_random_augment:
+                _aug_board_size = extra_fields.get("boardSize", 16)
+                planes, pol_t = _apply_random_d4_batch(planes, pol_t, board_size=_aug_board_size)
             if device.type == "cuda":
                 planes = planes.contiguous(memory_format=torch.channels_last)
 
@@ -1456,14 +2487,42 @@ async def _run_training_steps(
 
             step += 1
             bs = planes.size(0)
-            acc = policy_accuracy(logits.detach(), pol_t, legal_mask=legal_mask)
-            mae = value_mae(vpred.detach(), val_t)
+            det_logits = logits.detach()
+            det_vpred = vpred.detach()
+            acc = policy_accuracy(det_logits, pol_t, legal_mask=legal_mask)
+            mae = value_mae(det_vpred, val_t)
+            tmop = teacher_mass_on_pred(det_logits, pol_t, legal_mask=legal_mask)
+            vsa = value_sign_agreement(det_vpred, val_t)
+            p_entropy = policy_entropy(det_logits, legal_mask=legal_mask)
+            p_kl = policy_kl_divergence(det_logits, pol_t, legal_mask=legal_mask)
+
             cum_loss += loss.item() * bs; cum_acc += acc * bs; cum_mae += mae * bs
+            cum_tmop += tmop * bs; cum_vsa += vsa * bs
+            cum_entropy += p_entropy * bs; cum_kl += p_kl * bs
             cum_samples += bs; samples_seen += bs
 
             a_loss = cum_loss / max(cum_samples, 1)
             a_acc = (cum_acc / max(cum_samples, 1)) * 100.0
             a_mae = cum_mae / max(cum_samples, 1)
+            a_tmop = cum_tmop / max(cum_samples, 1)
+            a_vsa = (cum_vsa / max(cum_samples, 1)) * 100.0
+            a_entropy = cum_entropy / max(cum_samples, 1)
+            a_kl = cum_kl / max(cum_samples, 1)
+
+            # EMA early stop: time budget or plateau
+            ema_acc = ema_alpha * acc + (1 - ema_alpha) * ema_acc
+            if abs(ema_acc - prev_ema) < 0.005:
+                plateau_count += 1
+            else:
+                plateau_count = 0
+            prev_ema = ema_acc
+            phase_elapsed_check = time.monotonic() - phase_start
+            if time_budget > 0 and step >= min_steps_for_stop and phase_elapsed_check >= time_budget:
+                step = max_steps  # exit
+                break
+            if plateau_count >= 3 and step >= min_steps_for_stop * 2 and ema_acc >= 0.50:
+                step = max_steps  # exit
+                break
 
             now = time.monotonic()
             if _should_emit_progress(now, last_emit_at, force=(step >= max_steps)):
@@ -1485,6 +2544,11 @@ async def _run_training_steps(
                         "step": step, "totalSteps": max_steps,
                         "epoch": epoch, "totalEpochs": max(1, (max_steps * batch_size) // max(n, 1)),
                         "loss": round(a_loss, 6), "accuracy": round(a_acc, 2), "acc": round(a_acc, 2),
+                        "policyTop1Acc": round(a_acc, 2),
+                        "teacherMassOnPred": round(a_tmop, 4),
+                        "valueSignAgreement": round(a_vsa, 2),
+                        "policyEntropy": round(a_entropy, 4),
+                        "policyKL": round(a_kl, 6),
                         "mae": round(a_mae, 6),
                         "percent": round(pct, 1),
                         "elapsed": round(elapsed, 1),
@@ -1492,6 +2556,7 @@ async def _run_training_steps(
                         "speed": round(sps, 2), "speedUnit": "samples/s",
                         "samplesPerSec": round(sps, 2),
                         "positions": len(positions),
+                        "effectivePositions": effective_positions,
                         "batchSize": batch_size, "learningRate": 2e-3,
                         "modelParams": model_params,
                         "device": device.type, "deviceName": live_gpu.get("name", str(device)),
@@ -1512,6 +2577,7 @@ async def _run_training_steps(
                 "mae": round(cum_mae / cum_samples, 6),
             })
             cum_loss = cum_acc = cum_mae = 0.0
+            cum_tmop = cum_vsa = cum_entropy = cum_kl = 0.0
             cum_samples = 0
 
 
@@ -1531,211 +2597,781 @@ async def train_variant(
     """Train with multi-phase curriculum: Tactical → Bootstrap → MCTS iterations."""
     from trainer_lab.config import ModelConfig
     from trainer_lab.models.resnet import PolicyValueResNet
+    from gomoku_api.ws.model_registry import ModelRegistry
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     runtime_flags = _prepare_cuda_runtime(device)
     cfg = ModelConfig()
 
     board_size, win_len = _resolve_variant_spec(variant)
+    rapid_mode = board_size <= 5
 
+    registry = ModelRegistry(variant)
+    manifest = registry.read_manifest()
     model_dir = _ensure_saved_dir(variant)
-    model_path = model_dir / "model.pt"
-    is_new_model = not model_path.exists()
+    requested_model_profile = str(kwargs.get("modelProfile", "auto"))
+    current_manifest_profile = current_model_profile_from_manifest(manifest)
 
-    res_filters, res_blocks, value_fc = _variant_model_hparams(board_size, cfg)
+    # Determine if this is a fresh model or a resume.
+    # Try candidate → champion → legacy, falling through on load failure
+    # so a corrupt candidate doesn't nuke the verified champion.
+    resume_candidates = [p for p in (registry.candidate_path, registry.champion_path, registry.legacy_path) if p.exists()]
+    is_new_model = len(resume_candidates) == 0
+
+    model_profile, (res_filters, res_blocks, value_fc) = _variant_model_hparams(
+        board_size,
+        cfg,
+        variant=variant,
+        model_profile=requested_model_profile,
+        manifest=manifest,
+    )
+    if requested_model_profile.strip().lower() not in {"", "auto"} and current_manifest_profile and current_manifest_profile != model_profile:
+        logger.info(
+            "Model profile changed for %s (%s -> %s); starting from fresh weights",
+            variant,
+            current_manifest_profile,
+            model_profile,
+        )
+        resume_candidates = []
+        is_new_model = True
 
     model = PolicyValueResNet(
         in_channels=cfg.in_channels, res_filters=res_filters,
         res_blocks=res_blocks, policy_filters=cfg.policy_filters,
         value_fc=value_fc, board_max=cfg.board_max,
     )
-    if model_path.exists():
+    loaded = False
+    for resume_path in resume_candidates:
         try:
-            model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
-            logger.info("Resumed model from %s", model_path)
+            model.load_state_dict(torch.load(resume_path, map_location="cpu", weights_only=True))
+            logger.info("Resumed model from %s", resume_path)
+            loaded = True
+            break
         except Exception as exc:
-            is_new_model = True
-            logger.warning("Checkpoint %s is incompatible with current architecture, starting fresh: %s", model_path, exc)
+            logger.warning("Checkpoint %s failed to load, trying next: %s", resume_path, exc)
+    if not loaded and not is_new_model:
+        # All existing checkpoints are corrupt — treat as fresh
+        is_new_model = True
+        logger.warning("All checkpoints corrupt for %s, starting fresh", variant)
     if device.type == "cuda":
         model = model.to(device=device, memory_format=torch.channels_last)
     else:
         model = model.to(device)
     model = _maybe_compile_model(model, device, runtime_flags)
 
-    # Curriculum parameters
     bootstrap_games = int(kwargs.get("bootstrapGames", 64))
-    selfplay_iterations = int(kwargs.get("mctsIterations", 3))
-    selfplay_games = int(kwargs.get("mctsGamesPerIter", 32))
-    tactical_epochs = min(2, epochs)
-    supervised_epochs = min(12, epochs) if board_size <= 5 else min(3, epochs)
-    bootstrap_steps = 500 if board_size <= 5 else 300
-    selfplay_steps_per_iter = 500 if board_size <= 5 else 300
+    cycle_count = max(1, int(kwargs.get("mctsIterations", 3)))
+    exam_games = max(8, int(kwargs.get("mctsGamesPerIter", 32)))
+    prefer_offline_dataset = bool(kwargs.get("preferOfflineDataset", True))
+    offline_dataset_limit = max(0, int(kwargs.get("offlineDatasetLimit", 0)))
+    foundation_dataset_count = max(0, int(kwargs.get("foundationDatasetCount", 0)))
+    if board_size <= 5:
+        exam_pairs = max(3, min(8, exam_games // 4))
+    else:
+        exam_pairs = max(2, exam_games // 2)
+    if board_size <= 5:
+        teacher_seed_count = max(128, min(300, bootstrap_games * 3))
+    else:
+        teacher_seed_count = max(256, min(data_count, bootstrap_games * 12))
+    if board_size <= 5:
+        turbo_steps = 50  # base, overridden per-cycle by adaptive budget
+        repair_steps = 25
+        cycle_count = max(5, min(12, cycle_count * 3))
+        rapid_batch_size = min(batch_size, 256)
+        engine_per_cycle = 50
+        tactical_per_cycle = 200
+        anchor_bank_max = 800
+        exam_every = max(2, cycle_count // 4)
+        exam_threshold_acc = float(kwargs.get("examThresholdAcc", 30.0))
+    else:
+        turbo_steps = max(48, min(320, epochs * 8))
+        repair_steps = max(32, min(192, max(epochs * 4, turbo_steps // 2)))
+        exam_every = 1  # large boards: exam every cycle
+        exam_threshold_acc = float(kwargs.get("examThresholdAcc", 0.0))
+    repair_pool_size = max(512, min(data_count, teacher_seed_count))
+    failure_bank_max = max(256, min(data_count * 2, 2048))
 
     live_gpu = get_gpu_info()
     await callback({
         "type": "train.start",
         "payload": {
-            "variant": variant, "epochs": epochs, "batchSize": batch_size,
-            "boardSize": board_size, "winLength": win_len,
-            "device": device.type, "deviceName": live_gpu.get("name", str(device)),
+            "variant": variant,
+            "epochs": epochs,
+            "batchSize": batch_size,
+            "boardSize": board_size,
+            "winLength": win_len,
+            "device": device.type,
+            "deviceName": live_gpu.get("name", str(device)),
             "mixedPrecision": runtime_flags["mixedPrecision"],
-            "tf32": runtime_flags["tf32"], "channelsLast": runtime_flags["channelsLast"],
-            "learningRate": 2e-3, "modelParams": _count_model_parameters(model),
-            "totalIterations": selfplay_iterations, "gpu": live_gpu,
+            "tf32": runtime_flags["tf32"],
+            "channelsLast": runtime_flags["channelsLast"],
+            "learningRate": 2e-3,
+            "modelParams": _count_model_parameters(model),
+            "totalIterations": cycle_count,
+            "totalCycles": cycle_count,
+            "trainingMode": "cyclic_engine_exam",
+            "modelProfile": model_profile,
+            "gpu": live_gpu,
         },
     })
 
     completed_phases: list[str] = []
     metrics_history: list[dict[str, Any]] = []
-    all_positions: list[dict[str, Any]] = []
+    winrate_history: list[dict[str, Any]] = []
+    validation_history: list[dict[str, Any]] = []
     tactical_positions: list[dict[str, Any]] = []
-    bootstrap_positions: list[dict[str, Any]] = []
-    minimax_positions: list[dict[str, Any]] = []
+    anchor_positions: list[dict[str, Any]] = []
+    holdout_bank: list[dict[str, Any]] = []
+    failure_bank: list[dict[str, Any]] = []
+    frozen_suites: dict[str, list[dict[str, Any]]] = {}
     started_at = time.monotonic()
     common = {"variant": variant, "boardSize": board_size, "winLength": win_len}
 
-    # ── Phase 1: Tactical ──────────────────────────────────────────────
-    if is_new_model:
-        logger.info("Phase 1: Tactical — generating positions")
-        tactical_count = min(data_count // 2, 1000)
-        if board_size > 5:
-            tactical_positions = await _generate_tactical_curriculum_positions(
-                tactical_count, board_size, win_len, callback
+    engine_eval = None
+    engine_available = False
+    try:
+        from gomoku_api.ws.engine_evaluator import EngineEvaluator
+
+        engine_eval = EngineEvaluator()
+        await engine_eval.start()
+        engine_available = bool(engine_eval.alive)
+    except Exception as exc:
+        logger.warning("Engine teacher unavailable for %s: %s", variant, exc)
+        if engine_eval is not None:
+            try:
+                await engine_eval.stop()
+            except Exception:
+                pass
+        engine_eval = None
+
+    offline_target = offline_dataset_limit
+    if prefer_offline_dataset and board_size <= 5:
+        offline_target = max(
+            offline_target,
+            foundation_dataset_count,
+            teacher_seed_count * 6,
+            4096,
+        )
+    offline_positions: list[dict[str, Any]] = []
+    offline_dataset_path: Path | None = None
+    offline_dataset_type: str | None = None
+    if prefer_offline_dataset:
+        offline_positions, offline_dataset_path, offline_dataset_type = _load_offline_dataset_positions(
+            variant,
+            max_positions=offline_target if offline_target > 0 else None,
+        )
+        if offline_positions:
+            logger.info(
+                "Using offline %s dataset for %s: %d positions from %s",
+                offline_dataset_type,
+                variant,
+                len(offline_positions),
+                offline_dataset_path,
             )
-        else:
-            tactical_positions, _, _ = await _build_positions(variant, tactical_count, callback)
-        all_positions.extend(tactical_positions)
 
-        await _run_training_epochs(
-            model, tactical_positions, tactical_epochs, batch_size, device, runtime_flags,
-            callback, metrics_history,
-            phase="tactical", stage="training", completed_phases=completed_phases,
-            overall_started_at=started_at, overall_percent_base=0, overall_percent_range=10,
-            **common,
+    if variant == "ttt3":
+        tactical_positions, _, _ = await _build_positions(variant, min(teacher_seed_count // 2, 512), callback)
+    elif board_size <= 5:
+        tactical_positions = await _generate_tactical_curriculum_positions(
+            max(600, min(1500, teacher_seed_count * 5 if offline_positions else teacher_seed_count * 3)),
+            board_size,
+            win_len,
+            callback,
         )
-        completed_phases.append("tactical")
-        torch.save(model.state_dict(), model_path)
+    else:
+        tactical_positions = await _generate_tactical_curriculum_positions(
+            min(max(teacher_seed_count // 3, 128), 512),
+            board_size,
+            win_len,
+            callback,
+        )
 
-    # ── Phase 2: Supervised warm start (offline minimax seed) ─────────
-    if is_new_model:
-        dataset_path = SAVED_DIR / "datasets" / f"{variant}_minimax.json"
+    if offline_positions:
+        anchor_positions = list(offline_positions)
+    elif engine_available and engine_eval is not None:
+        anchor_positions = await _generate_engine_labeled_positions(
+            teacher_seed_count,
+            board_size,
+            win_len,
+            callback,
+            engine_eval,
+            variant=variant,
+        )
+    elif variant in {"ttt3", "ttt5"}:
+        _, dataset_path, dataset_type = _load_offline_dataset_positions(variant, max_positions=teacher_seed_count)
+        if dataset_path is None:
+            dataset_path = SAVED_DIR / "datasets" / f"{variant}_minimax.json"
         if not dataset_path.exists():
-            logger.info("No offline dataset at %s — auto-generating...", dataset_path)
+            logger.info("No offline dataset at %s — auto-generating fallback dataset", dataset_path)
             from gomoku_api.ws.offline_gen import generate_minimax_dataset
-            await generate_minimax_dataset(variant, 5000, callback)
-        logger.info("Phase 2: Supervised — loading %s", dataset_path)
-        minimax_positions = json.loads(dataset_path.read_text())
-        # Shard: 40% tactical + 60% minimax for balanced supervised pool
-        tactical_shard_count = min(len(minimax_positions) * 2 // 3, 2000)
-        tactical_shard = await _generate_tactical_curriculum_positions(
-            tactical_shard_count, board_size, win_len, callback
-        )
-        supervised_pool = tactical_shard + minimax_positions
-        random.shuffle(supervised_pool)
-        # NB: supervised_pool is NOT added to all_positions — minimax_positions
-        # are passed separately to _build_train_pool to avoid double-counting.
-        await _run_training_epochs(
-            model, supervised_pool, supervised_epochs, batch_size, device, runtime_flags,
-            callback, metrics_history,
-            phase="supervised", stage="training", completed_phases=completed_phases,
-            overall_started_at=started_at, overall_percent_base=10, overall_percent_range=10,
-            **common,
-        )
-        completed_phases.append("supervised")
-        torch.save(model.state_dict(), model_path)
-        logger.info("Supervised warm start: %d positions (%d minimax + tactical)", len(supervised_pool), len(minimax_positions))
 
-    # ── Phase 3: Bootstrap (GPU policy self-play) ─────────────────────
+            await generate_minimax_dataset(variant, min(max(teacher_seed_count, 1000), 5000), callback)
+        try:
+            anchor_positions = json.loads(dataset_path.read_text())[:teacher_seed_count]
+            offline_dataset_path = dataset_path
+            offline_dataset_type = dataset_type or "minimax"
+        except Exception as exc:
+            logger.warning("Failed to load fallback dataset %s: %s", dataset_path, exc)
+
+    if not anchor_positions:
+        anchor_positions = list(tactical_positions)
+
+    if offline_positions and rapid_mode:
+        repair_pool_size = max(repair_pool_size, min(len(anchor_positions), 1536))
+
+    initial_anchor_cap = len(anchor_positions) if (offline_positions and rapid_mode) else max(anchor_bank_max if rapid_mode else len(anchor_positions), teacher_seed_count)
+    anchor_positions = _merge_position_bank([], anchor_positions, max_size=initial_anchor_cap)
+    initial_holdout_cap = 48 if rapid_mode else 96
+    if offline_positions and rapid_mode:
+        initial_holdout_cap = min(max(int(len(anchor_positions) * 0.12), 96), 384)
+    anchor_positions, initial_holdout = _split_holdout_positions(
+        anchor_positions,
+        holdout_ratio=0.12 if rapid_mode else 0.08,
+        max_holdout=initial_holdout_cap,
+    )
+    holdout_bank = _merge_position_bank(
+        holdout_bank,
+        initial_holdout,
+        max_size=512 if (rapid_mode and offline_positions) else (192 if rapid_mode else 512),
+    )
+    frozen_suites = await _build_frozen_benchmark_suites(
+        variant,
+        board_size,
+        win_len,
+        engine_eval if engine_available else None,
+    )
+
+    _cycle_batch_size = rapid_batch_size if rapid_mode else batch_size
+    _cycle_augment_mode = "random" if rapid_mode else "full"
+
     if is_new_model:
-        logger.info("Phase 3: Bootstrap — %d games (policy teacher)", bootstrap_games)
-        bootstrap_positions, bootstrap_stats = await _play_selfplay_games_batched(
-            bootstrap_games, board_size, win_len, model, device, callback,
-            phase="bootstrap", teacher_mode="policy",
-            completed_phases=completed_phases,
-            overall_percent_base=20, overall_percent_range=10,
-            runtime_flags=runtime_flags, **common,
-        )
-        all_positions.extend(bootstrap_positions)
-
+        foundation_pool = list(anchor_positions) + list(tactical_positions)
+        random.shuffle(foundation_pool)
+        if rapid_mode and foundation_pool:
+            foundation_batch_size = _cycle_batch_size if rapid_mode else batch_size
+            foundation_batches = max(1, len(foundation_pool) // max(foundation_batch_size, 1))
+            default_foundation_epochs = 10 if (offline_positions and board_size <= 5) else (6 if offline_positions else 3)
+            foundation_epochs = max(2, min(12, int(kwargs.get("foundationEpochs", default_foundation_epochs))))
+            min_foundation_steps = 80 if (offline_positions and board_size <= 5) else 60
+            max_foundation_steps = 360 if (offline_positions and board_size <= 5) else 240
+            foundation_steps = max(min_foundation_steps, min(max_foundation_steps, foundation_batches * foundation_epochs))
+            if foundation_dataset_count > 0:
+                dataset_step_cap = 512 if board_size <= 5 else 320
+                foundation_steps = max(
+                    foundation_steps,
+                    min(dataset_step_cap, foundation_dataset_count // max(foundation_batch_size, 1)),
+                )
+        else:
+            foundation_steps = max(60, turbo_steps * 2) if rapid_mode else turbo_steps
         await _run_training_steps(
-            model, bootstrap_positions, bootstrap_steps, batch_size, device, runtime_flags,
-            callback, metrics_history,
-            phase="bootstrap", stage="training", completed_phases=completed_phases,
-            selfplay_stats=bootstrap_stats,
-            overall_started_at=started_at, overall_percent_base=25, overall_percent_range=5,
-            **common,
-        )
-        completed_phases.append("bootstrap")
-        torch.save(model.state_dict(), model_path)
-
-    # ── Phase 4: Self-play iterations (GPU policy only) ───────────────
-    sp_pct_per_iter = 60.0 / max(selfplay_iterations, 1)
-    sp_base_pct = 30.0 if is_new_model else 0.0
-
-    for it in range(1, selfplay_iterations + 1):
-        logger.info("Phase 4: Self-play iteration %d/%d — %d games", it, selfplay_iterations, selfplay_games)
-        iter_base = sp_base_pct + (it - 1) * sp_pct_per_iter
-
-        sp_positions, sp_stats = await _play_selfplay_games_batched(
-            selfplay_games, board_size, win_len, model, device, callback,
-            phase="self_play", teacher_mode="policy",
+            model,
+            foundation_pool,
+            foundation_steps,
+            _cycle_batch_size if rapid_mode else batch_size,
+            device,
+            runtime_flags,
+            callback,
+            metrics_history,
+            phase="foundation",
+            stage="turbo_train",
             completed_phases=completed_phases,
-            iteration=it, total_iterations=selfplay_iterations,
-            overall_percent_base=iter_base, overall_percent_range=sp_pct_per_iter,
-            runtime_flags=runtime_flags, **common,
-        )
-        all_positions.extend(sp_positions)
-
-        # Train on recent + replay (tactical and minimax are separate buckets)
-        replay_tail = all_positions[:-len(sp_positions)] if sp_positions else list(all_positions)
-        train_pool = _build_train_pool(
-            sp_positions,
-            replay_tail[-max(data_count, len(replay_tail) // 2):],
-            data_count=data_count,
-            seed_positions=tactical_positions,
-            minimax_positions=minimax_positions,
-        )
-        await _run_training_steps(
-            model, train_pool, selfplay_steps_per_iter, batch_size, device, runtime_flags,
-            callback, metrics_history,
-            phase="self_play", stage="training", completed_phases=completed_phases,
-            selfplay_stats=sp_stats,
-            iteration=it, total_iterations=selfplay_iterations,
             overall_started_at=started_at,
-            overall_percent_base=iter_base + sp_pct_per_iter * 0.5,
-            overall_percent_range=sp_pct_per_iter * 0.5,
+            overall_percent_base=0,
+            overall_percent_range=18,
+            augment=True,
+            augment_mode=_cycle_augment_mode,
+            time_budget=90.0 if rapid_mode else 0.0,
             **common,
         )
-        torch.save(model.state_dict(), model_path)
+        completed_phases.append("foundation")
+        registry.save_candidate(model, generation=0, metrics={"phase": "foundation"})
+        foundation_validation = await _run_validation_snapshot(
+            model,
+            holdout_bank,
+            frozen_suites,
+            device,
+            callback,
+            variant=variant,
+            cycle=0,
+            total_cycles=cycle_count,
+        )
+        validation_history.append(dict(foundation_validation))
 
-        # Tactical accuracy eval
-        if board_size <= 9:
-            tac_acc = _compute_tactical_accuracy(model, board_size, win_len, device)
-            logger.info("Self-play %d/%d tactical accuracy: %.1f%%", it, selfplay_iterations, tac_acc)
+    previous_exam: dict[str, Any] | None = None
+    last_validation: dict[str, Any] | None = validation_history[-1] if validation_history else None
+    strong_result = None
+    cycle_percent = 62.0 / max(cycle_count, 1)
+    base_percent = 18.0 if is_new_model else 5.0
+
+    _cycle_time_turbo = 45.0 if rapid_mode else 0.0
+    _cycle_time_repair = 30.0 if rapid_mode else 0.0
+    current_tactical_ratio = 0.50 if rapid_mode else 0.20
+    current_tactical_focus: str | None = None
+    current_failure_slice = 256
+    repair_effectiveness_history: list[float] = []
+
+    for cycle in range(1, cycle_count + 1):
+        cycle_base = base_percent + (cycle - 1) * cycle_percent
+
+        # Incremental data generation per cycle (rapid mode)
+        if rapid_mode and engine_available and engine_eval is not None:
+            new_engine = await _generate_engine_labeled_positions(
+                engine_per_cycle, board_size, win_len, callback, engine_eval,
+            )
+            train_engine, holdout_engine = _split_holdout_positions(
+                new_engine,
+                holdout_ratio=0.10,
+                max_holdout=8,
+            )
+            if offline_positions:
+                current_anchor_cap = min(max(anchor_bank_max, len(anchor_positions)), 4096)
+            else:
+                current_anchor_cap = min(anchor_bank_max, 200 + cycle * 75)
+            anchor_positions = _merge_position_bank(anchor_positions, train_engine, max_size=current_anchor_cap)
+            holdout_bank = _merge_position_bank(holdout_bank, holdout_engine, max_size=192)
+            if current_tactical_focus is None:
+                tactical_positions = await _generate_tactical_curriculum_positions(
+                    tactical_per_cycle, board_size, win_len, callback,
+                )
+            else:
+                focused_count = max(int(tactical_per_cycle * 0.60), 1)
+                mixed_count = max(tactical_per_cycle - focused_count, 0)
+                focused_positions = await _generate_tactical_curriculum_positions(
+                    focused_count,
+                    board_size,
+                    win_len,
+                    callback,
+                    motif_filter=current_tactical_focus,
+                )
+                mixed_positions = await _generate_tactical_curriculum_positions(
+                    mixed_count,
+                    board_size,
+                    win_len,
+                    callback,
+                ) if mixed_count > 0 else []
+                tactical_positions = focused_positions + mixed_positions
+
+        turbo_pool = _build_turbo_pool(
+            anchor_positions,
+            tactical_positions,
+            failure_bank[-min(len(failure_bank), current_failure_slice):],
+            data_count=repair_pool_size,
+            tactical_ratio=current_tactical_ratio if rapid_mode else 0.20,
+        )
+
+        # Adaptive training budget: steps scale with pool size
+        if rapid_mode:
+            _pool_size = len(turbo_pool)
+            _batches_per_pass = max(1, _pool_size // _cycle_batch_size)
+            effective_turbo = max(30, min(100, 8 * _batches_per_pass))
+            effective_repair = max(15, effective_turbo // 2)
+        else:
+            effective_turbo = turbo_steps
+            effective_repair = repair_steps
+
+        await _run_training_steps(
+            model,
+            turbo_pool,
+            effective_turbo,
+            _cycle_batch_size,
+            device,
+            runtime_flags,
+            callback,
+            metrics_history,
+            phase="turbo_train",
+            stage="training",
+            completed_phases=completed_phases,
+            iteration=cycle,
+            total_iterations=cycle_count,
+            overall_started_at=started_at,
+            overall_percent_base=cycle_base,
+            overall_percent_range=cycle_percent * 0.42,
+            augment=True,
+            augment_mode=_cycle_augment_mode,
+            time_budget=_cycle_time_turbo,
+            failureBankSize=len(failure_bank),
+            **common,
+        )
+        registry.save_candidate(model, generation=cycle, metrics={"phase": "turbo_train", "cycle": cycle})
+
+        cycle_failures: list[dict[str, Any]] = []
+        exam_result = None
+        exam_summary_current: dict[str, Any] | None = None
+        quick_exam_scheduled = not rapid_mode or (cycle % exam_every == 1 or cycle == cycle_count)
+        latest_holdout_acc = float(last_validation.get("holdoutPolicyAcc", 0.0) or 0.0) if last_validation else 0.0
+        holdout_ready = (not rapid_mode) or latest_holdout_acc >= exam_threshold_acc or cycle == cycle_count
+        do_exam = quick_exam_scheduled and holdout_ready
+        if do_exam:
+            if engine_available and engine_eval is not None:
+                exam_result, cycle_failures, exam_summary_current = await _run_engine_exam(
+                    model,
+                    board_size,
+                    win_len,
+                    device,
+                    callback,
+                    engine_eval,
+                    variant=variant,
+                    cycle=cycle,
+                    total_cycles=cycle_count,
+                    num_pairs=exam_pairs,
+                    previous_result=previous_exam,
+                    phase="exam",
+                    stage="engine_eval",
+                    collect_failures=True,
+                )
+                strong_result = exam_result
+                previous_exam = exam_summary_current
+                if exam_summary_current:
+                    winrate_history.append({
+                        "cycle": cycle,
+                        "winrate": round(exam_summary_current.get("winrate", 0), 4),
+                        "wins": exam_summary_current.get("wins", 0),
+                        "losses": exam_summary_current.get("losses", 0),
+                        "draws": exam_summary_current.get("draws", 0),
+                    })
+            else:
+                await callback({
+                    "type": "train.progress",
+                    "payload": {
+                        "phase": "exam",
+                        "stage": "unavailable",
+                        "variant": variant,
+                        "cycle": cycle,
+                        "totalCycles": cycle_count,
+                        "iteration": cycle,
+                        "totalIterations": cycle_count,
+                        "message": "Engine exam unavailable: persistent engine not running",
+                    },
+                })
+        elif quick_exam_scheduled and not holdout_ready:
             await callback({
                 "type": "train.progress",
                 "payload": {
-                    "phase": "self_play", "stage": "eval", "variant": variant,
-                    "completedPhases": completed_phases or [],
-                    "iteration": it, "totalIterations": selfplay_iterations,
-                    "tacticalAccuracy": tac_acc,
-                    "message": f"Tactical accuracy: {tac_acc}%",
+                    "phase": "exam",
+                    "stage": "holdout_gate",
+                    "variant": variant,
+                    "cycle": cycle,
+                    "totalCycles": cycle_count,
+                    "iteration": cycle,
+                    "totalIterations": cycle_count,
+                    "holdoutPolicyAcc": round(latest_holdout_acc, 2),
+                    "examThresholdAcc": round(exam_threshold_acc, 2),
+                    "message": "Quick probe deferred until holdout accuracy gate is met",
+                },
+            })
+        else:
+            await callback({
+                "type": "train.progress",
+                "payload": {
+                    "phase": "exam",
+                    "stage": "deferred",
+                    "variant": variant,
+                    "cycle": cycle,
+                    "totalCycles": cycle_count,
+                    "iteration": cycle,
+                    "totalIterations": cycle_count,
+                    "message": "Quick probe deferred this cycle",
                 },
             })
 
-    # ── Done ───────────────────────────────────────────────────────────
-    from gomoku_api.ws.predict_service import clear_cached_model
-    clear_cached_model(variant)
+        before_matches = _score_policy_matches(model, cycle_failures, device) if cycle_failures else []
+        failure_bank = _merge_failure_bank(failure_bank, cycle_failures, max_size=failure_bank_max)
 
-    final_elapsed = round(time.monotonic() - started_at, 1)
+        if failure_bank:
+            repair_pool = _build_repair_pool(
+                failure_bank,
+                anchor_positions,
+                tactical_positions,
+                data_count=max(batch_size, repair_pool_size),
+            )
+            await _run_training_steps(
+                model,
+                repair_pool,
+                effective_repair,
+                _cycle_batch_size,
+                device,
+                runtime_flags,
+                callback,
+                metrics_history,
+                phase="repair",
+                stage="training",
+                completed_phases=completed_phases,
+                iteration=cycle,
+                total_iterations=cycle_count,
+                overall_started_at=started_at,
+                overall_percent_base=cycle_base + cycle_percent * 0.42,
+                overall_percent_range=cycle_percent * 0.42,
+                augment=True,
+                augment_mode=_cycle_augment_mode,
+                time_budget=_cycle_time_repair,
+                failureBankSize=len(failure_bank),
+                newFailures=len(cycle_failures),
+                **common,
+            )
+            registry.save_candidate(model, generation=cycle, metrics={"phase": "repair", "cycle": cycle})
+
+        after_matches = _score_policy_matches(model, cycle_failures, device) if cycle_failures else []
+        fixed_errors = sum((not before) and after for before, after in zip(before_matches, after_matches))
+        regressed_errors = sum(before and (not after) for before, after in zip(before_matches, after_matches))
+        corrected_errors = sum(after_matches)
+        corrected_rate = corrected_errors / max(len(after_matches), 1) if after_matches else 0.0
+        await callback({
+            "type": "train.progress",
+            "payload": {
+                "phase": "repair_eval",
+                "stage": "assessment",
+                "variant": variant,
+                "cycle": cycle,
+                "totalCycles": cycle_count,
+                "iteration": cycle,
+                "totalIterations": cycle_count,
+                "fixedErrors": fixed_errors,
+                "regressedErrors": regressed_errors,
+                "correctedErrors": corrected_errors,
+                "correctedRate": round(corrected_rate, 4),
+                "failureBankSize": len(failure_bank),
+                "newFailures": len(cycle_failures),
+                "winrateVsAlgorithm": round(exam_result.winrate_a, 4) if exam_result is not None else None,
+                "percent": round(cycle_base + cycle_percent * 0.90, 1),
+                "elapsed": round(time.monotonic() - started_at, 1),
+            },
+        })
+        repair_effectiveness_history.append(corrected_rate)
+
+        validation_payload = await _run_validation_snapshot(
+            model,
+            holdout_bank,
+            frozen_suites,
+            device,
+            callback,
+            variant=variant,
+            cycle=cycle,
+            total_cycles=cycle_count,
+            previous_holdout=last_validation,
+        )
+        validation_history.append(dict(validation_payload))
+        last_validation = validation_payload
+
+        if rapid_mode:
+            current_tactical_ratio = 0.50
+            current_tactical_focus = None
+            current_failure_slice = 256
+
+            block_bench = validation_payload.get("frozenBlockAcc")
+            win_bench = validation_payload.get("frozenWinAcc")
+            holdout_delta = float(validation_payload.get("holdoutDeltaAcc", 0.0) or 0.0)
+
+            if block_bench is not None and win_bench is not None:
+                if block_bench + 4.0 < win_bench:
+                    current_tactical_focus = "block"
+                    current_tactical_ratio = 0.60
+                elif win_bench + 6.0 < block_bench:
+                    current_tactical_focus = "win"
+                    current_tactical_ratio = 0.55
+
+            if holdout_delta < -1.0:
+                current_tactical_ratio = max(0.40, current_tactical_ratio - 0.10)
+
+            if corrected_rate < 0.20 and len(failure_bank) > 8:
+                current_failure_slice = 384
+            elif corrected_rate > 0.45:
+                current_failure_slice = 192
+
+        # Winrate-driven scheduler: early exit if stable or stagnated
+        if rapid_mode and len(winrate_history) >= 3:
+            last3 = [h["winrate"] for h in winrate_history[-3:]]
+            recent_holdout = [
+                float(item["holdoutPolicyAcc"])
+                for item in validation_history[-3:]
+                if item.get("holdoutPolicyAcc") is not None
+            ]
+            recent_corrected = repair_effectiveness_history[-3:]
+            avg_corrected = sum(recent_corrected) / max(len(recent_corrected), 1)
+            holdout_regressing = len(recent_holdout) >= 2 and recent_holdout[-1] + 1.0 < recent_holdout[0]
+            holdout_flat = len(recent_holdout) >= 2 and abs(recent_holdout[-1] - recent_holdout[0]) < 1.0
+
+            if min(last3) >= 0.60 and not holdout_regressing and avg_corrected >= 0.25:
+                logger.info("Winrate stable above 60%% after cycle %d, exiting early", cycle)
+                break
+            if max(last3) - min(last3) < 0.03 and cycle >= 5 and holdout_flat and avg_corrected < 0.15:
+                logger.info("Winrate stagnated after cycle %d, exiting", cycle)
+                break
+
+    from gomoku_api.ws.arena_eval import arena_match
+    from gomoku_api.ws.promotion import evaluate_promotion
+
+    quick_result = None
+    if registry.has_champion():
+        from trainer_lab.config import ModelConfig as _MC
+        from trainer_lab.models.resnet import PolicyValueResNet as _PVR
+
+        _cfg = _MC()
+        champion_manifest = registry.read_manifest()
+        _, (_rf, _rb, _vf) = _variant_model_hparams(board_size, _cfg, variant=variant, manifest=champion_manifest)
+        champion_model = _PVR(
+            in_channels=_cfg.in_channels,
+            res_filters=_rf,
+            res_blocks=_rb,
+            policy_filters=_cfg.policy_filters,
+            value_fc=_vf,
+            board_max=_cfg.board_max,
+        )
+        champion_model = registry.load_champion_into(champion_model, device)
+        if champion_model is not None:
+            if device.type == "cuda":
+                champion_model = champion_model.to(memory_format=torch.channels_last)
+            quick_result = await arena_match(
+                model,
+                champion_model,
+                board_size,
+                win_len,
+                num_pairs=min(exam_pairs, 8),
+                device=device,
+                callback=callback,
+                variant=variant,
+            )
+            del champion_model
+
+    # Confirm exam: separate from quick probes, used for promotion only
+    confirm_result = strong_result
+    if engine_available and engine_eval is not None:
+        confirm_result, _, confirm_summary = await _run_engine_exam(
+            model,
+            board_size,
+            win_len,
+            device,
+            callback,
+            engine_eval,
+            variant=variant,
+            cycle=cycle_count + 1,
+            total_cycles=cycle_count,
+            num_pairs=10,
+            previous_result=previous_exam,
+            phase="confirm_exam",
+            stage="engine_eval",
+            collect_failures=False,
+        )
+        strong_result = confirm_result
+        logger.info("Confirm exam: winrate=%.2f (W%d/L%d/D%d)",
+                     confirm_summary.get("winrate", 0.0), confirm_summary.get("wins", 0), confirm_summary.get("losses", 0), confirm_summary.get("draws", 0))
+
+    if board_size <= 9:
+        block_acc = _compute_tactical_accuracy(model, board_size, win_len, device, n_samples=200, motif_filter="block")
+        win_acc = _compute_tactical_accuracy(model, board_size, win_len, device, n_samples=200, motif_filter="win")
+    else:
+        block_acc = 90.0
+        win_acc = 90.0
+
+    manifest_before = registry.read_manifest()
+    prev_algo_winrate = None
+    if manifest_before.get("history"):
+        prev_algo_winrate = manifest_before["history"][-1].get("winrateVsAlgorithm")
+
+    decision = evaluate_promotion(
+        quick_result,
+        strong_result,
+        block_accuracy=block_acc,
+        win_accuracy=win_acc,
+        prev_algo_winrate=prev_algo_winrate,
+    )
     await callback({
-        "type": "train.done",
+        "type": "train.progress",
         "payload": {
-            "variant": variant, "epochs": epochs, "elapsed": final_elapsed,
-            "metricsHistory": metrics_history, "device": device.type,
-            "positions": len(all_positions),
+            "phase": "promotion",
+            "stage": "decision",
+            "variant": variant,
+            "promotionDecision": decision.promoted,
+            **decision.to_dict(),
         },
     })
+
+    promoted_this_run = False
+    if decision.promoted:
+        registry.promote_candidate(
+            generation=cycle_count,
+            metrics={
+                **decision.to_dict(),
+                "modelProfile": model_profile,
+                "resFilters": res_filters,
+                "resBlocks": res_blocks,
+                "valueFc": value_fc,
+            },
+            reason=decision.reason,
+        )
+        promoted_this_run = True
+        await callback({
+            "type": "model.promoted",
+            "payload": {
+                "variant": variant,
+                "generation": cycle_count,
+                "promotionDecision": True,
+                **decision.to_dict(),
+            },
+        })
+    else:
+        await callback({
+            "type": "promotion.rejected",
+            "payload": {
+                "variant": variant,
+                "generation": cycle_count,
+                "promotionDecision": False,
+                **decision.to_dict(),
+            },
+        })
+
+    from gomoku_api.ws.predict_service import clear_cached_model
+
+    if promoted_this_run:
+        clear_cached_model(variant)
+
+    final_elapsed = round(time.monotonic() - started_at, 1)
+    manifest = registry.read_manifest()
+    done_payload: dict[str, Any] = {
+        "variant": variant,
+        "epochs": epochs,
+        "elapsed": final_elapsed,
+        "metricsHistory": metrics_history,
+        "device": device.type,
+        "modelProfile": model_profile,
+        "positions": len(anchor_positions) + len(tactical_positions) + len(failure_bank),
+        "failureBankSize": len(failure_bank),
+        "championGeneration": manifest.get("current_champion_generation"),
+        "promoted": promoted_this_run,
+        "cycles": cycle_count,
+    }
+    if quick_result:
+        done_payload["winrateVsChampion"] = round(quick_result.winrate_a, 4)
+    if strong_result:
+        done_payload["winrateVsAlgorithm"] = round(strong_result.winrate_a, 4)
+    if winrate_history:
+        done_payload["winrateHistory"] = winrate_history
+    if validation_history:
+        done_payload["validationHistory"] = validation_history
+        latest_validation = validation_history[-1]
+        for key in (
+            "holdoutPolicyAcc",
+            "holdoutTeacherMass",
+            "holdoutPolicyKL",
+            "holdoutValueMAE",
+            "holdoutValueSignAgreement",
+            "holdoutLegalTargetRate",
+            "holdoutDuplicateMergeRate",
+            "holdoutPolicyMassMeanAbsError",
+            "holdoutNonFiniteTargetRate",
+            "frozenBlockAcc",
+            "frozenWinAcc",
+            "frozenMidAcc",
+            "frozenLateAcc",
+        ):
+            if latest_validation.get(key) is not None:
+                done_payload[key] = latest_validation[key]
+    await callback({"type": "train.done", "payload": done_payload})
+
+    if engine_eval is not None:
+        try:
+            await engine_eval.stop()
+        except Exception:
+            logger.debug("Failed to stop persistent engine cleanly", exc_info=True)
 
 
 def clear_model(variant: str = "all") -> dict[str, Any]:
@@ -1744,9 +3380,10 @@ def clear_model(variant: str = "all") -> dict[str, Any]:
 
     variants = ["ttt3", "ttt5"] if variant == "all" else [variant]
     for current_variant in variants:
-        model_path = SAVED_DIR / f"{current_variant}_resnet" / "model.pt"
-        if model_path.exists():
-            model_path.unlink()
-            logger.info("Cleared model: %s", model_path)
+        for fname in ("model.pt", "candidate.pt", "champion.pt"):
+            fpath = SAVED_DIR / f"{current_variant}_resnet" / fname
+            if fpath.exists():
+                fpath.unlink()
+                logger.info("Cleared: %s", fpath)
         clear_cached_model(current_variant)
     return {"cleared": True, "variant": variant}
