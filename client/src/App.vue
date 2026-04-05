@@ -310,7 +310,25 @@
           </div>
 
           <!-- Winrate vs Engine Chart -->
-          <div v-if="winrateHistory.length > 0" class="training-charts winrate-chart-block">
+          <div v-if="hasWinrateChartData" class="training-charts winrate-chart-block">
+            <div class="winrate-chart-meta">
+              <span class="winrate-legend-item">
+                <span class="winrate-dot quick"></span>
+                Quick probe (до repair)
+              </span>
+              <span class="winrate-legend-item">
+                <span class="winrate-dot confirm"></span>
+                Confirm exam (финальный post-repair)
+              </span>
+            </div>
+            <div v-if="latestQuickProbe || latestConfirmExam" class="winrate-chart-summary">
+              <span v-if="latestQuickProbe" class="strength-pill">
+                {{ formatExamSummary(latestQuickProbe, 'quick') }}
+              </span>
+              <span v-if="latestConfirmExam" class="strength-pill promoted">
+                {{ formatExamSummary(latestConfirmExam, 'confirm') }}
+              </span>
+            </div>
             <div ref="winrateChartEl" class="uplot-chart"></div>
           </div>
         </div>
@@ -603,6 +621,7 @@ let gpuPollInterval = null
 
 const metricsHistory = ref([]) // For training charts
 const winrateHistory = ref([]) // Winrate vs engine per exam cycle
+const confirmWinrateHistory = ref([]) // Confirm exam winrate (post-repair / final)
 const lossChartEl = ref(null) // uPlot loss chart container
 const accChartEl = ref(null) // uPlot accuracy chart container
 const winrateChartEl = ref(null) // uPlot winrate chart container
@@ -611,6 +630,22 @@ let winrateChart = null
 let accChart = null
 const lastProbs = ref(null) // Last policy probabilities from bot
 const policyCanvas = ref(null) // Canvas for policy heatmap
+
+const hasWinrateChartData = computed(() => winrateHistory.value.length > 0 || confirmWinrateHistory.value.length > 0)
+const latestQuickProbe = computed(() => winrateHistory.value.length ? winrateHistory.value[winrateHistory.value.length - 1] : null)
+const latestConfirmExam = computed(() => confirmWinrateHistory.value.length ? confirmWinrateHistory.value[confirmWinrateHistory.value.length - 1] : null)
+
+function hasExamCounts(point) {
+  if (!point) return false
+  return (Number(point.wins || 0) + Number(point.losses || 0) + Number(point.draws || 0)) > 0
+}
+
+function formatExamSummary(point, label) {
+  if (!point) return ''
+  const base = `${label}: ${(Number(point.winrate || 0) * 100).toFixed(1)}%`
+  if (!hasExamCounts(point)) return base
+  return `${base} · W${point.wins}/L${point.losses}/D${point.draws}`
+}
 
 function formatTime(seconds) {
   if (!seconds || seconds <= 0) return '--:--'
@@ -728,13 +763,32 @@ function updateCharts() {
   }
 }
 
+function upsertWinratePoint(historyRef, point) {
+  const cycle = Number(point.cycle)
+  const nextPoint = {
+    cycle,
+    winrate: Number(point.winrate || 0),
+    wins: Number(point.wins || 0),
+    losses: Number(point.losses || 0),
+    draws: Number(point.draws || 0),
+  }
+  const existingIdx = historyRef.value.findIndex(item => Number(item.cycle) === cycle)
+  if (existingIdx >= 0) {
+    const updated = historyRef.value.slice()
+    updated[existingIdx] = { ...updated[existingIdx], ...nextPoint }
+    historyRef.value = updated.sort((a, b) => a.cycle - b.cycle)
+    return
+  }
+  historyRef.value = [...historyRef.value, nextPoint].sort((a, b) => a.cycle - b.cycle)
+}
+
 function createWinrateChart() {
   if (!winrateChartEl.value || winrateChart) return
   if (!winrateChartEl.value.isConnected) return
   const opts = {
     width: winrateChartEl.value.offsetWidth || 600,
     height: 180,
-    title: 'Winrate vs Engine',
+    title: 'Winrate vs Engine (Quick vs Confirm)',
     cursor: { show: true },
     scales: { x: { time: false }, y: { range: [0, 100] } },
     axes: [
@@ -743,19 +797,27 @@ function createWinrateChart() {
     ],
     series: [
       { label: 'Cycle' },
-      { label: 'Winrate', stroke: '#1565c0', width: 2, fill: 'rgba(21,101,192,0.1)' },
+      { label: 'Quick probe', stroke: '#1565c0', width: 2, fill: 'rgba(21,101,192,0.08)', points: { show: true, size: 6 } },
+      { label: 'Confirm exam', stroke: '#2e7d32', width: 2, dash: [8, 6], points: { show: true, size: 8, stroke: '#2e7d32', fill: '#ffffff' } },
     ],
   }
-  winrateChart = new uPlot(opts, [[0], [null]], winrateChartEl.value)
+  winrateChart = new uPlot(opts, [[0], [null], [null]], winrateChartEl.value)
 }
 
 function updateWinrateChart() {
-  const data = winrateHistory.value
-  if (!data || data.length < 1) return
-  const cycles = data.map(d => d.cycle)
-  const winrates = data.map(d => (d.winrate || 0) * 100)
+  const quickData = winrateHistory.value || []
+  const confirmData = confirmWinrateHistory.value || []
+  if (quickData.length < 1 && confirmData.length < 1) return
+  const cycles = Array.from(new Set([
+    ...quickData.map(d => Number(d.cycle)),
+    ...confirmData.map(d => Number(d.cycle)),
+  ])).sort((a, b) => a - b)
+  const quickByCycle = new Map(quickData.map(d => [Number(d.cycle), (Number(d.winrate) || 0) * 100]))
+  const confirmByCycle = new Map(confirmData.map(d => [Number(d.cycle), (Number(d.winrate) || 0) * 100]))
+  const quickWinrates = cycles.map(cycle => quickByCycle.has(cycle) ? quickByCycle.get(cycle) : null)
+  const confirmWinrates = cycles.map(cycle => confirmByCycle.has(cycle) ? confirmByCycle.get(cycle) : null)
   if (winrateChart) {
-    winrateChart.setData([cycles, winrates])
+    winrateChart.setData([cycles, quickWinrates, confirmWinrates])
   }
 }
 
@@ -972,19 +1034,28 @@ function connectWS() {
               if (msg.payload.metricsHistory) {
                 metricsHistory.value = msg.payload.metricsHistory
               }
-              // Collect winrate data from exam phase completion
+              // Collect winrate data from quick exam and confirm exam.
+              // Quick exam is a pre-repair probe; confirm exam is the final post-repair truth.
               const _p = msg.payload
-              if (_p.phase === 'exam' && _p.winrateVsAlgorithm != null && _p.game === _p.totalGames) {
-                const cycle = _p.cycle || _p.iteration || winrateHistory.value.length + 1
-                const existing = winrateHistory.value.find(h => h.cycle === cycle)
-                if (!existing) {
-                  winrateHistory.value = [...winrateHistory.value, {
+              if (_p.winrateVsAlgorithm != null && _p.game != null && _p.totalGames != null) {
+                if (_p.phase === 'exam') {
+                  const cycle = _p.cycle || _p.iteration || winrateHistory.value.length + 1
+                  upsertWinratePoint(winrateHistory, {
                     cycle,
                     winrate: _p.winrateVsAlgorithm,
                     wins: _p.arenaWins || 0,
                     losses: _p.arenaLosses || 0,
                     draws: _p.arenaDraws || 0,
-                  }]
+                  })
+                } else if (_p.phase === 'confirm_exam') {
+                  const cycle = _p.cycle || (_p.totalCycles ? _p.totalCycles + 1 : confirmWinrateHistory.value.length + 1)
+                  upsertWinratePoint(confirmWinrateHistory, {
+                    cycle,
+                    winrate: _p.winrateVsAlgorithm,
+                    wins: _p.arenaWins || 0,
+                    losses: _p.arenaLosses || 0,
+                    draws: _p.arenaDraws || 0,
+                  })
                 }
               }
               // Build status text from structured data
@@ -1028,11 +1099,14 @@ function connectWS() {
         }
         if (msg.type === 'train.start') { 
           training.value = true
+          destroyCharts()
           trainingMeta.value = msg.payload
           gpuTelemetry.value = extractGpuTelemetry(msg.payload)
           progress.value = { percent: 0, epoch: 0, epochs: msg.payload.epochs }
           ttt5Progress.value = { ...msg.payload, phase: 'preparing', percent: 0, elapsed: 0, eta: 0 }
+          metricsHistory.value = []
           winrateHistory.value = []
+          confirmWinrateHistory.value = []
           // Не сбрасываем datasetProgress здесь - генерация еще не началась
           status.value = 'Подготовка к обучению...'
           console.log('[WS] Training started, epochs:', msg.payload.epochs)
@@ -1107,6 +1181,28 @@ function connectWS() {
         ttt5Progress.value = { ...(ttt5Progress.value || {}), ...p, phase: 'done' }
         trainingMeta.value = { ...(trainingMeta.value || {}), ...p }
         if (p.metricsHistory) metricsHistory.value = p.metricsHistory
+        if (Array.isArray(p.winrateHistory)) {
+          winrateHistory.value = [...p.winrateHistory]
+            .map(item => ({
+              cycle: Number(item.cycle || 0),
+              winrate: Number(item.winrate || 0),
+              wins: Number(item.wins || 0),
+              losses: Number(item.losses || 0),
+              draws: Number(item.draws || 0),
+            }))
+            .sort((a, b) => a.cycle - b.cycle)
+        }
+        if (p.winrateVsAlgorithm != null) {
+          const confirmCycle = Number(p.cycles || winrateHistory.value.length || 0) + 1
+          const previousConfirm = confirmWinrateHistory.value.find(item => Number(item.cycle) === confirmCycle)
+          upsertWinratePoint(confirmWinrateHistory, {
+            cycle: confirmCycle,
+            winrate: p.winrateVsAlgorithm,
+            wins: p.confirmWins ?? previousConfirm?.wins ?? 0,
+            losses: p.confirmLosses ?? previousConfirm?.losses ?? 0,
+            draws: p.confirmDraws ?? previousConfirm?.draws ?? 0,
+          })
+        }
         status.value = doneStatus
         console.log('[WS] Training completed:', p)
         // Обновляем статистику истории после обучения
@@ -1211,7 +1307,10 @@ function connectWS() {
           clearing.value = false
           progress.value = null
           ttt5Progress.value = null
+          destroyCharts()
           metricsHistory.value = []
+          winrateHistory.value = []
+          confirmWinrateHistory.value = []
           modelConfidence.value = null
           // Сбросить игру — старая модель больше не существует
           reset()
@@ -1723,8 +1822,8 @@ watch(metricsHistory, () => {
   }
 }, { deep: true })
 
-watch(winrateHistory, () => {
-  if (winrateHistory.value.length > 0) {
+watch([winrateHistory, confirmWinrateHistory], () => {
+  if (hasWinrateChartData.value) {
     nextTick(() => {
       if (winrateChart && winrateChartEl.value && !winrateChartEl.value.querySelector('canvas')) {
         try { winrateChart.destroy() } catch (_) {}
@@ -1749,7 +1848,7 @@ watch(board, () => {
 
 // Destroy charts when training ends
 watch(training, (val) => {
-  if (!val) {
+  if (!val && metricsHistory.value.length === 0 && !hasWinrateChartData.value) {
     setTimeout(destroyCharts, 500)
   }
 })
@@ -2196,6 +2295,41 @@ onMounted(() => {
   border-color: rgba(21, 101, 192, 0.3);
   background: rgba(21, 101, 192, 0.02);
 }
+
+.winrate-chart-meta,
+.winrate-chart-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.winrate-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.88em;
+  color: #4b5b73;
+}
+
+.winrate-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.winrate-dot.quick {
+  background: #1565c0;
+  box-shadow: 0 0 0 2px rgba(21, 101, 192, 0.14);
+}
+
+.winrate-dot.confirm {
+  background: #fff;
+  border: 2px dashed #2e7d32;
+  box-sizing: border-box;
+}
+
 .uplot-chart {
   width: 100%;
   max-width: 640px;

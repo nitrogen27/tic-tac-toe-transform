@@ -343,6 +343,67 @@ def _normalize_policy_vector(policy: list[float]) -> list[float]:
     return [float(v / total) for v in policy]
 
 
+def _classify_engine_phase(board_size: int, occupied_cells: int) -> str:
+    total_cells = board_size * board_size
+    if board_size <= 5:
+        if occupied_cells <= 3:
+            return "opening"
+        if occupied_cells <= 10:
+            return "early_mid"
+        if occupied_cells <= 16:
+            return "mid"
+        return "late"
+    if occupied_cells <= max(3, total_cells // 8):
+        return "opening"
+    if occupied_cells <= max(10, total_cells // 3):
+        return "mid"
+    return "late"
+
+
+def _resolve_engine_sampling_bounds(
+    board_size: int,
+    total_cells: int,
+    *,
+    phase_focus: str | None = None,
+    rng_value: float | None = None,
+) -> tuple[int, int]:
+    focus = (phase_focus or "").strip().lower()
+    if board_size <= 5:
+        if focus in {"opening", "early"}:
+            return 0, min(6, total_cells - 1)
+        if focus in {"mid", "midgame"}:
+            return min(9, total_cells - 1), min(16, total_cells - 1)
+        if focus in {"late", "endgame"}:
+            return min(17, total_cells - 1), total_cells - 1
+    else:
+        if focus in {"opening", "early"}:
+            return 0, min(max(4, total_cells // 8), total_cells - 1)
+        if focus in {"mid", "midgame"}:
+            return min(max(5, total_cells // 5), total_cells - 1), min(max(18, (total_cells * 2) // 3), total_cells - 1)
+        if focus in {"late", "endgame"}:
+            return min(max(19, (total_cells * 2) // 3), total_cells - 1), total_cells - 1
+
+    r = 0.5 if rng_value is None else rng_value
+    if board_size <= 5:
+        # Default mixed mode still prefers tactical positions, but leaves
+        # enough midgame coverage for conversion quality to improve.
+        if r < 0.05:
+            return 0, min(3, total_cells - 1)
+        if r < 0.20:
+            return min(4, total_cells - 1), min(10, total_cells - 1)
+        if r < 0.55:
+            return min(11, total_cells - 1), min(16, total_cells - 1)
+        return min(17, total_cells - 1), total_cells - 1
+
+    if r < 0.20:
+        return 0, min(3, total_cells - 1)
+    if r < 0.60:
+        return min(4, total_cells - 1), min(10, total_cells - 1)
+    if r < 0.90:
+        return min(11, total_cells - 1), min(18, total_cells - 1)
+    return min(19, total_cells - 1), total_cells - 1
+
+
 def _canonicalize_position(position: dict[str, Any]) -> dict[str, Any]:
     if "_canonicalFingerprint" in position:
         return position
@@ -658,6 +719,79 @@ def _build_turbo_pool(
     return pool[:data_count]
 
 
+def _choose_rapid_cycle_strategy(
+    validation_payload: dict[str, Any],
+    *,
+    corrected_rate: float,
+    failure_bank_size: int,
+    engine_per_cycle: int,
+) -> dict[str, Any]:
+    strategy = {
+        "tacticalRatio": 0.50,
+        "tacticalFocus": None,
+        "failureSlice": 256,
+        "engineFocus": None,
+        "engineCount": engine_per_cycle,
+        "weakestFrozenSuite": None,
+        "midLateGap": None,
+    }
+
+    block_bench = validation_payload.get("frozenBlockAcc")
+    win_bench = validation_payload.get("frozenWinAcc")
+    mid_bench = validation_payload.get("frozenMidAcc")
+    late_bench = validation_payload.get("frozenLateAcc")
+    holdout_delta = float(validation_payload.get("holdoutDeltaAcc", 0.0) or 0.0)
+
+    suites = [
+        ("block", block_bench),
+        ("win", win_bench),
+        ("mid", mid_bench),
+        ("late", late_bench),
+    ]
+    available_suites = [(name, float(value)) for name, value in suites if value is not None]
+    if available_suites:
+        weakest_name, _ = min(available_suites, key=lambda item: item[1])
+        strategy["weakestFrozenSuite"] = weakest_name
+
+    if mid_bench is not None and late_bench is not None:
+        strategy["midLateGap"] = round(float(late_bench) - float(mid_bench), 2)
+
+    if block_bench is not None and win_bench is not None:
+        if float(block_bench) + 4.0 < float(win_bench):
+            strategy["tacticalFocus"] = "block"
+            strategy["tacticalRatio"] = 0.60
+        elif float(win_bench) + 6.0 < float(block_bench):
+            strategy["tacticalFocus"] = "win"
+            strategy["tacticalRatio"] = 0.55
+
+    # Midgame conversion is the current bottleneck once tactical suites are strong.
+    if mid_bench is not None and (late_bench is None or float(mid_bench) + 8.0 < float(late_bench)):
+        strategy["engineFocus"] = "mid"
+        strategy["engineCount"] = min(
+            128,
+            max(engine_per_cycle + 24, int(round(engine_per_cycle * 1.75))),
+        )
+        strategy["tacticalRatio"] = min(float(strategy["tacticalRatio"]), 0.35)
+    elif late_bench is not None and float(late_bench) < 60.0:
+        strategy["engineFocus"] = "late"
+        strategy["engineCount"] = min(
+            112,
+            max(engine_per_cycle + 16, int(round(engine_per_cycle * 1.5))),
+        )
+        strategy["tacticalRatio"] = min(float(strategy["tacticalRatio"]), 0.40)
+
+    if holdout_delta < -1.0:
+        strategy["tacticalRatio"] = max(0.35, float(strategy["tacticalRatio"]) - 0.05)
+        strategy["engineCount"] = min(128, int(strategy["engineCount"]) + 16)
+
+    if corrected_rate < 0.20 and failure_bank_size > 8:
+        strategy["failureSlice"] = 384
+    elif corrected_rate > 0.45:
+        strategy["failureSlice"] = 192
+
+    return strategy
+
+
 _BATCH_D4_TRANSFORMS = [
     lambda p: p,                                          # identity
     lambda p: torch.rot90(p, 1, [2, 3]),                  # rot90
@@ -843,29 +977,16 @@ def _sample_engine_position(
     win_len: int,
     *,
     rng: random.Random | None = None,
+    phase_focus: str | None = None,
 ) -> tuple[list[int], int, int] | None:
     rng = rng or random
     total_cells = board_size * board_size
-    r = rng.random()
-    if board_size <= 5:
-        # 5×5: bias heavily toward endgame/tactical positions
-        if r < 0.05:
-            low, high = 0, min(3, total_cells - 1)
-        elif r < 0.20:
-            low, high = min(4, total_cells - 1), min(10, total_cells - 1)
-        elif r < 0.50:
-            low, high = min(11, total_cells - 1), min(16, total_cells - 1)
-        else:
-            low, high = min(17, total_cells - 1), total_cells - 1
-    else:
-        if r < 0.20:
-            low, high = 0, min(3, total_cells - 1)
-        elif r < 0.60:
-            low, high = min(4, total_cells - 1), min(10, total_cells - 1)
-        elif r < 0.90:
-            low, high = min(11, total_cells - 1), min(18, total_cells - 1)
-        else:
-            low, high = min(19, total_cells - 1), total_cells - 1
+    low, high = _resolve_engine_sampling_bounds(
+        board_size,
+        total_cells,
+        phase_focus=phase_focus,
+        rng_value=rng.random(),
+    )
 
     if high < low:
         low = 0
@@ -900,6 +1021,7 @@ async def _generate_engine_labeled_positions(
     variant: str = "",
     rng: random.Random | None = None,
     source: str = "engine",
+    phase_focus: str | None = None,
 ) -> list[dict[str, Any]]:
     positions: list[dict[str, Any]] = []
     started_at = time.monotonic()
@@ -910,11 +1032,12 @@ async def _generate_engine_labeled_positions(
 
     while len(positions) < count and attempts < max_attempts:
         attempts += 1
-        sampled = _sample_engine_position(board_size, win_len, rng=rng)
+        sampled = _sample_engine_position(board_size, win_len, rng=rng, phase_focus=phase_focus)
         if sampled is None:
             continue
 
         board, current, last_move = sampled
+        phase_bucket = _classify_engine_phase(board_size, sum(1 for cell in board if cell != 0))
         move, value = await engine_eval.best_move_with_value(board, current, board_size, win_len)
         if move < 0 or move >= len(board) or board[move] != 0:
             continue
@@ -927,6 +1050,7 @@ async def _generate_engine_labeled_positions(
             "policy": _one_hot_policy(move, board_size),
             "value": max(-1.0, min(1.0, float(value))),
             "source": source,
+            "phaseBucket": phase_bucket,
             "sampleWeight": 1.0,
         })
 
@@ -1650,7 +1774,7 @@ async def _build_frozen_benchmark_suites(
 
     if engine_eval is not None:
         suites["mid"] = await _generate_engine_labeled_positions(
-            24,
+            48 if board_size <= 5 else 24,
             board_size,
             win_len,
             _silent_callback,
@@ -1658,9 +1782,10 @@ async def _build_frozen_benchmark_suites(
             variant=variant,
             rng=random.Random(f"{variant}:mid"),
             source="benchmark",
+            phase_focus="mid",
         )
         suites["late"] = await _generate_engine_labeled_positions(
-            24,
+            48 if board_size <= 5 else 24,
             board_size,
             win_len,
             _silent_callback,
@@ -1668,6 +1793,7 @@ async def _build_frozen_benchmark_suites(
             variant=variant,
             rng=random.Random(f"{variant}:late"),
             source="benchmark",
+            phase_focus="late",
         )
     return suites
 
@@ -2907,6 +3033,8 @@ async def train_variant(
     _cycle_time_repair = 30.0 if rapid_mode else 0.0
     current_tactical_ratio = 0.50 if rapid_mode else 0.20
     current_tactical_focus: str | None = None
+    current_engine_focus: str | None = None
+    current_engine_count = engine_per_cycle
     current_failure_slice = 256
     repair_effectiveness_history: list[float] = []
 
@@ -2916,7 +3044,12 @@ async def train_variant(
         # Incremental data generation per cycle (rapid mode)
         if rapid_mode and engine_available and engine_eval is not None:
             new_engine = await _generate_engine_labeled_positions(
-                engine_per_cycle, board_size, win_len, callback, engine_eval,
+                current_engine_count,
+                board_size,
+                win_len,
+                callback,
+                engine_eval,
+                phase_focus=current_engine_focus,
             )
             train_engine, holdout_engine = _split_holdout_positions(
                 new_engine,
@@ -3153,29 +3286,17 @@ async def train_variant(
         last_validation = validation_payload
 
         if rapid_mode:
-            current_tactical_ratio = 0.50
-            current_tactical_focus = None
-            current_failure_slice = 256
-
-            block_bench = validation_payload.get("frozenBlockAcc")
-            win_bench = validation_payload.get("frozenWinAcc")
-            holdout_delta = float(validation_payload.get("holdoutDeltaAcc", 0.0) or 0.0)
-
-            if block_bench is not None and win_bench is not None:
-                if block_bench + 4.0 < win_bench:
-                    current_tactical_focus = "block"
-                    current_tactical_ratio = 0.60
-                elif win_bench + 6.0 < block_bench:
-                    current_tactical_focus = "win"
-                    current_tactical_ratio = 0.55
-
-            if holdout_delta < -1.0:
-                current_tactical_ratio = max(0.40, current_tactical_ratio - 0.10)
-
-            if corrected_rate < 0.20 and len(failure_bank) > 8:
-                current_failure_slice = 384
-            elif corrected_rate > 0.45:
-                current_failure_slice = 192
+            strategy = _choose_rapid_cycle_strategy(
+                validation_payload,
+                corrected_rate=corrected_rate,
+                failure_bank_size=len(failure_bank),
+                engine_per_cycle=engine_per_cycle,
+            )
+            current_tactical_ratio = float(strategy["tacticalRatio"])
+            current_tactical_focus = strategy["tacticalFocus"]
+            current_engine_focus = strategy["engineFocus"]
+            current_engine_count = int(strategy["engineCount"])
+            current_failure_slice = int(strategy["failureSlice"])
 
         # Winrate-driven scheduler: early exit if stable or stagnated
         if rapid_mode and len(winrate_history) >= 3:

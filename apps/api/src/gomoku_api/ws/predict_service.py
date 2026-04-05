@@ -95,6 +95,195 @@ def _nxn_winner(board: list[int], n: int, win_len: int, last_move: int) -> int:
     return 0
 
 
+def _policy_cell_index(flat_index: int, board_size: int) -> int:
+    row, col = divmod(flat_index, board_size)
+    return row * 16 + col
+
+
+def _flat_to_board2d(board: list[int], board_size: int, current: int) -> list[list[int]]:
+    board_2d: list[list[int]] = []
+    for r in range(board_size):
+        row: list[int] = []
+        for c in range(board_size):
+            v = board[r * board_size + c]
+            if v == current:
+                row.append(1)
+            elif v == -current or (v != 0 and v != current):
+                row.append(2)
+            else:
+                row.append(0)
+        board_2d.append(row)
+    return board_2d
+
+
+def _find_immediate_move(board: list[int], board_size: int, win_len: int, player: int) -> int | None:
+    for move, cell in enumerate(board):
+        if cell != 0:
+            continue
+        board[move] = player
+        winner = _nxn_winner(board, board_size, win_len, move)
+        board[move] = 0
+        if winner == player:
+            return move
+    return None
+
+
+def _list_immediate_wins(board: list[int], board_size: int, win_len: int, player: int) -> list[int]:
+    wins: list[int] = []
+    for move, cell in enumerate(board):
+        if cell != 0:
+            continue
+        board[move] = player
+        winner = _nxn_winner(board, board_size, win_len, move)
+        board[move] = 0
+        if winner == player:
+            wins.append(move)
+    return wins
+
+
+def _count_double_threat_responses(board: list[int], board_size: int, win_len: int, player: int) -> int:
+    """Count replies that create at least two distinct immediate wins for *player*."""
+    count = 0
+    for move, cell in enumerate(board):
+        if cell != 0:
+            continue
+        board[move] = player
+        if _nxn_winner(board, board_size, win_len, move) != player:
+            immediate_wins = _list_immediate_wins(board, board_size, win_len, player)
+            if len(immediate_wins) >= 2:
+                count += 1
+        board[move] = 0
+    return count
+
+
+def _uniform_legal_probs(board: list[int]) -> list[float]:
+    legal = [idx for idx, cell in enumerate(board) if cell == 0]
+    if not legal:
+        return [0.0] * len(board)
+    p = 1.0 / len(legal)
+    return [p if cell == 0 else 0.0 for cell in board]
+
+
+def _select_threat_aware_move(
+    board: list[int],
+    current: int,
+    board_size: int,
+    win_len: int,
+    probs_raw: list[float],
+) -> tuple[int, dict[str, Any]]:
+    """Choose a move using model probabilities plus hard tactical safety rules.
+
+    The priority order is:
+    1. Immediate win now.
+    2. Forced immediate block against opponent's win.
+    3. Reject moves that allow opponent an immediate win.
+    4. Prefer moves that create multiple immediate wins next turn (forcing fork).
+    5. Reject moves that allow opponent a forcing fork on the next reply.
+    6. Use model policy as final tie-break among tactically similar moves.
+    """
+    legal = [idx for idx, cell in enumerate(board) if cell == 0]
+    if not legal:
+        return -1, {
+            "tacticalReason": "no_legal_moves",
+            "tacticalOverride": False,
+            "unsafeMovesFiltered": 0,
+            "opponentThreatsBefore": 0,
+            "forcingThreatsAfterMove": 0,
+        }
+
+    opponent = 2 if current == 1 else 1
+    model_best = max(legal, key=lambda idx: probs_raw[idx]) if legal else -1
+
+    immediate_win = _find_immediate_move(board, board_size, win_len, current)
+    if immediate_win is not None:
+        return immediate_win, {
+            "tacticalReason": "immediate_win",
+            "tacticalOverride": immediate_win != model_best,
+            "unsafeMovesFiltered": 0,
+            "opponentThreatsBefore": 0,
+            "forcingThreatsAfterMove": 0,
+        }
+
+    opponent_threats_before = _list_immediate_wins(board, board_size, win_len, opponent)
+    best_move = -1
+    best_key: tuple[Any, ...] | None = None
+    best_eval: dict[str, Any] | None = None
+    unsafe_filtered = 0
+
+    for move in legal:
+        board[move] = current
+        opp_immediate_wins = _list_immediate_wins(board, board_size, win_len, opponent)
+        self_immediate_next = _list_immediate_wins(board, board_size, win_len, current)
+        opponent_fork_responses = 0
+        if not opp_immediate_wins:
+            opponent_fork_responses = _count_double_threat_responses(board, board_size, win_len, opponent)
+        board[move] = 0
+
+        safe_now = len(opp_immediate_wins) == 0
+        safe_vs_fork = opponent_fork_responses == 0
+        creates_fork = len(self_immediate_next) >= 2
+        blocks_immediate = bool(opponent_threats_before) and safe_now
+        if not safe_now or not safe_vs_fork:
+            unsafe_filtered += 1
+
+        evaluation = {
+            "move": move,
+            "safeNow": safe_now,
+            "safeVsFork": safe_vs_fork,
+            "blocksImmediate": blocks_immediate,
+            "createsFork": creates_fork,
+            "opponentImmediateWins": len(opp_immediate_wins),
+            "opponentForkResponses": opponent_fork_responses,
+            "selfImmediateWinsNext": len(self_immediate_next),
+            "modelProb": probs_raw[move],
+        }
+
+        key = (
+            1 if blocks_immediate else 0,
+            1 if safe_now else 0,
+            1 if safe_vs_fork else 0,
+            1 if creates_fork else 0,
+            -len(opp_immediate_wins),
+            -opponent_fork_responses,
+            len(self_immediate_next),
+            probs_raw[move],
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_move = move
+            best_eval = evaluation
+
+    if best_eval is None:
+        return model_best, {
+            "tacticalReason": "model_policy",
+            "tacticalOverride": False,
+            "unsafeMovesFiltered": 0,
+            "opponentThreatsBefore": len(opponent_threats_before),
+            "forcingThreatsAfterMove": 0,
+        }
+
+    if best_eval["blocksImmediate"]:
+        reason = "block_immediate"
+    elif best_eval["createsFork"]:
+        reason = "create_forcing_threat"
+    elif best_eval["safeNow"] and best_eval["safeVsFork"] and best_move != model_best:
+        reason = "reject_unsafe_model_move"
+    elif not best_eval["safeNow"] or not best_eval["safeVsFork"]:
+        reason = "least_bad_move"
+    else:
+        reason = "model_policy"
+
+    return best_move, {
+        "tacticalReason": reason,
+        "tacticalOverride": best_move != model_best or reason != "model_policy",
+        "unsafeMovesFiltered": unsafe_filtered,
+        "opponentThreatsBefore": len(opponent_threats_before),
+        "forcingThreatsAfterMove": best_eval["selfImmediateWinsNext"],
+        "opponentThreatsAfterMove": best_eval["opponentImmediateWins"],
+        "opponentForkResponses": best_eval["opponentForkResponses"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # C++ Engine subprocess (for algorithm mode on 5x5+)
 # ---------------------------------------------------------------------------
@@ -235,38 +424,29 @@ def _get_model(variant: str):
 
 def _model_predict(board: list[int], current: int, variant: str, board_size: int) -> dict:
     """Use PyTorch model for prediction."""
+    win_length = 4 if board_size == 5 else 5
+    if variant == "ttt3":
+        win_length = 3
     model = _get_model(variant)
     if model is None:
-        legal = [i for i, v in enumerate(board) if v == 0]
+        probs_raw = _uniform_legal_probs(board)
+        best_move, tactical_meta = _select_threat_aware_move(board, current, board_size, win_length, probs_raw)
         return {
-            "move": random.choice(legal) if legal else -1,
-            "confidence": 0.0,
-            "probs": [0.0] * len(board),
+            "move": best_move,
+            "confidence": round(probs_raw[best_move], 4) if best_move >= 0 else 0.0,
+            "probs": [round(p, 6) for p in probs_raw],
             "mode": "model",
-            "isRandom": True,
+            "isRandom": False,
             "fallback": True,
+            **tactical_meta,
         }
 
     try:
         from trainer_lab.data.encoder import board_to_tensor
 
-        # Build position dict for encoder
-        board_2d = []
-        for r in range(board_size):
-            row = []
-            for c in range(board_size):
-                v = board[r * board_size + c]
-                if v == current:
-                    row.append(1)
-                elif v == -current or (v != 0 and v != current):
-                    row.append(2)
-                else:
-                    row.append(0)
-            board_2d.append(row)
-
         pos_dict = {
             "board_size": board_size,
-            "board": board_2d,
+            "board": _flat_to_board2d(board, board_size, current),
             "current_player": 1,
             "last_move": None,
         }
@@ -292,7 +472,7 @@ def _model_predict(board: list[int], current: int, variant: str, board_size: int
             r, c = divmod(idx, board_size)
             probs_raw[idx] = probs_tensor[r * 16 + c].item()
 
-        best_move = max(legal_flat, key=lambda i: probs_raw[i]) if legal_flat else -1
+        best_move, tactical_meta = _select_threat_aware_move(board, current, board_size, win_length, probs_raw)
         confidence = probs_raw[best_move] if best_move >= 0 else 0.0
 
         return {
@@ -303,17 +483,20 @@ def _model_predict(board: list[int], current: int, variant: str, board_size: int
             "isRandom": False,
             "fallback": False,
             "value": round(value.item(), 4),
+            **tactical_meta,
         }
     except Exception as exc:
         logger.error("Model predict error: %s", exc)
-        legal = [i for i, v in enumerate(board) if v == 0]
+        probs_raw = _uniform_legal_probs(board)
+        best_move, tactical_meta = _select_threat_aware_move(board, current, board_size, win_length, probs_raw)
         return {
-            "move": random.choice(legal) if legal else -1,
-            "confidence": 0.0,
-            "probs": [0.0] * len(board),
+            "move": best_move,
+            "confidence": round(probs_raw[best_move], 4) if best_move >= 0 else 0.0,
+            "probs": [round(p, 6) for p in probs_raw],
             "mode": "model",
-            "isRandom": True,
+            "isRandom": False,
             "fallback": True,
+            **tactical_meta,
         }
 
 

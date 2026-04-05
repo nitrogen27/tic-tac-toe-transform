@@ -131,27 +131,79 @@ def _one_hot_policy(move: int, board_size: int) -> list[float]:
     return padded
 
 
-def _sample_engine_position(board_size: int, win_len: int, rng: random.Random) -> tuple[list[int], int, int] | None:
+def _classify_engine_phase(board_size: int, occupied_cells: int) -> str:
     total_cells = board_size * board_size
-    r = rng.random()
+    if board_size <= 5:
+        if occupied_cells <= 3:
+            return "opening"
+        if occupied_cells <= 10:
+            return "early_mid"
+        if occupied_cells <= 16:
+            return "mid"
+        return "late"
+    if occupied_cells <= max(3, total_cells // 8):
+        return "opening"
+    if occupied_cells <= max(10, total_cells // 3):
+        return "mid"
+    return "late"
+
+
+def _resolve_engine_sampling_bounds(
+    board_size: int,
+    total_cells: int,
+    *,
+    phase_focus: str | None = None,
+    rng_value: float | None = None,
+) -> tuple[int, int]:
+    focus = (phase_focus or "").strip().lower()
+    if board_size <= 5:
+        if focus in {"opening", "early"}:
+            return 0, min(6, total_cells - 1)
+        if focus in {"mid", "midgame"}:
+            return min(9, total_cells - 1), min(16, total_cells - 1)
+        if focus in {"late", "endgame"}:
+            return min(17, total_cells - 1), total_cells - 1
+    else:
+        if focus in {"opening", "early"}:
+            return 0, min(max(4, total_cells // 8), total_cells - 1)
+        if focus in {"mid", "midgame"}:
+            return min(max(5, total_cells // 5), total_cells - 1), min(max(18, (total_cells * 2) // 3), total_cells - 1)
+        if focus in {"late", "endgame"}:
+            return min(max(19, (total_cells * 2) // 3), total_cells - 1), total_cells - 1
+
+    r = 0.5 if rng_value is None else rng_value
     if board_size <= 5:
         if r < 0.05:
-            low, high = 0, min(3, total_cells - 1)
-        elif r < 0.20:
-            low, high = min(4, total_cells - 1), min(10, total_cells - 1)
-        elif r < 0.50:
-            low, high = min(11, total_cells - 1), min(16, total_cells - 1)
-        else:
-            low, high = min(17, total_cells - 1), total_cells - 1
-    else:
+            return 0, min(3, total_cells - 1)
         if r < 0.20:
-            low, high = 0, min(3, total_cells - 1)
-        elif r < 0.60:
-            low, high = min(4, total_cells - 1), min(10, total_cells - 1)
-        elif r < 0.90:
-            low, high = min(11, total_cells - 1), min(18, total_cells - 1)
-        else:
-            low, high = min(19, total_cells - 1), total_cells - 1
+            return min(4, total_cells - 1), min(10, total_cells - 1)
+        if r < 0.55:
+            return min(11, total_cells - 1), min(16, total_cells - 1)
+        return min(17, total_cells - 1), total_cells - 1
+
+    if r < 0.20:
+        return 0, min(3, total_cells - 1)
+    if r < 0.60:
+        return min(4, total_cells - 1), min(10, total_cells - 1)
+    if r < 0.90:
+        return min(11, total_cells - 1), min(18, total_cells - 1)
+    return min(19, total_cells - 1), total_cells - 1
+
+
+def _sample_engine_position(
+    board_size: int,
+    win_len: int,
+    rng: random.Random,
+    *,
+    phase_focus: str | None = None,
+) -> tuple[list[int], int, int] | None:
+    total_cells = board_size * board_size
+    low, high = _resolve_engine_sampling_bounds(
+        board_size,
+        total_cells,
+        phase_focus=phase_focus,
+        rng_value=rng.random(),
+    )
 
     if high < low:
         low = 0
@@ -277,6 +329,7 @@ async def generate_engine_dataset(
     variant: str,
     count: int = 10_000,
     callback: TRAIN_CALLBACK | None = None,
+    phase_focus: str | None = None,
 ) -> Path:
     """Generate engine-labeled offline dataset via persistent engine worker."""
     from gomoku_api.ws.engine_evaluator import EngineEvaluator
@@ -297,11 +350,12 @@ async def generate_engine_dataset(
     async with EngineEvaluator() as engine_eval:
         while len(positions) < count and attempts < max_attempts:
             attempts += 1
-            sampled = _sample_engine_position(board_size, win_len, rng)
+            sampled = _sample_engine_position(board_size, win_len, rng, phase_focus=phase_focus)
             if sampled is None:
                 continue
 
             board, current, last_move = sampled
+            phase_bucket = _classify_engine_phase(board_size, sum(1 for cell in board if cell != 0))
             move, value = await engine_eval.best_move_with_value(board, current, board_size, win_len)
             if move < 0 or move >= len(board) or board[move] != 0:
                 continue
@@ -314,6 +368,7 @@ async def generate_engine_dataset(
                 "policy": _one_hot_policy(move, board_size),
                 "value": max(-1.0, min(1.0, float(value))),
                 "source": "engine",
+                "phaseBucket": phase_bucket,
                 "sampleWeight": 1.0,
             })
 
@@ -360,13 +415,14 @@ async def _main() -> None:
     parser.add_argument("variant", choices=["ttt3", "ttt5"], help="Game variant")
     parser.add_argument("--count", type=int, default=5000, help="Number of positions")
     parser.add_argument("--mode", choices=["minimax", "engine"], default="minimax", help="Dataset generator")
+    parser.add_argument("--phase-focus", choices=["opening", "mid", "late"], default=None, help="Optional engine dataset phase bias")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     print(f"Generating {args.count} {args.mode} positions for {args.variant}...")
     started = time.monotonic()
     if args.mode == "engine":
-        path = await generate_engine_dataset(args.variant, args.count, _cli_callback)
+        path = await generate_engine_dataset(args.variant, args.count, _cli_callback, phase_focus=args.phase_focus)
     else:
         path = await generate_minimax_dataset(args.variant, args.count, _cli_callback)
     elapsed = time.monotonic() - started

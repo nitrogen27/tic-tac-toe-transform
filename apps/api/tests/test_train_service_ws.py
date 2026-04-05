@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from gomoku_api.ws.train_service_ws import (
     _build_repair_pool,
     _build_train_pool,
+    _choose_rapid_cycle_strategy,
     _compute_target_sanity_metrics,
     _merge_failure_bank,
     _merge_position_bank,
     _generate_tactical_curriculum_positions,
     _policy_cell_index,
+    _resolve_engine_sampling_bounds,
+    _sample_engine_position,
     _variant_model_hparams,
 )
 from trainer_lab.config import ModelConfig
@@ -178,3 +183,45 @@ def test_build_repair_pool_prioritizes_failure_samples() -> None:
 
     assert len(pool) == 12
     assert sum(item.startswith("failure-") for item in ids) >= 6
+
+
+def test_resolve_engine_sampling_bounds_biases_mid_and_late_for_ttt5() -> None:
+    total_cells = 25
+
+    assert _resolve_engine_sampling_bounds(5, total_cells, phase_focus="mid") == (9, 16)
+    assert _resolve_engine_sampling_bounds(5, total_cells, phase_focus="late") == (17, 24)
+
+
+def test_sample_engine_position_with_mid_focus_stays_in_mid_bucket() -> None:
+    rng = random.Random(7)
+
+    sampled = None
+    for _ in range(64):
+        sampled = _sample_engine_position(5, 4, rng=rng, phase_focus="mid")
+        if sampled is not None:
+            break
+
+    assert sampled is not None
+    board, _current, _last_move = sampled
+    occupied = sum(1 for cell in board if cell != 0)
+    assert 9 <= occupied <= 16
+
+
+def test_choose_rapid_cycle_strategy_biases_engine_generation_toward_midgame() -> None:
+    strategy = _choose_rapid_cycle_strategy(
+        {
+            "frozenBlockAcc": 92.0,
+            "frozenWinAcc": 95.0,
+            "frozenMidAcc": 48.0,
+            "frozenLateAcc": 68.0,
+            "holdoutDeltaAcc": 0.5,
+        },
+        corrected_rate=0.12,
+        failure_bank_size=16,
+        engine_per_cycle=50,
+    )
+
+    assert strategy["engineFocus"] == "mid"
+    assert strategy["engineCount"] > 50
+    assert strategy["tacticalRatio"] <= 0.35
+    assert strategy["failureSlice"] == 384
