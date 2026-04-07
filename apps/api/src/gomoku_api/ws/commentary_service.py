@@ -279,7 +279,16 @@ def analyze_move_commentary(
     else:
         category, mood = "solid_move", "neutral"
 
-    best_move_label = _move_label(best_move, board_size)
+    suggested_move = (
+        immediate_win
+        if category == "missed_win"
+        else (opponent_immediate_before[0] if category == "missed_block" and opponent_immediate_before else best_move)
+    )
+    if suggested_move is None:
+        suggested_move = best_move
+
+    display_best_move = suggested_move if category in {"missed_win", "missed_block"} else best_move
+    best_move_label = _move_label(display_best_move, board_size)
     templates = _PHRASES[style_key].get(category) or _PHRASES["coach"]["solid_move"]
     text = _seeded_choice(
         templates,
@@ -312,9 +321,9 @@ def analyze_move_commentary(
         "text": text,
         "move": move,
         "moveLabel": move_name,
-        "bestMove": best_move,
+        "bestMove": display_best_move,
         "bestMoveLabel": best_move_label,
-        "suggestedMove": immediate_win if category == "missed_win" else (opponent_immediate_before[0] if category == "missed_block" and opponent_immediate_before else best_move),
+        "suggestedMove": suggested_move,
         "chosenScore": round(chosen_score, 4),
         "bestScore": round(best_score, 4),
         "scoreGap": round(score_gap, 4),

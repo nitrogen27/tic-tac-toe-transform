@@ -6,13 +6,16 @@ import pytest
 
 from gomoku_api.ws.train_service_ws import (
     _build_repair_pool,
+    _build_turbo_pool,
     _build_train_pool,
     _checkpoint_selection_score,
     _choose_rapid_cycle_strategy,
     _compute_target_sanity_metrics,
+    _generate_engine_labeled_positions,
     _merge_failure_bank,
     _merge_position_bank,
     _generate_tactical_curriculum_positions,
+    _load_offline_dataset_positions,
     _policy_cell_index,
     _resolve_engine_sampling_bounds,
     _sample_engine_position,
@@ -187,6 +190,32 @@ def test_build_repair_pool_prioritizes_failure_samples() -> None:
     assert sum(item.startswith("failure-") for item in ids) >= 6
 
 
+def test_build_repair_pool_includes_user_corpus_positions() -> None:
+    failure = [{"id": f"failure-{idx}", "sampleWeight": 1.0} for idx in range(10)]
+    anchor = [{"id": f"anchor-{idx}", "sampleWeight": 1.0} for idx in range(10)]
+    tactical = [{"id": f"tactical-{idx}", "sampleWeight": 1.0} for idx in range(10)]
+    user = [{"id": f"user-{idx}", "sampleWeight": 1.5} for idx in range(10)]
+
+    pool = _build_repair_pool(failure, anchor, tactical, user, data_count=20)
+    ids = [item["id"] for item in pool]
+
+    assert len(pool) == 20
+    assert any(item.startswith("user-") for item in ids)
+
+
+def test_build_turbo_pool_includes_user_corpus_positions() -> None:
+    anchor = [{"id": f"anchor-{idx}", "sampleWeight": 1.0} for idx in range(20)]
+    tactical = [{"id": f"tactical-{idx}", "sampleWeight": 1.0} for idx in range(20)]
+    failure = [{"id": f"failure-{idx}", "sampleWeight": 1.0} for idx in range(20)]
+    user = [{"id": f"user-{idx}", "sampleWeight": 1.5} for idx in range(20)]
+
+    pool = _build_turbo_pool(anchor, tactical, failure, user, data_count=24, tactical_ratio=0.20)
+    ids = [item["id"] for item in pool]
+
+    assert len(pool) == 24
+    assert any(item.startswith("user-") for item in ids)
+
+
 def test_resolve_engine_sampling_bounds_biases_mid_and_late_for_ttt5() -> None:
     total_cells = 25
 
@@ -227,6 +256,80 @@ def test_choose_rapid_cycle_strategy_biases_engine_generation_toward_midgame() -
     assert strategy["engineCount"] > 50
     assert strategy["tacticalRatio"] <= 0.35
     assert strategy["failureSlice"] == 384
+
+
+def test_choose_rapid_cycle_strategy_biases_conversion_and_weak_side() -> None:
+    strategy = _choose_rapid_cycle_strategy(
+        {
+            "frozenBlockAcc": 94.0,
+            "frozenWinAcc": 96.0,
+            "frozenMidAcc": 61.0,
+            "frozenLateAcc": 67.0,
+            "holdoutDeltaAcc": 0.0,
+        },
+        corrected_rate=0.30,
+        failure_bank_size=12,
+        engine_per_cycle=50,
+        exam_summary={
+            "winrateAsP1": 0.25,
+            "winrateAsP2": 0.75,
+            "decisiveWinRate": 0.05,
+            "drawRate": 0.55,
+        },
+    )
+
+    assert strategy["engineCurrentPlayerFocus"] == 1
+    assert strategy["conversionFocus"] is True
+    assert strategy["engineCount"] > 50
+    assert strategy["tacticalRatio"] <= 0.32
+
+
+@pytest.mark.asyncio
+async def test_generate_engine_labeled_positions_can_focus_side_and_conversion(monkeypatch) -> None:
+    samples = [
+        ([0] * 25, 1, -1),
+        ([0] * 25, 2, -1),
+        ([0] * 25, 2, -1),
+    ]
+
+    def fake_sample_engine_position(board_size: int, win_len: int, *, rng=None, phase_focus=None):
+        if not samples:
+            return None
+        board, current, last_move = samples.pop(0)
+        return list(board), current, last_move
+
+    class FakeEngine:
+        async def analyze_position(self, board, current, board_size, win_len):
+            move = next(idx for idx, cell in enumerate(board) if cell == 0)
+            value = 0.8 if current == 2 else 0.1
+            return {"bestMove": move, "value": value}
+
+        async def suggest_moves(self, board, current, board_size, win_len, *, top_n=5):
+            move = next(idx for idx, cell in enumerate(board) if cell == 0)
+            return [{"move": move, "score": 1.0}]
+
+    async def callback(_event: dict) -> None:
+        return None
+
+    monkeypatch.setattr("gomoku_api.ws.train_service_ws._sample_engine_position", fake_sample_engine_position)
+
+    positions = await _generate_engine_labeled_positions(
+        2,
+        5,
+        4,
+        callback,
+        FakeEngine(),
+        current_player_focus=2,
+        min_value=0.45,
+        source="engine_conversion",
+        boost_weight=1.35,
+    )
+
+    assert len(positions) == 2
+    assert all(pos["current_player"] == 2 for pos in positions)
+    assert all(pos["value"] >= 0.45 for pos in positions)
+    assert all(pos["source"] == "engine_conversion" for pos in positions)
+    assert all(pos["sampleWeight"] == pytest.approx(1.35) for pos in positions)
 
 
 def test_soft_policy_from_engine_hints_creates_distribution_not_one_hot() -> None:
@@ -276,3 +379,33 @@ def test_checkpoint_selection_score_uses_side_balance_as_tiebreaker() -> None:
     }
 
     assert _checkpoint_selection_score(balanced, 9) > _checkpoint_selection_score(skewed, 9)
+
+
+def test_load_offline_dataset_positions_prefers_rapfi_dataset(tmp_path, monkeypatch) -> None:
+    datasets_dir = tmp_path / "saved" / "datasets"
+    datasets_dir.mkdir(parents=True)
+    (datasets_dir / "gomoku15_engine.json").write_text('[{"source":"engine"}]', encoding="utf-8")
+    (datasets_dir / "gomoku15_rapfi.json").write_text('[{"source":"rapfi"}]', encoding="utf-8")
+
+    monkeypatch.setattr("gomoku_api.ws.train_service_ws.SAVED_DIR", tmp_path / "saved")
+
+    positions, path, dataset_type = _load_offline_dataset_positions("gomoku15")
+
+    assert dataset_type == "rapfi"
+    assert path is not None and path.name == "gomoku15_rapfi.json"
+    assert positions[0]["source"] == "rapfi"
+
+
+def test_load_offline_dataset_positions_honors_preferred_backend(tmp_path, monkeypatch) -> None:
+    datasets_dir = tmp_path / "saved" / "datasets"
+    datasets_dir.mkdir(parents=True)
+    (datasets_dir / "gomoku15_engine.json").write_text('[{"source":"engine"}]', encoding="utf-8")
+    (datasets_dir / "gomoku15_rapfi.json").write_text('[{"source":"rapfi"}]', encoding="utf-8")
+
+    monkeypatch.setattr("gomoku_api.ws.train_service_ws.SAVED_DIR", tmp_path / "saved")
+
+    positions, path, dataset_type = _load_offline_dataset_positions("gomoku15", preferred_backend="builtin")
+
+    assert dataset_type == "engine"
+    assert path is not None and path.name == "gomoku15_engine.json"
+    assert positions[0]["source"] == "engine"

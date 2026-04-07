@@ -374,15 +374,17 @@ async def generate_engine_dataset(
     count: int = 10_000,
     callback: TRAIN_CALLBACK | None = None,
     phase_focus: str | None = None,
+    backend: str | None = None,
 ) -> Path:
     """Generate engine-labeled offline dataset via persistent engine worker."""
-    from gomoku_api.ws.engine_evaluator import EngineEvaluator
+    from gomoku_api.ws.oracle_backends import create_oracle_evaluator
 
     board_size, win_len = _resolve_variant(variant)
+    oracle_eval, resolved_backend = create_oracle_evaluator(board_size, win_len, backend=backend, role="teacher")
 
     output_dir = SAVED_DIR / "datasets"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{variant}_engine.json"
+    output_path = output_dir / f"{variant}_{resolved_backend}.json"
 
     positions: list[dict[str, Any]] = []
     started_at = time.monotonic()
@@ -391,7 +393,7 @@ async def generate_engine_dataset(
     rng = random.Random(f"{variant}:engine:{count}")
     max_attempts = max(count * 25, 500)
 
-    async with EngineEvaluator() as engine_eval:
+    async with oracle_eval as engine_eval:
         while len(positions) < count and attempts < max_attempts:
             attempts += 1
             sampled = _sample_engine_position(board_size, win_len, rng, phase_focus=phase_focus)
@@ -433,15 +435,16 @@ async def generate_engine_dataset(
                         "elapsed": round(elapsed, 1),
                         "eta": round(eta, 1),
                         "speed": round(speed, 1),
-                        "message": f"Generated {min(len(positions), count)}/{count} engine positions",
-                        "stage": "engine_dataset",
+                "message": f"Generated {min(len(positions), count)}/{count} {resolved_backend} positions",
+                "stage": "engine_dataset",
+                "backend": resolved_backend,
                     },
                 })
                 await asyncio.sleep(0)
 
     positions = positions[:count]
     output_path.write_text(json.dumps(positions, separators=(",", ":")), encoding="utf-8")
-    logger.info("Saved %d engine positions to %s", len(positions), output_path)
+    logger.info("Saved %d %s positions to %s", len(positions), resolved_backend, output_path)
     return output_path
 
 
@@ -463,13 +466,14 @@ async def _main() -> None:
     parser.add_argument("--count", type=int, default=5000, help="Number of positions")
     parser.add_argument("--mode", choices=["minimax", "engine"], default="minimax", help="Dataset generator")
     parser.add_argument("--phase-focus", choices=["opening", "mid", "late"], default=None, help="Optional engine dataset phase bias")
+    parser.add_argument("--backend", choices=["auto", "builtin", "rapfi"], default="auto", help="Oracle backend for engine dataset")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     print(f"Generating {args.count} {args.mode} positions for {args.variant}...")
     started = time.monotonic()
     if args.mode == "engine":
-        path = await generate_engine_dataset(args.variant, args.count, _cli_callback, phase_focus=args.phase_focus)
+        path = await generate_engine_dataset(args.variant, args.count, _cli_callback, phase_focus=args.phase_focus, backend=args.backend)
     else:
         path = await generate_minimax_dataset(args.variant, args.count, _cli_callback)
     elapsed = time.monotonic() - started

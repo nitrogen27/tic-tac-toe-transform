@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import random
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +157,31 @@ def _count_double_threat_responses(board: list[int], board_size: int, win_len: i
     return count
 
 
+def _count_winning_pressure_moves(board: list[int], board_size: int, win_len: int, player: int) -> int:
+    """Count follow-up moves that either win immediately or create a forcing fork."""
+    count = 0
+    for move, cell in enumerate(board):
+        if cell != 0:
+            continue
+        board[move] = player
+        if _nxn_winner(board, board_size, win_len, move) == player:
+            count += 1
+        else:
+            immediate_wins = _list_immediate_wins(board, board_size, win_len, player)
+            if len(immediate_wins) >= 2:
+                count += 1
+        board[move] = 0
+    return count
+
+
+def _board_winner(board: list[int], board_size: int, win_len: int) -> int:
+    """Check whether either side has already won in the current position."""
+    for idx, cell in enumerate(board):
+        if cell != 0 and _nxn_winner(board, board_size, win_len, idx) == cell:
+            return cell
+    return 0
+
+
 def _uniform_legal_probs(board: list[int]) -> list[float]:
     legal = [idx for idx, cell in enumerate(board) if cell == 0]
     if not legal:
@@ -227,6 +253,10 @@ def _select_policy_value_move(
             "tacticalOverride": False,
             "valueGuided": False,
             "unsafeMovesFiltered": 0,
+            "searchBacked": False,
+            "searchMode": "none",
+            "searchScore": 0.0,
+            "searchDepth": 0,
         }
 
     value_scores = value_scores or {}
@@ -246,6 +276,216 @@ def _select_policy_value_move(
         "valueGuided": used_value,
         "afterstateValue": round(float(value_scores.get(best_move, 0.0)), 4),
         "unsafeMovesFiltered": 0,
+        "searchBacked": False,
+        "searchMode": "none",
+        "searchScore": 0.0,
+        "searchDepth": 0,
+    }
+
+
+def _evaluate_threat_move(
+    board: list[int],
+    current: int,
+    board_size: int,
+    win_len: int,
+    move: int,
+    *,
+    opponent_threats_before: list[int],
+    probs_raw: list[float] | None = None,
+    value_scores: dict[int, float] | None = None,
+) -> dict[str, Any]:
+    opponent = 2 if current == 1 else 1
+    probs_raw = probs_raw or [0.0] * len(board)
+    value_scores = value_scores or {}
+
+    board[move] = current
+    winner = _nxn_winner(board, board_size, win_len, move)
+    opp_immediate_wins = _list_immediate_wins(board, board_size, win_len, opponent)
+    self_immediate_next = _list_immediate_wins(board, board_size, win_len, current)
+    opponent_fork_responses = 0
+    if not opp_immediate_wins:
+        opponent_fork_responses = _count_double_threat_responses(board, board_size, win_len, opponent)
+    self_winning_pressure = _count_winning_pressure_moves(board, board_size, win_len, current)
+    board[move] = 0
+
+    safe_now = len(opp_immediate_wins) == 0
+    safe_vs_fork = opponent_fork_responses == 0
+    creates_fork = len(self_immediate_next) >= 2
+    blocks_immediate = bool(opponent_threats_before) and safe_now
+
+    return {
+        "move": move,
+        "isImmediateWin": winner == current,
+        "safeNow": safe_now,
+        "safeVsFork": safe_vs_fork,
+        "blocksImmediate": blocks_immediate,
+        "createsFork": creates_fork,
+        "opponentImmediateWins": len(opp_immediate_wins),
+        "opponentForkResponses": opponent_fork_responses,
+        "selfImmediateWinsNext": len(self_immediate_next),
+        "selfWinningPressure": self_winning_pressure,
+        "modelProb": probs_raw[move],
+        "afterstateValue": float(value_scores.get(move, 0.0)),
+    }
+
+
+def _threat_candidate_sort_key(evaluation: dict[str, Any]) -> tuple[Any, ...]:
+    winning_pressure = int(evaluation.get("selfWinningPressure", 0))
+    return (
+        1 if evaluation["isImmediateWin"] else 0,
+        1 if evaluation["blocksImmediate"] else 0,
+        1 if evaluation["safeNow"] else 0,
+        1 if evaluation["safeVsFork"] else 0,
+        winning_pressure,
+        1 if evaluation["createsFork"] else 0,
+        evaluation["selfImmediateWinsNext"],
+        -evaluation["opponentImmediateWins"],
+        -evaluation["opponentForkResponses"],
+        evaluation["afterstateValue"],
+        evaluation["modelProb"],
+        -evaluation["move"],
+    )
+
+
+def _candidate_move_evaluations(
+    board: list[int],
+    current: int,
+    board_size: int,
+    win_len: int,
+    *,
+    probs_raw: list[float] | None = None,
+    value_scores: dict[int, float] | None = None,
+) -> tuple[list[dict[str, Any]], list[int]]:
+    legal = [idx for idx, cell in enumerate(board) if cell == 0]
+    opponent = 2 if current == 1 else 1
+    opponent_threats_before = _list_immediate_wins(board, board_size, win_len, opponent)
+    evaluations = [
+        _evaluate_threat_move(
+            board,
+            current,
+            board_size,
+            win_len,
+            move,
+            opponent_threats_before=opponent_threats_before,
+            probs_raw=probs_raw,
+            value_scores=value_scores,
+        )
+        for move in legal
+    ]
+    evaluations.sort(key=_threat_candidate_sort_key, reverse=True)
+    return evaluations, opponent_threats_before
+
+
+def _select_exact_endgame_move(
+    board: list[int],
+    current: int,
+    board_size: int,
+    win_len: int,
+    probs_raw: list[float],
+    value_scores: dict[int, float] | None = None,
+    *,
+    max_empties: int = 10,
+) -> tuple[int, dict[str, Any]] | None:
+    legal = [idx for idx, cell in enumerate(board) if cell == 0]
+    if not legal or len(legal) > max_empties:
+        return None
+
+    root_evaluations, opponent_threats_before = _candidate_move_evaluations(
+        board,
+        current,
+        board_size,
+        win_len,
+        probs_raw=probs_raw,
+        value_scores=value_scores,
+    )
+    if not root_evaluations:
+        return None
+
+    @lru_cache(maxsize=20000)
+    def solve(state: tuple[int, ...], side_to_move: int) -> int:
+        local_board = list(state)
+        winner = _board_winner(local_board, board_size, win_len)
+        if winner != 0:
+            return 1 if winner == current else -1
+
+        local_legal = [idx for idx, cell in enumerate(local_board) if cell == 0]
+        if not local_legal:
+            return 0
+
+        evaluations, _ = _candidate_move_evaluations(local_board, side_to_move, board_size, win_len)
+        if side_to_move == current:
+            best = -2
+            for evaluation in evaluations:
+                move = int(evaluation["move"])
+                local_board[move] = side_to_move
+                score = solve(tuple(local_board), 2 if side_to_move == 1 else 1)
+                local_board[move] = 0
+                if score > best:
+                    best = score
+                if best == 1:
+                    break
+            return best
+
+        best = 2
+        for evaluation in evaluations:
+            move = int(evaluation["move"])
+            local_board[move] = side_to_move
+            score = solve(tuple(local_board), 2 if side_to_move == 1 else 1)
+            local_board[move] = 0
+            if score < best:
+                best = score
+            if best == -1:
+                break
+        return best
+
+    best_move = -1
+    best_eval: dict[str, Any] | None = None
+    best_score = -2
+    best_key: tuple[Any, ...] | None = None
+    model_best = max(legal, key=lambda idx: probs_raw[idx])
+
+    for evaluation in root_evaluations:
+        move = int(evaluation["move"])
+        board[move] = current
+        score = solve(tuple(board), 2 if current == 1 else 1)
+        board[move] = 0
+        key = (score, *_threat_candidate_sort_key(evaluation))
+        if best_key is None or key > best_key:
+            best_key = key
+            best_score = score
+            best_move = move
+            best_eval = evaluation
+
+    if best_eval is None or best_move < 0:
+        return None
+
+    if best_score > 0:
+        reason = "search_exact_win"
+    elif best_score == 0 and best_eval["blocksImmediate"]:
+        reason = "search_exact_hold"
+    elif best_score == 0:
+        reason = "search_exact_draw"
+    else:
+        reason = "search_exact_survival"
+
+    unsafe_filtered = sum(
+        1 for evaluation in root_evaluations if not evaluation["safeNow"] or not evaluation["safeVsFork"]
+    )
+
+    return best_move, {
+        "tacticalReason": reason,
+        "tacticalOverride": best_move != model_best or reason != "model_policy",
+        "unsafeMovesFiltered": unsafe_filtered,
+        "opponentThreatsBefore": len(opponent_threats_before),
+        "forcingThreatsAfterMove": best_eval["selfImmediateWinsNext"],
+        "opponentThreatsAfterMove": best_eval["opponentImmediateWins"],
+        "opponentForkResponses": best_eval["opponentForkResponses"],
+        "valueGuided": False,
+        "afterstateValue": round(best_eval["afterstateValue"], 4),
+        "searchBacked": True,
+        "searchMode": "exact_endgame",
+        "searchScore": float(best_score),
+        "searchDepth": len(legal),
     }
 
 
@@ -263,9 +503,10 @@ def _select_threat_aware_move(
     1. Immediate win now.
     2. Forced immediate block against opponent's win.
     3. Reject moves that allow opponent an immediate win.
-    4. Prefer moves that create multiple immediate wins next turn (forcing fork).
-    5. Reject moves that allow opponent a forcing fork on the next reply.
-    6. Use model policy as final tie-break among tactically similar moves.
+    4. Prefer safe moves that preserve the strongest winning pressure.
+    5. Prefer moves that create multiple immediate wins next turn (forcing fork).
+    6. Reject moves that allow opponent a forcing fork on the next reply.
+    7. Use model policy/value only as a final tie-break among tactically similar moves.
     """
     legal = [idx for idx, cell in enumerate(board) if cell == 0]
     if not legal:
@@ -275,6 +516,10 @@ def _select_threat_aware_move(
             "unsafeMovesFiltered": 0,
             "opponentThreatsBefore": 0,
             "forcingThreatsAfterMove": 0,
+            "searchBacked": False,
+            "searchMode": "none",
+            "searchScore": 0.0,
+            "searchDepth": 0,
         }
 
     opponent = 2 if current == 1 else 1
@@ -288,54 +533,42 @@ def _select_threat_aware_move(
             "unsafeMovesFiltered": 0,
             "opponentThreatsBefore": 0,
             "forcingThreatsAfterMove": 0,
+            "searchBacked": False,
+            "searchMode": "none",
+            "searchScore": 0.0,
+            "searchDepth": 0,
         }
 
-    opponent_threats_before = _list_immediate_wins(board, board_size, win_len, opponent)
+    if board_size <= 5:
+        exact_endgame = _select_exact_endgame_move(
+            board,
+            current,
+            board_size,
+            win_len,
+            probs_raw,
+            value_scores=value_scores,
+        )
+        if exact_endgame is not None:
+            return exact_endgame
+
+    evaluations, opponent_threats_before = _candidate_move_evaluations(
+        board,
+        current,
+        board_size,
+        win_len,
+        probs_raw=probs_raw,
+        value_scores=value_scores,
+    )
     best_move = -1
     best_key: tuple[Any, ...] | None = None
     best_eval: dict[str, Any] | None = None
     unsafe_filtered = 0
 
-    for move in legal:
-        board[move] = current
-        opp_immediate_wins = _list_immediate_wins(board, board_size, win_len, opponent)
-        self_immediate_next = _list_immediate_wins(board, board_size, win_len, current)
-        opponent_fork_responses = 0
-        if not opp_immediate_wins:
-            opponent_fork_responses = _count_double_threat_responses(board, board_size, win_len, opponent)
-        board[move] = 0
-
-        safe_now = len(opp_immediate_wins) == 0
-        safe_vs_fork = opponent_fork_responses == 0
-        creates_fork = len(self_immediate_next) >= 2
-        blocks_immediate = bool(opponent_threats_before) and safe_now
-        if not safe_now or not safe_vs_fork:
+    for evaluation in evaluations:
+        move = int(evaluation["move"])
+        if not evaluation["safeNow"] or not evaluation["safeVsFork"]:
             unsafe_filtered += 1
-
-        evaluation = {
-            "move": move,
-            "safeNow": safe_now,
-            "safeVsFork": safe_vs_fork,
-            "blocksImmediate": blocks_immediate,
-            "createsFork": creates_fork,
-            "opponentImmediateWins": len(opp_immediate_wins),
-            "opponentForkResponses": opponent_fork_responses,
-            "selfImmediateWinsNext": len(self_immediate_next),
-            "modelProb": probs_raw[move],
-            "afterstateValue": float((value_scores or {}).get(move, 0.0)),
-        }
-
-        key = (
-            1 if blocks_immediate else 0,
-            1 if safe_now else 0,
-            1 if safe_vs_fork else 0,
-            1 if creates_fork else 0,
-            -len(opp_immediate_wins),
-            -opponent_fork_responses,
-            len(self_immediate_next),
-            evaluation["afterstateValue"],
-            probs_raw[move],
-        )
+        key = _threat_candidate_sort_key(evaluation)
         if best_key is None or key > best_key:
             best_key = key
             best_move = move
@@ -348,12 +581,23 @@ def _select_threat_aware_move(
             "unsafeMovesFiltered": 0,
             "opponentThreatsBefore": len(opponent_threats_before),
             "forcingThreatsAfterMove": 0,
+            "searchBacked": False,
+            "searchMode": "none",
+            "searchScore": 0.0,
+            "searchDepth": 0,
         }
 
     if best_eval["blocksImmediate"]:
         reason = "block_immediate"
     elif best_eval["createsFork"]:
         reason = "create_forcing_threat"
+    elif (
+        best_eval["safeNow"]
+        and best_eval["safeVsFork"]
+        and int(best_eval.get("selfWinningPressure", 0)) > 0
+        and best_move != model_best
+    ):
+        reason = "press_winning_advantage"
     elif best_eval["safeNow"] and best_eval["safeVsFork"] and abs(best_eval["afterstateValue"]) > 1e-6 and best_move != model_best:
         reason = "policy_value"
     elif best_eval["safeNow"] and best_eval["safeVsFork"] and best_move != model_best:
@@ -371,8 +615,13 @@ def _select_threat_aware_move(
         "forcingThreatsAfterMove": best_eval["selfImmediateWinsNext"],
         "opponentThreatsAfterMove": best_eval["opponentImmediateWins"],
         "opponentForkResponses": best_eval["opponentForkResponses"],
+        "winningPressure": int(best_eval.get("selfWinningPressure", 0)),
         "valueGuided": reason == "policy_value",
         "afterstateValue": round(best_eval["afterstateValue"], 4),
+        "searchBacked": False,
+        "searchMode": "none",
+        "searchScore": 0.0,
+        "searchDepth": 0,
     }
 
 
@@ -615,6 +864,10 @@ def _model_predict(
                 "valueGuided": False,
                 "unsafeMovesFiltered": 0,
                 "afterstateValue": 0.0,
+                "searchBacked": False,
+                "searchMode": "none",
+                "searchScore": 0.0,
+                "searchDepth": 0,
             }
         else:
             probs_raw = _uniform_legal_probs(board)

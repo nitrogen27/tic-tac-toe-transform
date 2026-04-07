@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     """Runtime configuration for the Gomoku API."""
 
     engine_binary: str = _default_engine_binary()
+    rapfi_enabled: bool = False
+    rapfi_binary: str = ""
+    rapfi_args: str = ""
+    rapfi_workdir: str = ""
+    default_teacher_backend: str = "auto"
+    default_confirm_backend: str = "auto"
     host: str = "0.0.0.0"
     port: int = 8080
     cors_origins: list[str] = ["*"]

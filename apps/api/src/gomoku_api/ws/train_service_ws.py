@@ -530,10 +530,22 @@ def _position_bank_importance(position: dict[str, Any]) -> float:
     importance = sample_weight + min(math.log2(max(merge_count, 1.0) + 1.0) * 0.15, 0.75)
     if source == "failure":
         importance += 0.35
+    elif source == "failure_conversion":
+        importance += 0.55
+    elif source == "user_mistake":
+        importance += 0.45
+    elif source == "user_conversion":
+        importance += 0.40
+    elif source == "user_game":
+        importance += 0.15
     elif source == "engine":
         importance += 0.20
     if motif in {"block", "win"}:
         importance += 0.20
+    elif motif == "conversion" or bool(position.get("conversionTarget")):
+        importance += 0.35
+    if int(position.get("playerFocus", 0) or 0) == 1:
+        importance += 0.12
     return importance
 
 
@@ -561,12 +573,66 @@ def _merge_position_records(existing: dict[str, Any], incoming: dict[str, Any]) 
     incoming_value = float(incoming.get("value", 0.0))
     merged["value"] = ((existing_value * existing_count) + (incoming_value * incoming_count)) / total_count
     merged["mergeCount"] = int(total_count)
-    merged["sampleWeight"] = round(min(1.0 + math.log2(total_count + 1.0) * 0.35, 3.0), 4)
+    baseline_weight = min(1.0 + math.log2(total_count + 1.0) * 0.35, 3.0)
+    merged["sampleWeight"] = round(max(
+        baseline_weight,
+        float(existing.get("sampleWeight", 1.0)),
+        float(incoming.get("sampleWeight", 1.0)),
+    ), 4)
     merged["_canonicalFingerprint"] = existing.get("_canonicalFingerprint") or incoming.get("_canonicalFingerprint")
     merged["_order"] = max(int(existing.get("_order", 0)), int(incoming.get("_order", 0)))
     if existing.get("source") == "engine" or incoming.get("source") == "engine":
         merged["source"] = "engine"
+    elif existing.get("source") == "failure_conversion" or incoming.get("source") == "failure_conversion":
+        merged["source"] = "failure_conversion"
+    if existing.get("motif") == "conversion" or incoming.get("motif") == "conversion":
+        merged["motif"] = "conversion"
+    if bool(existing.get("conversionTarget")) or bool(incoming.get("conversionTarget")):
+        merged["conversionTarget"] = True
+    merged["playerFocus"] = int(incoming.get("playerFocus", existing.get("playerFocus", 0)) or 0)
     return merged
+
+
+def _build_conversion_relabel_candidate(
+    state: dict[str, Any],
+    hybrid_decision: dict[str, Any],
+    pure_decision: dict[str, Any],
+) -> dict[str, Any] | None:
+    hybrid_move = int(hybrid_decision.get("move", -1) or -1)
+    pure_move = int(pure_decision.get("move", -1) or -1)
+    if hybrid_move < 0 or pure_move < 0 or hybrid_move == pure_move:
+        return None
+
+    hybrid_reason = str(hybrid_decision.get("tacticalReason", "") or "")
+    hybrid_pressure = int(hybrid_decision.get("winningPressure", 0) or 0)
+    hybrid_forcing = int(hybrid_decision.get("forcingThreatsAfterMove", 0) or 0)
+    hybrid_search_score = float(hybrid_decision.get("searchScore", 0.0) or 0.0)
+    pure_reason = str(pure_decision.get("tacticalReason", "") or "")
+    pure_pressure = int(pure_decision.get("winningPressure", 0) or 0)
+
+    hybrid_is_conversion = (
+        hybrid_reason in {"press_winning_advantage", "create_forcing_threat", "search_exact_win"}
+        or hybrid_pressure > pure_pressure
+        or hybrid_forcing >= 2
+        or hybrid_search_score > 0.0
+    )
+    pure_is_quiet = pure_reason in {"model_policy", "policy_value"} and pure_pressure <= hybrid_pressure
+    if not hybrid_is_conversion or not pure_is_quiet:
+        return None
+
+    current_player = int(state.get("current_player", 0) or 0)
+    sample_weight = 1.85 if current_player == 1 else 1.45
+    enriched = dict(state)
+    enriched["source"] = "failure_conversion"
+    enriched["motif"] = "conversion"
+    enriched["sampleWeight"] = sample_weight
+    enriched["playerFocus"] = current_player
+    enriched["conversionTarget"] = True
+    enriched["hybridMove"] = hybrid_move
+    enriched["pureMove"] = pure_move
+    enriched["hybridReason"] = hybrid_reason
+    enriched["pureReason"] = pure_reason
+    return enriched
 
 
 def _sanitize_bank_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -640,12 +706,29 @@ def _load_offline_dataset_positions(
     variant: str,
     *,
     max_positions: int | None = None,
+    preferred_backend: str | None = None,
 ) -> tuple[list[dict[str, Any]], Path | None, str | None]:
     datasets_dir = SAVED_DIR / "datasets"
-    candidates = [
-        ("engine", datasets_dir / f"{variant}_engine.json"),
-        ("minimax", datasets_dir / f"{variant}_minimax.json"),
-    ]
+    dataset_paths = {
+        "rapfi": datasets_dir / f"{variant}_rapfi.json",
+        "engine": datasets_dir / f"{variant}_engine.json",
+        "minimax": datasets_dir / f"{variant}_minimax.json",
+    }
+    backend_aliases = {
+        "builtin": "engine",
+        "engine": "engine",
+        "cpp": "engine",
+        "rapfi": "rapfi",
+        "minimax": "minimax",
+    }
+    preferred_type = backend_aliases.get(str(preferred_backend or "").strip().lower())
+    ordered_types: list[str] = []
+    if preferred_type is not None:
+        ordered_types.append(preferred_type)
+    for dataset_type in ("rapfi", "engine", "minimax"):
+        if dataset_type not in ordered_types:
+            ordered_types.append(dataset_type)
+    candidates = [(dataset_type, dataset_paths[dataset_type]) for dataset_type in ordered_types]
     for dataset_type, path in candidates:
         if not path.exists():
             continue
@@ -732,6 +815,7 @@ def _build_repair_pool(
     failure_bank: list[dict[str, Any]],
     anchor_positions: list[dict[str, Any]],
     tactical_positions: list[dict[str, Any]],
+    user_corpus_positions: list[dict[str, Any]] | None = None,
     *,
     data_count: int,
 ) -> list[dict[str, Any]]:
@@ -739,9 +823,17 @@ def _build_repair_pool(
     if data_count <= 0:
         return []
 
-    fail_quota = min(len(failure_bank), max(int(data_count * 0.65), 0))
-    anchor_quota = min(len(anchor_positions), max(int(data_count * 0.25), 0))
-    tactical_quota = min(len(tactical_positions), max(data_count - fail_quota - anchor_quota, 0))
+    user_corpus_positions = list(user_corpus_positions or [])
+    if user_corpus_positions:
+        fail_quota = min(len(failure_bank), max(int(data_count * 0.55), 0))
+        anchor_quota = min(len(anchor_positions), max(int(data_count * 0.20), 0))
+        tactical_quota = min(len(tactical_positions), max(int(data_count * 0.10), 0))
+        user_quota = min(len(user_corpus_positions), max(data_count - fail_quota - anchor_quota - tactical_quota, 0))
+    else:
+        fail_quota = min(len(failure_bank), max(int(data_count * 0.65), 0))
+        anchor_quota = min(len(anchor_positions), max(int(data_count * 0.25), 0))
+        tactical_quota = min(len(tactical_positions), max(data_count - fail_quota - anchor_quota, 0))
+        user_quota = 0
 
     pool: list[dict[str, Any]] = []
     if fail_quota > 0:
@@ -750,9 +842,11 @@ def _build_repair_pool(
         pool.extend(_sample_positions(anchor_positions, anchor_quota))
     if tactical_quota > 0:
         pool.extend(_sample_positions(tactical_positions, tactical_quota))
+    if user_quota > 0:
+        pool.extend(_sample_positions(user_corpus_positions, user_quota))
 
     if len(pool) < data_count:
-        leftovers = failure_bank + anchor_positions + tactical_positions
+        leftovers = failure_bank + anchor_positions + tactical_positions + user_corpus_positions
         needed = min(data_count - len(pool), len(leftovers))
         if needed > 0:
             pool.extend(_sample_positions(leftovers, needed))
@@ -765,6 +859,7 @@ def _build_turbo_pool(
     anchor_positions: list[dict[str, Any]],
     tactical_positions: list[dict[str, Any]],
     failure_bank: list[dict[str, Any]],
+    user_corpus_positions: list[dict[str, Any]] | None = None,
     *,
     data_count: int,
     tactical_ratio: float = 0.20,
@@ -773,10 +868,14 @@ def _build_turbo_pool(
     if data_count <= 0:
         return []
 
-    anchor_ratio = max(0.10, 1.0 - tactical_ratio - 0.20)
+    user_corpus_positions = list(user_corpus_positions or [])
+    user_ratio = 0.10 if user_corpus_positions else 0.0
+    failure_ratio = 0.10 if user_corpus_positions else 0.20
+    anchor_ratio = max(0.10, 1.0 - tactical_ratio - failure_ratio - user_ratio)
     anchor_quota = min(len(anchor_positions), max(int(data_count * anchor_ratio), 0))
     tactical_quota = min(len(tactical_positions), max(int(data_count * tactical_ratio), 0))
-    failure_quota = min(len(failure_bank), max(data_count - anchor_quota - tactical_quota, 0))
+    failure_quota = min(len(failure_bank), max(int(data_count * failure_ratio), 0))
+    user_quota = min(len(user_corpus_positions), max(data_count - anchor_quota - tactical_quota - failure_quota, 0))
 
     pool: list[dict[str, Any]] = []
     if anchor_quota > 0:
@@ -785,9 +884,11 @@ def _build_turbo_pool(
         pool.extend(_sample_positions(tactical_positions, tactical_quota))
     if failure_quota > 0:
         pool.extend(_sample_positions(failure_bank, failure_quota))
+    if user_quota > 0:
+        pool.extend(_sample_positions(user_corpus_positions, user_quota))
 
     if len(pool) < data_count:
-        leftovers = anchor_positions + tactical_positions + failure_bank
+        leftovers = anchor_positions + tactical_positions + failure_bank + user_corpus_positions
         needed = min(data_count - len(pool), len(leftovers))
         if needed > 0:
             pool.extend(_sample_positions(leftovers, needed))
@@ -802,6 +903,7 @@ def _choose_rapid_cycle_strategy(
     corrected_rate: float,
     failure_bank_size: int,
     engine_per_cycle: int,
+    exam_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     strategy = {
         "tacticalRatio": 0.50,
@@ -809,6 +911,8 @@ def _choose_rapid_cycle_strategy(
         "failureSlice": 256,
         "engineFocus": None,
         "engineCount": engine_per_cycle,
+        "engineCurrentPlayerFocus": None,
+        "conversionFocus": False,
         "weakestFrozenSuite": None,
         "midLateGap": None,
     }
@@ -860,6 +964,23 @@ def _choose_rapid_cycle_strategy(
     if holdout_delta < -1.0:
         strategy["tacticalRatio"] = max(0.35, float(strategy["tacticalRatio"]) - 0.05)
         strategy["engineCount"] = min(128, int(strategy["engineCount"]) + 16)
+
+    if exam_summary:
+        winrate_as_p1 = float(exam_summary.get("winrateAsP1", 0.0) or 0.0)
+        winrate_as_p2 = float(exam_summary.get("winrateAsP2", 0.0) or 0.0)
+        decisive_winrate = float(exam_summary.get("decisiveWinRate", 0.0) or 0.0)
+        draw_rate = float(exam_summary.get("drawRate", 0.0) or 0.0)
+
+        if abs(winrate_as_p1 - winrate_as_p2) >= 0.10:
+            strategy["engineCurrentPlayerFocus"] = 1 if winrate_as_p1 < winrate_as_p2 else 2
+            strategy["engineCount"] = min(144, max(int(strategy["engineCount"]), engine_per_cycle + 12))
+
+        if decisive_winrate < 0.20 or draw_rate > 0.40:
+            strategy["conversionFocus"] = True
+            strategy["engineCount"] = min(160, max(int(strategy["engineCount"]), engine_per_cycle + 24))
+            strategy["tacticalRatio"] = min(float(strategy["tacticalRatio"]), 0.32)
+            if strategy["engineFocus"] is None:
+                strategy["engineFocus"] = "mid"
 
     if corrected_rate < 0.20 and failure_bank_size > 8:
         strategy["failureSlice"] = 384
@@ -1099,6 +1220,9 @@ async def _generate_engine_labeled_positions(
     rng: random.Random | None = None,
     source: str = "engine",
     phase_focus: str | None = None,
+    current_player_focus: int | None = None,
+    min_value: float | None = None,
+    boost_weight: float = 1.0,
 ) -> list[dict[str, Any]]:
     positions: list[dict[str, Any]] = []
     started_at = time.monotonic()
@@ -1114,10 +1238,14 @@ async def _generate_engine_labeled_positions(
             continue
 
         board, current, last_move = sampled
+        if current_player_focus in (1, 2) and current != int(current_player_focus):
+            continue
         phase_bucket = _classify_engine_phase(board_size, sum(1 for cell in board if cell != 0))
         analysis = await engine_eval.analyze_position(board, current, board_size, win_len)
         move = int(analysis.get("bestMove", -1))
         value = max(-1.0, min(1.0, float(analysis.get("value", 0.0))))
+        if min_value is not None and value < float(min_value):
+            continue
         if move < 0 or move >= len(board) or board[move] != 0:
             continue
         hints = await engine_eval.suggest_moves(board, current, board_size, win_len, top_n=5)
@@ -1131,7 +1259,9 @@ async def _generate_engine_labeled_positions(
             "value": value,
             "source": source,
             "phaseBucket": phase_bucket,
-            "sampleWeight": 1.0,
+            "sampleWeight": max(float(boost_weight), 0.1),
+            "playerFocus": int(current_player_focus) if current_player_focus in (1, 2) else None,
+            "conversionTarget": bool(min_value is not None and min_value > 0.0),
         })
 
         if len(positions) - last_reported >= 64 or len(positions) == count:
@@ -1177,6 +1307,11 @@ async def _relabel_positions_with_engine(
             "last_move": pos.get("last_move"),
             "policy": _soft_policy_from_engine_hints(move, board, board_size, hints),
             "value": value,
+            "source": pos.get("source", "failure"),
+            "motif": pos.get("motif"),
+            "sampleWeight": float(pos.get("sampleWeight", 1.0)),
+            "playerFocus": int(pos.get("playerFocus", 0) or 0),
+            "conversionTarget": bool(pos.get("conversionTarget", False)),
         })
 
         if callback is not None and (idx - last_reported >= 24 or idx == len(positions)):
@@ -1221,10 +1356,12 @@ async def _run_engine_exam(
     collect_failures: bool = True,
 ) -> tuple[Any, list[dict[str, Any]], dict[str, Any]]:
     from gomoku_api.ws.arena_eval import ArenaResult, _model_greedy_decision
+    from gomoku_api.ws.predict_service import _loaded_model_decision
 
     wins = losses = draws = 0
     total_games = max(num_pairs * 2, 1)
     raw_failures: list[dict[str, Any]] = []
+    raw_conversion_failures: list[dict[str, Any]] = []
     started_at = time.monotonic()
     side_stats: dict[int, dict[str, int]] = {
         1: {"wins": 0, "losses": 0, "draws": 0, "total": 0},
@@ -1236,6 +1373,8 @@ async def _run_engine_exam(
     model_policy_count = 0
     unsafe_moves_filtered_total = 0
     decision_reason_counts: dict[str, int] = {}
+    conversion_failure_count = 0
+    conversion_failure_side_counts: dict[int, int] = {1: 0, 2: 0}
 
     def _side_rate(side: int, numerator: str, *, draw_weight: float = 0.0) -> float:
         bucket = side_stats[side]
@@ -1257,14 +1396,28 @@ async def _run_engine_exam(
                     break
 
                 if current == candidate_side:
-                    candidate_states.append({
+                    candidate_state = {
                         "board_size": board_size,
                         "board": _flat_to_board2d(board, board_size),
                         "current_player": current,
                         "last_move": list(divmod(last_move, board_size)) if last_move >= 0 else None,
-                    })
+                    }
+                    candidate_states.append(candidate_state)
                     decision = _model_greedy_decision(board, board_size, win_len, current, model, device)
                     move = int(decision.get("move", -1))
+                    pure_decision = _loaded_model_decision(
+                        board,
+                        current,
+                        board_size,
+                        win_len,
+                        model,
+                        decision_mode="pure",
+                    )
+                    conversion_candidate = _build_conversion_relabel_candidate(candidate_state, decision, pure_decision)
+                    if conversion_candidate is not None:
+                        raw_conversion_failures.append(conversion_candidate)
+                        conversion_failure_count += 1
+                        conversion_failure_side_counts[current] = conversion_failure_side_counts.get(current, 0) + 1
                     candidate_move_count += 1
                     if bool(decision.get("tacticalOverride")):
                         tactical_override_count += 1
@@ -1366,13 +1519,16 @@ async def _run_engine_exam(
                 "elapsed": round(elapsed, 1),
                 "speed": round(games_done / elapsed, 2),
                 "speedUnit": "g/s",
-                "positions": len(raw_failures),
+                "positions": len(raw_failures) + len(raw_conversion_failures),
+                "conversionFailures": conversion_failure_count,
+                "conversionFailuresAsP1": conversion_failure_side_counts[1],
+                "conversionFailuresAsP2": conversion_failure_side_counts[2],
             },
         })
         await asyncio.sleep(0)
 
     if collect_failures:
-        unique_raw = _merge_failure_bank([], raw_failures, max_size=max_failure_positions)
+        unique_raw = _merge_failure_bank([], raw_failures + raw_conversion_failures, max_size=max_failure_positions)
         relabeled = await _relabel_positions_with_engine(
             unique_raw,
             board_size,
@@ -1404,6 +1560,10 @@ async def _run_engine_exam(
         "modelPolicyRate": round(model_policy_count / max(candidate_move_count, 1), 4),
         "avgUnsafeMovesFiltered": round(unsafe_moves_filtered_total / max(candidate_move_count, 1), 4),
         "decisionReasonCounts": dict(sorted(decision_reason_counts.items())),
+        "conversionFailures": conversion_failure_count,
+        "conversionFailuresAsP1": conversion_failure_side_counts[1],
+        "conversionFailuresAsP2": conversion_failure_side_counts[2],
+        "conversionRelabels": sum(1 for pos in relabeled if pos.get("motif") == "conversion"),
         "newFailures": len(relabeled),
     }
     return result, relabeled, summary
@@ -2939,6 +3099,8 @@ async def train_variant(
     bootstrap_games = int(kwargs.get("bootstrapGames", 64))
     cycle_count = max(1, int(kwargs.get("mctsIterations", 3)))
     exam_games = max(8, int(kwargs.get("mctsGamesPerIter", 32)))
+    teacher_backend_requested = str(kwargs.get("teacherBackend", "default"))
+    confirm_backend_requested = str(kwargs.get("confirmBackend", "default"))
     prefer_offline_dataset = bool(kwargs.get("preferOfflineDataset", True))
     offline_dataset_limit = max(0, int(kwargs.get("offlineDatasetLimit", 0)))
     foundation_dataset_count = max(0, int(kwargs.get("foundationDatasetCount", 0)))
@@ -2968,6 +3130,86 @@ async def train_variant(
     repair_pool_size = max(512, min(data_count, teacher_seed_count))
     failure_bank_max = max(256, min(data_count * 2, 2048))
 
+    completed_phases: list[str] = []
+    metrics_history: list[dict[str, Any]] = []
+    winrate_history: list[dict[str, Any]] = []
+    validation_history: list[dict[str, Any]] = []
+    tactical_positions: list[dict[str, Any]] = []
+    anchor_positions: list[dict[str, Any]] = []
+    holdout_bank: list[dict[str, Any]] = []
+    failure_bank: list[dict[str, Any]] = []
+    frozen_suites: dict[str, list[dict[str, Any]]] = {}
+    started_at = time.monotonic()
+    common = {"variant": variant, "boardSize": board_size, "winLength": win_len}
+    use_user_corpus = bool(kwargs.get("useCorpus", False)) and variant == "ttt5"
+    user_corpus_mode = str(kwargs.get("corpusMode", "quick_repair")).strip().lower()
+    user_corpus = None
+    user_corpus_stats: dict[str, Any] = {}
+    user_corpus_budget = 0
+    if use_user_corpus:
+        from gomoku_api.ws.user_game_corpus import UserGameCorpus
+
+        user_corpus = UserGameCorpus(variant)
+        user_corpus.load()
+        user_corpus_stats = user_corpus.stats()
+        if user_corpus_mode in {"consolidate", "consolidation"}:
+            user_corpus_budget = min(max(data_count // 2, 192), 768)
+        else:
+            user_corpus_budget = min(max(data_count // 4, 96), 384)
+
+    engine_eval = None
+    engine_available = False
+    engine_backend_resolved = "builtin"
+    confirm_eval = None
+    confirm_available = False
+    confirm_backend_resolved = "builtin"
+    try:
+        from gomoku_api.ws.oracle_backends import create_oracle_evaluator
+
+        engine_eval, engine_backend_resolved = create_oracle_evaluator(
+            board_size,
+            win_len,
+            backend=teacher_backend_requested,
+            role="teacher",
+        )
+        await engine_eval.start()
+        engine_available = bool(engine_eval.alive)
+    except Exception as exc:
+        logger.warning("Teacher oracle unavailable for %s: %s", variant, exc)
+        if engine_eval is not None:
+            try:
+                await engine_eval.stop()
+            except Exception:
+                pass
+        engine_eval = None
+
+    try:
+        if confirm_backend_requested == teacher_backend_requested and engine_eval is not None:
+            confirm_eval = engine_eval
+            confirm_backend_resolved = engine_backend_resolved
+            confirm_available = engine_available
+        else:
+            from gomoku_api.ws.oracle_backends import create_oracle_evaluator
+
+            confirm_eval, confirm_backend_resolved = create_oracle_evaluator(
+                board_size,
+                win_len,
+                backend=confirm_backend_requested,
+                role="confirm",
+            )
+            await confirm_eval.start()
+            confirm_available = bool(confirm_eval.alive)
+    except Exception as exc:
+        logger.warning("Confirm oracle unavailable for %s: %s", variant, exc)
+        if confirm_eval is not None and confirm_eval is not engine_eval:
+            try:
+                await confirm_eval.stop()
+            except Exception:
+                pass
+        confirm_eval = engine_eval
+        confirm_available = engine_available
+        confirm_backend_resolved = engine_backend_resolved
+
     live_gpu = get_gpu_info()
     await callback({
         "type": "train.start",
@@ -2988,38 +3230,16 @@ async def train_variant(
             "totalCycles": cycle_count,
             "trainingMode": "cyclic_engine_exam",
             "modelProfile": model_profile,
+            "teacherBackend": teacher_backend_requested,
+            "teacherBackendResolved": engine_backend_resolved,
+            "confirmBackend": confirm_backend_requested,
+            "confirmBackendResolved": confirm_backend_resolved,
+            "userCorpusEnabled": use_user_corpus,
+            "userCorpusMode": user_corpus_mode if use_user_corpus else None,
+            "userCorpusStats": user_corpus_stats if use_user_corpus else None,
             "gpu": live_gpu,
         },
     })
-
-    completed_phases: list[str] = []
-    metrics_history: list[dict[str, Any]] = []
-    winrate_history: list[dict[str, Any]] = []
-    validation_history: list[dict[str, Any]] = []
-    tactical_positions: list[dict[str, Any]] = []
-    anchor_positions: list[dict[str, Any]] = []
-    holdout_bank: list[dict[str, Any]] = []
-    failure_bank: list[dict[str, Any]] = []
-    frozen_suites: dict[str, list[dict[str, Any]]] = {}
-    started_at = time.monotonic()
-    common = {"variant": variant, "boardSize": board_size, "winLength": win_len}
-
-    engine_eval = None
-    engine_available = False
-    try:
-        from gomoku_api.ws.engine_evaluator import EngineEvaluator
-
-        engine_eval = EngineEvaluator()
-        await engine_eval.start()
-        engine_available = bool(engine_eval.alive)
-    except Exception as exc:
-        logger.warning("Engine teacher unavailable for %s: %s", variant, exc)
-        if engine_eval is not None:
-            try:
-                await engine_eval.stop()
-            except Exception:
-                pass
-        engine_eval = None
 
     offline_target = offline_dataset_limit
     if prefer_offline_dataset and board_size <= 5:
@@ -3036,6 +3256,7 @@ async def train_variant(
         offline_positions, offline_dataset_path, offline_dataset_type = _load_offline_dataset_positions(
             variant,
             max_positions=offline_target if offline_target > 0 else None,
+            preferred_backend=engine_backend_resolved,
         )
         if offline_positions:
             logger.info(
@@ -3075,7 +3296,11 @@ async def train_variant(
             variant=variant,
         )
     elif variant in {"ttt3", "ttt5"}:
-        _, dataset_path, dataset_type = _load_offline_dataset_positions(variant, max_positions=teacher_seed_count)
+        _, dataset_path, dataset_type = _load_offline_dataset_positions(
+            variant,
+            max_positions=teacher_seed_count,
+            preferred_backend=engine_backend_resolved,
+        )
         if dataset_path is None:
             dataset_path = SAVED_DIR / "datasets" / f"{variant}_minimax.json"
         if not dataset_path.exists():
@@ -3123,6 +3348,12 @@ async def train_variant(
 
     if is_new_model:
         foundation_pool = list(anchor_positions) + list(tactical_positions)
+        if user_corpus is not None and user_corpus_budget > 0:
+            foundation_user_count = min(
+                max(user_corpus_budget * (2 if user_corpus_mode in {"consolidate", "consolidation"} else 1), 64),
+                768,
+            )
+            foundation_pool.extend(user_corpus.get_pool_for_builder(foundation_user_count, user_corpus_mode))
         random.shuffle(foundation_pool)
         if rapid_mode and foundation_pool:
             foundation_batch_size = _cycle_batch_size if rapid_mode else batch_size
@@ -3186,12 +3417,14 @@ async def train_variant(
     current_tactical_focus: str | None = None
     current_engine_focus: str | None = None
     current_engine_count = engine_per_cycle
+    current_engine_current_player_focus: int | None = 2 if (rapid_mode and board_size <= 5) else None
+    current_conversion_focus = False
     current_failure_slice = 256
     repair_effectiveness_history: list[float] = []
     best_quick_checkpoint_state: dict[str, torch.Tensor] | None = None
     best_quick_checkpoint_summary: dict[str, Any] | None = None
     best_quick_checkpoint_cycle: int | None = None
-    best_quick_checkpoint_score: tuple[float, float, float, int] | None = None
+    best_quick_checkpoint_score: tuple[float, float, float, float, int] | None = None
 
     for cycle in range(1, cycle_count + 1):
         cycle_base = base_percent + (cycle - 1) * cycle_percent
@@ -3206,6 +3439,35 @@ async def train_variant(
                 engine_eval,
                 phase_focus=current_engine_focus,
             )
+            if current_engine_current_player_focus in (1, 2):
+                side_focus_count = max(8, min(32, current_engine_count // 4))
+                side_focus_positions = await _generate_engine_labeled_positions(
+                    side_focus_count,
+                    board_size,
+                    win_len,
+                    callback,
+                    engine_eval,
+                    source="engine_side_focus",
+                    phase_focus=current_engine_focus,
+                    current_player_focus=current_engine_current_player_focus,
+                    boost_weight=1.15,
+                )
+                new_engine.extend(side_focus_positions)
+            if current_conversion_focus:
+                conversion_count = max(12, min(40, current_engine_count // 3))
+                conversion_positions = await _generate_engine_labeled_positions(
+                    conversion_count,
+                    board_size,
+                    win_len,
+                    callback,
+                    engine_eval,
+                    source="engine_conversion",
+                    phase_focus=current_engine_focus or "mid",
+                    current_player_focus=current_engine_current_player_focus,
+                    min_value=0.45,
+                    boost_weight=1.35,
+                )
+                new_engine.extend(conversion_positions)
             train_engine, holdout_engine = _split_holdout_positions(
                 new_engine,
                 holdout_ratio=0.10,
@@ -3243,6 +3505,7 @@ async def train_variant(
             anchor_positions,
             tactical_positions,
             failure_bank[-min(len(failure_bank), current_failure_slice):],
+            user_corpus.get_pool_for_builder(user_corpus_budget, user_corpus_mode) if (user_corpus is not None and user_corpus_budget > 0) else None,
             data_count=repair_pool_size,
             tactical_ratio=current_tactical_ratio if rapid_mode else 0.20,
         )
@@ -3385,6 +3648,7 @@ async def train_variant(
                 failure_bank,
                 anchor_positions,
                 tactical_positions,
+                user_corpus.get_pool_for_builder(user_corpus_budget, user_corpus_mode) if (user_corpus is not None and user_corpus_budget > 0) else None,
                 data_count=max(batch_size, repair_pool_size),
             )
             await _run_training_steps(
@@ -3463,11 +3727,14 @@ async def train_variant(
                 corrected_rate=corrected_rate,
                 failure_bank_size=len(failure_bank),
                 engine_per_cycle=engine_per_cycle,
+                exam_summary=exam_summary_current or previous_exam,
             )
             current_tactical_ratio = float(strategy["tacticalRatio"])
             current_tactical_focus = strategy["tacticalFocus"]
             current_engine_focus = strategy["engineFocus"]
             current_engine_count = int(strategy["engineCount"])
+            current_engine_current_player_focus = strategy.get("engineCurrentPlayerFocus")
+            current_conversion_focus = bool(strategy.get("conversionFocus", False))
             current_failure_slice = int(strategy["failureSlice"])
 
         # Winrate-driven scheduler: early exit if stable or stagnated
@@ -3572,14 +3839,14 @@ async def train_variant(
     # Confirm exam: separate from quick probes, used for promotion only
     confirm_result = strong_result
     confirm_summary: dict[str, Any] | None = None
-    if engine_available and engine_eval is not None:
+    if confirm_available and confirm_eval is not None:
         confirm_result, _, confirm_summary = await _run_engine_exam(
             model,
             board_size,
             win_len,
             device,
             callback,
-            engine_eval,
+            confirm_eval,
             variant=variant,
             cycle=cycle_count + 1,
             total_cycles=cycle_count,
@@ -3677,6 +3944,10 @@ async def train_variant(
         "promoted": promoted_this_run,
         "cycles": cycle_count,
         "selectedCheckpointCycle": selected_checkpoint_cycle,
+        "teacherBackendRequested": teacher_backend_requested,
+        "teacherBackendResolved": engine_backend_resolved,
+        "confirmBackendRequested": confirm_backend_requested,
+        "confirmBackendResolved": confirm_backend_resolved,
     }
     if selected_checkpoint_summary:
         done_payload["selectedCheckpointWinrate"] = round(float(selected_checkpoint_summary.get("winrate", 0.0) or 0.0), 4)
@@ -3750,6 +4021,12 @@ async def train_variant(
             if latest_validation.get(key) is not None:
                 done_payload[key] = latest_validation[key]
     await callback({"type": "train.done", "payload": done_payload})
+
+    if confirm_eval is not None and confirm_eval is not engine_eval:
+        try:
+            await confirm_eval.stop()
+        except Exception:
+            logger.debug("Failed to stop confirm oracle cleanly", exc_info=True)
 
     if engine_eval is not None:
         try:

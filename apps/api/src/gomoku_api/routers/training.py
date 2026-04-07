@@ -16,6 +16,10 @@ router = APIRouter(prefix="/train", tags=["training"])
 class EngineDatasetRequest(BaseModel):
     variant: str = "ttt5"
     count: int = Field(default=10_000, ge=100, le=100_000)
+    backend: str = Field(default="auto")
+    phase_focus: str | None = Field(default=None, alias="phaseFocus")
+
+    model_config = {"populate_by_name": True}
 
 
 class DiagnosticsRequest(BaseModel):
@@ -72,11 +76,12 @@ async def cancel_job(job_id: str, request: Request) -> Response:
 
 @router.post("/datasets/engine")
 async def create_engine_dataset(config: EngineDatasetRequest) -> dict:
-    path = await generate_engine_dataset(config.variant, config.count)
+    path = await generate_engine_dataset(config.variant, config.count, phase_focus=config.phase_focus, backend=config.backend)
     return {
         "variant": config.variant,
         "count": config.count,
         "mode": "engine",
+        "backend": config.backend,
         "path": str(path),
     }
 

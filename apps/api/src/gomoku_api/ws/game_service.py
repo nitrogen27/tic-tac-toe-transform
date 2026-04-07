@@ -21,6 +21,8 @@ class GameService:
             "playerRole": player_role,
             "variant": variant,
             "moves": [],
+            "finished": False,
+            "analyzed": False,
         }
         return game_id
 
@@ -37,6 +39,7 @@ class GameService:
         if game:
             game["winner"] = winner
             game["finished"] = True
+            game["analyzed"] = False
         return self.get_stats()
 
     def get_stats(self) -> dict:
@@ -48,6 +51,32 @@ class GameService:
 
     def get_history(self) -> list[dict]:
         return list(self._history)
+
+    def get_finished_game(self, game_id: str) -> dict | None:
+        game = self._games.get(game_id)
+        if not game or not game.get("finished"):
+            return None
+        return dict(game)
+
+    def get_finished_games(self, variant: str | None = None, *, unanalyzed_only: bool = False) -> list[dict]:
+        games: list[dict] = []
+        for game in self._games.values():
+            if not game.get("finished"):
+                continue
+            if variant and game.get("variant") != variant:
+                continue
+            if unanalyzed_only and bool(game.get("analyzed")):
+                continue
+            games.append(dict(game))
+        return games
+
+    def mark_game_analyzed(self, game_id: str, *, positions: int = 0) -> dict | None:
+        game = self._games.get(game_id)
+        if not game:
+            return None
+        game["analyzed"] = True
+        game["analyzedPositions"] = int(max(0, positions))
+        return dict(game)
 
     def clear_history(self) -> dict:
         self._history.clear()

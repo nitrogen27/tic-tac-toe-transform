@@ -203,6 +203,9 @@
           <div class="compact-train-header">
             <div class="button-group">
               <button class="btn btn-primary btn-sm" :disabled="training || clearing" @click="startTrain">Обучить</button>
+              <button class="btn btn-danger btn-sm" v-if="training" :disabled="clearing || cancellingTraining" @click="cancelTraining">
+                {{ cancellingTraining ? 'Остановка...' : 'Стоп' }}
+              </button>
               <button class="btn btn-secondary btn-sm" :disabled="training || clearing" @click="trainOnGames" :class="historyCount >= 10 ? '' : 'disabled-btn'">Дообучить</button>
               <button class="btn btn-danger btn-sm" :disabled="training || clearing" @click="clearModel">Очистить</button>
               <button class="btn btn-secondary btn-sm" v-if="variant === 'ttt5'" :disabled="training || generatingDataset" @click="generateDataset">{{ generatingDataset ? '...' : 'Dataset' }}</button>
@@ -256,6 +259,36 @@
             <small>Больше вариаций = лучшее обучение, но медленнее генерация</small>
           </div>
         </details>
+
+        <!-- User Game Corpus status -->
+        <div v-if="corpusStatus || corpusAnalyzing" class="card corpus-card">
+          <div class="corpus-header">
+            <span class="corpus-title">Корпус партий</span>
+            <span v-if="corpusAnalyzing" class="corpus-spinner">⏳</span>
+            <span v-else class="corpus-ready">✓</span>
+          </div>
+          <div v-if="corpusStatus" class="corpus-buckets">
+            <div class="corpus-bucket">
+              <span class="bucket-count">{{ corpusStatus.recentCount }}</span>
+              <span class="bucket-label">Недавние</span>
+            </div>
+            <div class="corpus-bucket bucket-mistakes">
+              <span class="bucket-count">{{ corpusStatus.hardMistakeCount }}</span>
+              <span class="bucket-label">Ошибки</span>
+            </div>
+            <div class="corpus-bucket bucket-conversion">
+              <span class="bucket-count">{{ corpusStatus.conversionCount }}</span>
+              <span class="bucket-label">Упущения</span>
+            </div>
+            <div class="corpus-bucket bucket-weak">
+              <span class="bucket-count">{{ corpusStatus.weakSideCount }}</span>
+              <span class="bucket-label">Слабая сторона</span>
+            </div>
+          </div>
+          <div v-if="corpusLastEvent" class="corpus-event">
+            <small>{{ corpusLastEvent }}</small>
+          </div>
+        </div>
 
         <!-- Dataset progress card -->
         <div v-if="datasetProgress" class="card">
@@ -567,6 +600,7 @@ function setVariant(v) {
 
 const ws = ref(null)
 const training = ref(false)
+const cancellingTraining = ref(false)
 const clearing = ref(false)
 const generatingDataset = ref(false)
 const progress = ref(null)
@@ -587,6 +621,11 @@ const lastMoveIdx = ref(-1) // Last played move index
 const winLine = ref(null) // Array of winning cell indices
 const showHeatmap = ref(true) // Inline heatmap on board
 const probFading = ref(false) // Fade-out animation trigger
+
+// Corpus status
+const corpusStatus = ref(null) // { recentCount, hardMistakeCount, conversionCount, weakSideCount, ... }
+const corpusAnalyzing = ref(false) // analysis in progress
+const corpusLastEvent = ref('') // last event description
 
 // Get winning line indices
 function getWinningLine(brd) {
@@ -1371,6 +1410,7 @@ function connectWS() {
         }
         if (msg.type === 'train.start') { 
           training.value = true
+          cancellingTraining.value = false
           destroyCharts()
           trainingMeta.value = msg.payload
           gpuTelemetry.value = extractGpuTelemetry(msg.payload)
@@ -1410,12 +1450,14 @@ function connectWS() {
       }
       if (msg.type === 'train.error') {
         training.value = false
+        cancellingTraining.value = false
         if (trainingTimerInterval) { clearInterval(trainingTimerInterval); trainingTimerInterval = null }
         status.value = `Ошибка обучения: ${msg.payload.error}`
         console.error('[WS] Training error:', msg.payload)
       }
       if (msg.type === 'train.cancelled') {
         training.value = false
+        cancellingTraining.value = false
         if (trainingTimerInterval) { clearInterval(trainingTimerInterval); trainingTimerInterval = null }
         status.value = `Обучение ${msg.payload.variant} отменено`
       }
@@ -1437,6 +1479,7 @@ function connectWS() {
       }
       if (msg.type === 'train.done') {
         training.value = false
+        cancellingTraining.value = false
         datasetProgress.value = null
         // Stop timer & show final time
         if (trainingTimerInterval) { clearInterval(trainingTimerInterval); trainingTimerInterval = null }
@@ -1500,6 +1543,32 @@ function connectWS() {
           ws.value.send(JSON.stringify({ type: 'get_history_stats' }))
         }
       }
+        // Corpus events
+        if (msg.type === 'corpus.analysis.queued') {
+          corpusAnalyzing.value = true
+          corpusLastEvent.value = `Анализ партии ${msg.payload.gameId?.slice(0, 8) || ''}...`
+          console.log('[WS] Corpus analysis queued:', msg.payload)
+        }
+        if (msg.type === 'corpus.updated') {
+          const p = msg.payload
+          corpusStatus.value = {
+            recentCount: p.recentCount || 0,
+            hardMistakeCount: p.hardMistakeCount || 0,
+            conversionCount: p.conversionCount || 0,
+            weakSideCount: p.weakSideCount || 0,
+            analyzedGames: p.analyzedGames || 0,
+            analyzedPositions: p.analyzedPositions || 0,
+            variant: p.variant,
+          }
+          corpusLastEvent.value = `+${p.analyzedPositions || 0} позиций из ${p.analyzedGames || 0} игр`
+          console.log('[WS] Corpus updated:', p)
+        }
+        if (msg.type === 'corpus.analysis.done') {
+          corpusAnalyzing.value = false
+          corpusLastEvent.value = `Готово: ${msg.payload.analyzedPositions || 0} позиций`
+          console.log('[WS] Corpus analysis done:', msg.payload)
+        }
+
         if (msg.type === 'predict.result') {
           console.log('[WS] Received predict.result, resetting waiting')
           waiting.value = false
@@ -1645,6 +1714,7 @@ function connectWS() {
         if (msg.type === 'error') {
           console.error('[WS] Server error:', msg.error)
           training.value = false
+          cancellingTraining.value = false
           clearing.value = false
           waiting.value = false // Сбрасываем ожидание при ошибке
           trainingMeta.value = null
@@ -1722,6 +1792,26 @@ function startTrain() {
     console.error('[Train] Send error:', e)
     training.value = false
     status.value = 'Ошибка отправки запроса: ' + e.message
+  }
+}
+
+function cancelTraining() {
+  if (!training.value) return
+  if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
+    status.value = 'Ошибка: WebSocket не подключен. Не удалось остановить обучение.'
+    return
+  }
+  cancellingTraining.value = true
+  status.value = `Останавливаем обучение ${variant.value}...`
+  try {
+    ws.value.send(JSON.stringify({
+      type: 'cancel_training',
+      payload: { variant: variant.value }
+    }))
+  } catch (e) {
+    cancellingTraining.value = false
+    status.value = 'Ошибка отправки запроса на остановку: ' + e.message
+    console.error('[Train] Cancel send error:', e)
   }
 }
 
@@ -2540,6 +2630,81 @@ body {
 
 .auto-train-check input {
   accent-color: var(--accent);
+}
+
+/* ===== Corpus Status Panel ===== */
+.corpus-card {
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-card));
+  border-color: color-mix(in srgb, var(--accent) 25%, var(--border-color));
+}
+
+.corpus-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.corpus-title {
+  font-size: 0.8em;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.corpus-spinner {
+  font-size: 0.85em;
+  animation: spin 1.2s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.corpus-ready {
+  font-size: 0.75em;
+  color: var(--accent-green);
+}
+
+.corpus-buckets {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+}
+
+.corpus-bucket {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 4px 2px;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+
+.bucket-count {
+  font-size: 1.1em;
+  font-weight: 700;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.bucket-label {
+  font-size: 0.65em;
+  color: var(--text-secondary);
+  text-align: center;
+  line-height: 1.1;
+}
+
+.bucket-mistakes .bucket-count { color: var(--accent-red); }
+.bucket-conversion .bucket-count { color: var(--accent-orange); }
+.bucket-weak .bucket-count { color: var(--accent); }
+
+.corpus-event {
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: 0.75em;
 }
 
 .custom-settings-compact {

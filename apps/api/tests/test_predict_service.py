@@ -113,6 +113,126 @@ def test_model_predict_uses_value_head_when_safe_moves_are_tactically_equal(monk
     assert result["afterstateValue"] == 0.9
 
 
+def test_threat_aware_move_prefers_winning_pressure_over_quiet_safety(monkeypatch) -> None:
+    board = [0] * 25
+    probs_raw = [0.0] * 25
+    probs_raw[1] = 0.9
+    probs_raw[2] = 0.2
+
+    monkeypatch.setattr(predict_service, "_find_immediate_move", lambda *args, **kwargs: None)
+    monkeypatch.setattr(predict_service, "_select_exact_endgame_move", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        predict_service,
+        "_candidate_move_evaluations",
+        lambda *args, **kwargs: (
+            [
+                {
+                    "move": 1,
+                    "isImmediateWin": False,
+                    "safeNow": True,
+                    "safeVsFork": True,
+                    "blocksImmediate": False,
+                    "createsFork": False,
+                    "opponentImmediateWins": 0,
+                    "opponentForkResponses": 0,
+                    "selfImmediateWinsNext": 0,
+                    "selfWinningPressure": 0,
+                    "modelProb": 0.9,
+                    "afterstateValue": 0.95,
+                },
+                {
+                    "move": 2,
+                    "isImmediateWin": False,
+                    "safeNow": True,
+                    "safeVsFork": True,
+                    "blocksImmediate": False,
+                    "createsFork": False,
+                    "opponentImmediateWins": 0,
+                    "opponentForkResponses": 0,
+                    "selfImmediateWinsNext": 1,
+                    "selfWinningPressure": 3,
+                    "modelProb": 0.2,
+                    "afterstateValue": 0.25,
+                },
+            ],
+            [],
+        ),
+    )
+
+    move, meta = predict_service._select_threat_aware_move(
+        board,
+        current=1,
+        board_size=5,
+        win_len=4,
+        probs_raw=probs_raw,
+        value_scores={1: 0.95, 2: 0.25},
+    )
+
+    assert move == 2
+    assert meta["tacticalReason"] == "press_winning_advantage"
+    assert meta["winningPressure"] == 3
+
+
+def test_model_predict_uses_exact_endgame_search_to_convert_win(monkeypatch) -> None:
+    board = [
+        2, 2, 2, 1, 1,
+        1, 1, 1, 2, 1,
+        0, 2, 0, 2, 0,
+        2, 0, 1, 1, 0,
+        1, 1, 2, 2, 2,
+    ]
+    logits = [-8.0] * 256
+    logits[_policy_index(14)] = 10.0  # heuristic/preference would drift elsewhere
+    logits[_policy_index(19)] = 4.0
+    model = DummyModel(logits)
+    monkeypatch.setattr(predict_service, "_get_model", lambda variant: model)
+    monkeypatch.setattr(
+        predict_service,
+        "_evaluate_afterstate_values",
+        lambda model, board, current, board_size, candidate_moves: {move: 0.0 for move in candidate_moves},
+    )
+
+    result = predict_service._model_predict(board, current=1, variant="ttt5", board_size=5)
+
+    assert result["move"] == 19
+    assert result["tacticalReason"] == "search_exact_win"
+    assert result["searchBacked"] is True
+    assert result["searchMode"] == "exact_endgame"
+    assert result["searchScore"] == 1.0
+
+
+def test_model_predict_uses_exact_endgame_search_to_avoid_losing_move(monkeypatch) -> None:
+    board = [
+        0, 2, 1, 2, 1,
+        1, 2, 1, 1, 1,
+        2, 1, 2, 0, 0,
+        2, 0, 0, 1, 0,
+        2, 1, 1, 2, 2,
+    ]
+    logits = [-8.0] * 256
+    logits[_policy_index(0)] = 10.0   # raw model prefers a losing move
+    logits[_policy_index(13)] = 8.0
+    logits[_policy_index(14)] = 7.0
+    logits[_policy_index(16)] = 6.0
+    logits[_policy_index(17)] = 5.0
+    logits[_policy_index(19)] = 4.0
+    model = DummyModel(logits)
+    monkeypatch.setattr(predict_service, "_get_model", lambda variant: model)
+    monkeypatch.setattr(
+        predict_service,
+        "_evaluate_afterstate_values",
+        lambda model, board, current, board_size, candidate_moves: {move: 0.0 for move in candidate_moves},
+    )
+
+    result = predict_service._model_predict(board, current=2, variant="ttt5", board_size=5)
+
+    assert result["move"] != 0
+    assert result["tacticalReason"] in {"search_exact_draw", "search_exact_hold", "search_exact_win"}
+    assert result["searchBacked"] is True
+    assert result["searchMode"] == "exact_endgame"
+    assert result["searchScore"] >= 0.0
+
+
 def test_model_predict_pure_mode_skips_hybrid_tactical_override(monkeypatch) -> None:
     board = [
         2, 0, 0, 0, 0,

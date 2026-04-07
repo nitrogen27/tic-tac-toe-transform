@@ -52,8 +52,9 @@ def test_cancel_job(client):
 
 
 def test_create_engine_dataset_route(client, monkeypatch, tmp_path: Path):
-    async def fake_generate_engine_dataset(variant: str, count: int):
-        path = tmp_path / f"{variant}_engine.json"
+    async def fake_generate_engine_dataset(variant: str, count: int, *, phase_focus=None, backend="auto"):
+        suffix = "builtin" if backend == "auto" else (backend if backend else "engine")
+        path = tmp_path / f"{variant}_{suffix}.json"
         path.write_text("[]", encoding="utf-8")
         return path
 
@@ -65,7 +66,8 @@ def test_create_engine_dataset_route(client, monkeypatch, tmp_path: Path):
     assert data["variant"] == "ttt5"
     assert data["count"] == 1234
     assert data["mode"] == "engine"
-    assert data["path"].endswith("ttt5_engine.json")
+    assert data["backend"] == "auto"
+    assert data["path"].endswith("ttt5_builtin.json")
 
 
 def test_run_diagnostics_route(client, monkeypatch):
