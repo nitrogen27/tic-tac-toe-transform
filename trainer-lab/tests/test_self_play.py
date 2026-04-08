@@ -165,7 +165,7 @@ class TestSelfPlayPlayer:
         assert "board" in pos
         assert "policy" in pos
         assert "value" in pos
-        assert len(pos["policy"]) == 49
+        assert len(pos["policy"]) == 256  # padded to 16x16
 
 
 # ---------------------------------------------------------------------------

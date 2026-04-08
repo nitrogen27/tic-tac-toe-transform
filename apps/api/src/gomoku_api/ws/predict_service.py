@@ -943,6 +943,77 @@ def clear_cached_model(variant: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# MCTS-enhanced prediction
+# ---------------------------------------------------------------------------
+
+
+def _mcts_predict(
+    board: list[int],
+    current: int,
+    variant: str,
+    board_size: int,
+    *,
+    num_simulations: int = 50,
+) -> dict:
+    """Use MCTS + neural network for stronger move selection."""
+    import asyncio
+    from trainer_lab.self_play.player import GameState, mcts_search
+
+    win_length = 4 if board_size == 5 else (3 if board_size == 3 else 5)
+    model = _get_model(variant)
+    if model is None:
+        # Fallback to regular predict if no model
+        return _model_predict(board, current, variant, board_size)
+
+    device = next(model.parameters()).device
+
+    # Build GameState from flat board
+    state = GameState(board_size, win_length)
+    for r in range(board_size):
+        for c in range(board_size):
+            v = board[r * board_size + c]
+            if v == current:
+                state.board[r][c] = 1
+            elif v != 0:
+                state.board[r][c] = 2
+    state.current_player = 1  # encoder expects current=1
+    state.move_count = sum(1 for c in board if c != 0)
+
+    # Run MCTS
+    model.eval()
+    policy_flat, root_value = mcts_search(
+        state, model, device,
+        num_simulations=num_simulations,
+        c_puct=1.5,
+        dirichlet_alpha=0.03,
+        dirichlet_weight=0.0,  # no noise at inference
+    )
+
+    # Convert policy to probs_raw format
+    probs_raw = [0.0] * (board_size * board_size)
+    for idx, prob in enumerate(policy_flat):
+        probs_raw[idx] = prob
+
+    # Select best legal move
+    legal = [i for i, v in enumerate(board) if v == 0]
+    best_move = max(legal, key=lambda i: probs_raw[i]) if legal else -1
+    confidence = probs_raw[best_move] if best_move >= 0 else 0.0
+
+    return {
+        "move": best_move,
+        "confidence": round(confidence, 4),
+        "probs": [round(p, 6) for p in probs_raw],
+        "mode": "model",
+        "isRandom": False,
+        "fallback": False,
+        "value": round(root_value, 4),
+        "searchBacked": True,
+        "searchMode": "mcts",
+        "searchDepth": num_simulations,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -987,5 +1058,7 @@ async def predict(
             }
         else:
             return await _engine_predict(board, current, board_size, win_length)
+    elif mode == "mcts":
+        return _mcts_predict(board, current, variant, board_size, num_simulations=50)
     else:
         return _model_predict(board, current, variant, board_size, decision_mode=model_decision_mode)

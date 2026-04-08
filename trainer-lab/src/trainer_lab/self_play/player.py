@@ -18,8 +18,6 @@ from trainer_lab.models.resnet import PolicyValueResNet
 
 logger = logging.getLogger(__name__)
 
-WIN_LENGTH = 5
-
 
 # ---------------------------------------------------------------------------
 # GameState — lightweight board representation for self-play
@@ -29,10 +27,11 @@ WIN_LENGTH = 5
 class GameState:
     """Minimal board state for MCTS self-play."""
 
-    __slots__ = ("board_size", "board", "current_player", "last_move", "move_count")
+    __slots__ = ("board_size", "win_length", "board", "current_player", "last_move", "move_count")
 
-    def __init__(self, board_size: int = 15) -> None:
+    def __init__(self, board_size: int = 15, win_length: int | None = None) -> None:
         self.board_size = board_size
+        self.win_length = win_length if win_length is not None else (4 if board_size <= 5 else 5)
         self.board: list[list[int]] = [[0] * board_size for _ in range(board_size)]
         self.current_player = 1  # 1 or 2
         self.last_move: tuple[int, int] | None = None
@@ -49,6 +48,7 @@ class GameState:
         r, c = divmod(flat_idx, bs)
         new = GameState.__new__(GameState)
         new.board_size = bs
+        new.win_length = self.win_length
         new.board = [row[:] for row in self.board]
         new.board[r][c] = self.current_player
         new.current_player = 3 - self.current_player
@@ -66,22 +66,23 @@ class GameState:
         r, c = self.last_move
         player = self.board[r][c]
         bs = self.board_size
+        wl = self.win_length
 
         for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
             count = 1
-            for s in range(1, WIN_LENGTH):
+            for s in range(1, wl):
                 nr, nc = r + dr * s, c + dc * s
                 if 0 <= nr < bs and 0 <= nc < bs and self.board[nr][nc] == player:
                     count += 1
                 else:
                     break
-            for s in range(1, WIN_LENGTH):
+            for s in range(1, wl):
                 nr, nc = r - dr * s, c - dc * s
                 if 0 <= nr < bs and 0 <= nc < bs and self.board[nr][nc] == player:
                     count += 1
                 else:
                     break
-            if count >= WIN_LENGTH:
+            if count >= wl:
                 return True, player
 
         if self.move_count >= bs * bs:
@@ -254,28 +255,37 @@ class SelfPlayPlayer:
         self.model.to(self.device)
         self.model.eval()
 
-    def play_game(self, board_size: int = 15) -> list[dict]:
+    def play_game(self, board_size: int = 15, win_length: int | None = None) -> list[dict]:
         """Play a single self-play game using MCTS.
 
-        Returns list of position records:
+        Returns list of position records with 256-padded policy targets:
         ``{board_size, board, current_player, last_move, policy, value}``
         """
-        state = GameState(board_size)
+        wl = win_length if win_length is not None else (4 if board_size <= 5 else 5)
+        state = GameState(board_size, wl)
         positions: list[dict] = []
         move_count = 0
-        tau_threshold = 30
+        # Temperature exploration: proportional for first N moves, then greedy
+        tau_threshold = max(4, board_size)  # 5 for ttt5, 15 for gomoku15
 
         while True:
             terminal, winner = state.is_terminal()
             if terminal:
                 break
 
-            policy, _ = mcts_search(
+            policy_flat, _ = mcts_search(
                 state,
                 self.model,
                 self.device,
                 num_simulations=self.config.simulations,
             )
+
+            # Convert board_size^2 policy to 256-padded (16x16) format
+            policy_256 = [0.0] * 256
+            for idx, prob in enumerate(policy_flat):
+                if prob > 0:
+                    r, c = divmod(idx, board_size)
+                    policy_256[r * 16 + c] = prob
 
             # Store position before making the move
             positions.append({
@@ -283,21 +293,22 @@ class SelfPlayPlayer:
                 "board": [row[:] for row in state.board],
                 "current_player": state.current_player,
                 "last_move": list(state.last_move) if state.last_move else None,
-                "policy": policy,
+                "policy": policy_256,
                 "value": 0.0,  # filled after game ends
+                "source": "self_play",
             })
 
             # Temperature-based move selection
             if move_count < tau_threshold:
                 # Sample proportionally (tau=1)
-                total = sum(policy)
+                total = sum(policy_flat)
                 if total > 0:
-                    move = random.choices(range(len(policy)), weights=policy, k=1)[0]
+                    move = random.choices(range(len(policy_flat)), weights=policy_flat, k=1)[0]
                 else:
                     move = random.choice(state.legal_moves())
             else:
                 # Greedy (tau->0)
-                move = max(range(len(policy)), key=lambda i: policy[i])
+                move = max(range(len(policy_flat)), key=lambda i: policy_flat[i])
 
             state = state.apply_move(move)
             move_count += 1
@@ -314,12 +325,17 @@ class SelfPlayPlayer:
 
         return positions
 
-    def generate_games(self, num_games: int | None = None) -> list[dict]:
+    def generate_games(
+        self,
+        num_games: int | None = None,
+        board_size: int = 15,
+        win_length: int | None = None,
+    ) -> list[dict]:
         """Generate multiple self-play games and collect all positions."""
         n = num_games if num_games is not None else self.config.games
         all_positions: list[dict] = []
         for g in range(n):
-            positions = self.play_game()
+            positions = self.play_game(board_size=board_size, win_length=win_length)
             all_positions.extend(positions)
             if (g + 1) % max(1, n // 10) == 0:
                 logger.info("Self-play: %d/%d games (%d positions)", g + 1, n, len(all_positions))
