@@ -5,19 +5,23 @@ import random
 import pytest
 
 from gomoku_api.ws.train_service_ws import (
+    _build_pure_gap_relabel_candidate,
     _build_repair_pool,
     _build_turbo_pool,
     _build_train_pool,
     _checkpoint_selection_score,
     _choose_rapid_cycle_strategy,
     _compute_target_sanity_metrics,
+    _evaluate_decision_suite,
     _generate_engine_labeled_positions,
     _merge_failure_bank,
     _merge_position_bank,
+    _position_bank_importance,
     _generate_tactical_curriculum_positions,
     _load_offline_dataset_positions,
     _policy_cell_index,
     _resolve_engine_sampling_bounds,
+    _run_engine_exam,
     _sample_engine_position,
     _soft_policy_from_engine_hints,
     _variant_model_hparams,
@@ -258,6 +262,78 @@ def test_choose_rapid_cycle_strategy_biases_engine_generation_toward_midgame() -
     assert strategy["failureSlice"] == 384
 
 
+def test_choose_rapid_cycle_strategy_responds_to_pure_gap_on_p1() -> None:
+    strategy = _choose_rapid_cycle_strategy(
+        {
+            "frozenBlockAcc": 92.0,
+            "frozenWinAcc": 95.0,
+            "frozenMidAcc": 60.0,
+            "frozenLateAcc": 65.0,
+            "holdoutDeltaAcc": 0.0,
+        },
+        corrected_rate=0.30,
+        failure_bank_size=12,
+        engine_per_cycle=50,
+        exam_summary={
+            "winrateAsP1": 0.50,
+            "winrateAsP2": 0.75,
+            "decisiveWinRate": 0.15,
+            "drawRate": 0.45,
+            "pureGapRate": 0.35,
+            "pureGapRateAsP1": 0.40,
+            "pureGapRateAsP2": 0.10,
+        },
+    )
+
+    assert strategy["engineCurrentPlayerFocus"] == 1
+    assert strategy["conversionFocus"] is True
+    assert strategy["failureSlice"] == 384
+    assert strategy["engineCount"] > 50
+
+
+def test_choose_rapid_cycle_strategy_uses_pure_frozen_recalls() -> None:
+    strategy = _choose_rapid_cycle_strategy(
+        {
+            "frozenBlockAcc": 95.0,
+            "frozenWinAcc": 95.0,
+            "pureFrozenBlockRecall": 30.0,
+            "pureFrozenWinRecall": 85.0,
+            "frozenMidAcc": 62.0,
+            "frozenLateAcc": 66.0,
+            "holdoutDeltaAcc": 0.0,
+        },
+        corrected_rate=0.25,
+        failure_bank_size=12,
+        engine_per_cycle=50,
+    )
+
+    assert strategy["tacticalFocus"] == "block"
+    assert strategy["tacticalRatio"] >= 0.65
+    assert strategy["failureSlice"] >= 320
+
+
+def test_choose_rapid_cycle_strategy_enters_tactical_rescue_mode_on_zero_pure_win_recall() -> None:
+    strategy = _choose_rapid_cycle_strategy(
+        {
+            "frozenBlockAcc": 95.0,
+            "frozenWinAcc": 95.0,
+            "pureFrozenBlockRecall": 68.75,
+            "pureFrozenWinRecall": 0.0,
+            "frozenMidAcc": 62.0,
+            "frozenLateAcc": 66.0,
+            "holdoutDeltaAcc": 0.0,
+        },
+        corrected_rate=0.25,
+        failure_bank_size=12,
+        engine_per_cycle=50,
+    )
+
+    assert strategy["tacticalFocus"] == "win"
+    assert strategy["tacticalRatio"] >= 0.75
+    assert strategy["failureSlice"] >= 448
+    assert strategy["conversionFocus"] is True
+
+
 def test_choose_rapid_cycle_strategy_biases_conversion_and_weak_side() -> None:
     strategy = _choose_rapid_cycle_strategy(
         {
@@ -282,6 +358,186 @@ def test_choose_rapid_cycle_strategy_biases_conversion_and_weak_side() -> None:
     assert strategy["conversionFocus"] is True
     assert strategy["engineCount"] > 50
     assert strategy["tacticalRatio"] <= 0.32
+    assert strategy["playerFocusRatio"] >= 0.45
+
+
+def test_position_bank_importance_boosts_any_focused_side() -> None:
+    p1 = _position_bank_importance({"sampleWeight": 1.0, "playerFocus": 1})
+    p2 = _position_bank_importance({"sampleWeight": 1.0, "playerFocus": 2})
+    neutral = _position_bank_importance({"sampleWeight": 1.0, "playerFocus": 0})
+
+    assert p1 > neutral
+    assert p2 > neutral
+    assert p1 == pytest.approx(p2)
+
+
+def test_position_bank_importance_boosts_engine_side_and_conversion_sources() -> None:
+    base = _position_bank_importance({"sampleWeight": 1.0, "source": "engine"})
+    side_focus = _position_bank_importance({"sampleWeight": 1.0, "source": "engine_side_focus"})
+    conversion = _position_bank_importance({"sampleWeight": 1.0, "source": "engine_conversion"})
+    side_conversion = _position_bank_importance({"sampleWeight": 1.0, "source": "engine_side_conversion"})
+
+    assert side_focus > base
+    assert conversion > side_focus
+    assert side_conversion > conversion
+
+
+def test_build_turbo_pool_respects_focus_player_ratio() -> None:
+    anchor = [{"id": f"a1-{i}", "playerFocus": 1, "sampleWeight": 10.0} for i in range(30)]
+    anchor.extend({"id": f"a2-{i}", "playerFocus": 2, "sampleWeight": 1.0} for i in range(30))
+    tactical = [{"id": f"t1-{i}", "playerFocus": 1, "sampleWeight": 10.0} for i in range(12)]
+    tactical.extend({"id": f"t2-{i}", "playerFocus": 2, "sampleWeight": 1.0} for i in range(12))
+    failure = [{"id": f"f1-{i}", "playerFocus": 1, "sampleWeight": 10.0} for i in range(12)]
+    failure.extend({"id": f"f2-{i}", "playerFocus": 2, "sampleWeight": 1.0} for i in range(12))
+
+    pool = _build_turbo_pool(
+        anchor,
+        tactical,
+        failure,
+        data_count=24,
+        tactical_ratio=0.25,
+        focus_player=2,
+        focus_ratio=0.5,
+    )
+
+    focused = sum(1 for pos in pool if int(pos.get("playerFocus", 0) or 0) == 2)
+    assert focused >= 8
+
+
+def test_build_turbo_pool_reserves_side_conversion_slice() -> None:
+    anchor = [{"id": f"a1-{i}", "playerFocus": 1, "sampleWeight": 1.0} for i in range(40)]
+    anchor.extend(
+        {"id": f"ac2-{i}", "playerFocus": 2, "conversionTarget": True, "source": "engine_side_conversion", "sampleWeight": 2.0}
+        for i in range(12)
+    )
+    tactical = [{"id": f"t1-{i}", "playerFocus": 1, "sampleWeight": 1.0} for i in range(12)]
+    failure = [{"id": f"f1-{i}", "playerFocus": 1, "sampleWeight": 1.0} for i in range(12)]
+
+    pool = _build_turbo_pool(
+        anchor,
+        tactical,
+        failure,
+        data_count=24,
+        tactical_ratio=0.20,
+        focus_player=2,
+        focus_ratio=0.45,
+        focus_conversion_ratio=0.25,
+    )
+
+    focus_conversion = sum(
+        1 for pos in pool
+        if int(pos.get("playerFocus", 0) or 0) == 2 and bool(pos.get("conversionTarget"))
+    )
+    assert focus_conversion >= 4
+
+
+def test_build_turbo_pool_keeps_counter_side_conversion_slice() -> None:
+    anchor = [
+        {"id": f"a1c-{i}", "playerFocus": 1, "conversionTarget": True, "source": "engine_conversion", "sampleWeight": 1.5}
+        for i in range(12)
+    ]
+    anchor.extend(
+        {"id": f"a2c-{i}", "playerFocus": 2, "conversionTarget": True, "source": "engine_side_conversion", "sampleWeight": 2.0}
+        for i in range(12)
+    )
+    tactical = [{"id": f"t-{i}", "playerFocus": 1, "sampleWeight": 1.0} for i in range(12)]
+    failure = [{"id": f"f-{i}", "playerFocus": 2, "sampleWeight": 1.0} for i in range(12)]
+
+    pool = _build_turbo_pool(
+        anchor,
+        tactical,
+        failure,
+        data_count=24,
+        tactical_ratio=0.20,
+        focus_player=2,
+        focus_ratio=0.45,
+        focus_conversion_ratio=0.25,
+        counter_conversion_ratio=0.10,
+    )
+
+    counter_conversion = sum(
+        1 for pos in pool
+        if int(pos.get("playerFocus", 0) or 0) == 1 and bool(pos.get("conversionTarget"))
+    )
+    assert counter_conversion >= 2
+
+
+def test_build_repair_pool_respects_focus_player_ratio() -> None:
+    failure = [{"id": f"f1-{i}", "playerFocus": 1, "sampleWeight": 10.0} for i in range(40)]
+    failure.extend({"id": f"f2-{i}", "playerFocus": 2, "sampleWeight": 1.0} for i in range(40))
+    anchor = [{"id": f"a1-{i}", "playerFocus": 1, "sampleWeight": 10.0} for i in range(20)]
+    anchor.extend({"id": f"a2-{i}", "playerFocus": 2, "sampleWeight": 1.0} for i in range(20))
+    tactical = [{"id": f"t1-{i}", "playerFocus": 1, "sampleWeight": 10.0} for i in range(16)]
+    tactical.extend({"id": f"t2-{i}", "playerFocus": 2, "sampleWeight": 1.0} for i in range(16))
+
+    pool = _build_repair_pool(
+        failure,
+        anchor,
+        tactical,
+        data_count=32,
+        focus_player=2,
+        focus_ratio=0.5,
+    )
+
+    focused = sum(1 for pos in pool if int(pos.get("playerFocus", 0) or 0) == 2)
+    assert focused >= 12
+
+
+def test_build_repair_pool_reserves_side_conversion_slice() -> None:
+    failure = [{"id": f"f1-{i}", "playerFocus": 1, "sampleWeight": 1.0} for i in range(40)]
+    failure.extend(
+        {"id": f"fc2-{i}", "playerFocus": 2, "conversionTarget": True, "source": "failure_conversion", "sampleWeight": 2.0}
+        for i in range(12)
+    )
+    anchor = [{"id": f"a1-{i}", "playerFocus": 1, "sampleWeight": 1.0} for i in range(20)]
+    tactical = [{"id": f"t1-{i}", "playerFocus": 1, "sampleWeight": 1.0} for i in range(16)]
+
+    pool = _build_repair_pool(
+        failure,
+        anchor,
+        tactical,
+        data_count=32,
+        focus_player=2,
+        focus_ratio=0.5,
+        focus_conversion_ratio=0.25,
+    )
+
+    focus_conversion = sum(
+        1 for pos in pool
+        if int(pos.get("playerFocus", 0) or 0) == 2 and bool(pos.get("conversionTarget"))
+    )
+    assert focus_conversion >= 6
+
+
+def test_choose_rapid_cycle_strategy_uses_side_conversion_failures() -> None:
+    strategy = _choose_rapid_cycle_strategy(
+        {
+            "frozenBlockAcc": 94.0,
+            "frozenWinAcc": 96.0,
+            "frozenMidAcc": 61.0,
+            "frozenLateAcc": 67.0,
+            "holdoutDeltaAcc": 0.0,
+        },
+        corrected_rate=0.30,
+        failure_bank_size=24,
+        engine_per_cycle=50,
+        exam_summary={
+            "winrateAsP1": 0.50,
+            "winrateAsP2": 0.50,
+            "balancedSideWinrate": 0.10,
+            "decisiveWinRate": 0.05,
+            "drawRate": 0.50,
+            "conversionFailuresAsP1": 3,
+            "conversionFailuresAsP2": 11,
+        },
+    )
+
+    assert strategy["engineCurrentPlayerFocus"] == 2
+    assert strategy["conversionFocus"] is True
+    assert strategy["playerFocusRatio"] >= 0.55
+    assert strategy["focusConversionRatio"] >= 0.30
+    assert strategy["counterConversionRatio"] > 0.0
+    assert strategy["failureSlice"] >= 384
 
 
 @pytest.mark.asyncio
@@ -332,6 +588,88 @@ async def test_generate_engine_labeled_positions_can_focus_side_and_conversion(m
     assert all(pos["sampleWeight"] == pytest.approx(1.35) for pos in positions)
 
 
+def test_evaluate_decision_suite_collects_pure_win_failures(monkeypatch) -> None:
+    position = {
+        "board_size": 5,
+        "board": [
+            [1, 1, 1, 0, 0],
+            [2, 2, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+        ],
+        "current_player": 1,
+        "last_move": [1, 1],
+        "policy": [0.0] * 256,
+        "value": 1.0,
+        "motif": "win",
+        "sampleWeight": 1.0,
+    }
+    position["policy"][_policy_cell_index(3, 5)] = 1.0
+
+    def fake_loaded_model_decision(*args, **kwargs):
+        return {"move": 24}
+
+    monkeypatch.setattr("gomoku_api.ws.predict_service._loaded_model_decision", fake_loaded_model_decision)
+
+    metrics, failures = _evaluate_decision_suite(
+        model=None,
+        positions=[position],
+        board_size=5,
+        win_len=4,
+        decision_mode="pure",
+        suite_name="win",
+        collect_failures=True,
+    )
+
+    assert metrics["total"] == 1
+    assert metrics["correct"] == 0
+    assert failures[0]["motif"] == "pure_missed_win"
+    assert failures[0]["source"] == "failure_pure_gap"
+    assert failures[0]["pureMissedWinInOne"] is True
+
+
+def test_evaluate_decision_suite_collects_pure_block_failures(monkeypatch) -> None:
+    position = {
+        "board_size": 5,
+        "board": [
+            [2, 0, 0, 0, 0],
+            [2, 0, 0, 0, 0],
+            [2, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+        ],
+        "current_player": 1,
+        "last_move": [2, 2],
+        "policy": [0.0] * 256,
+        "value": 0.2,
+        "motif": "block",
+        "sampleWeight": 1.0,
+    }
+    position["policy"][_policy_cell_index(15, 5)] = 1.0
+
+    def fake_loaded_model_decision(*args, **kwargs):
+        return {"move": 24}
+
+    monkeypatch.setattr("gomoku_api.ws.predict_service._loaded_model_decision", fake_loaded_model_decision)
+
+    metrics, failures = _evaluate_decision_suite(
+        model=None,
+        positions=[position],
+        board_size=5,
+        win_len=4,
+        decision_mode="pure",
+        suite_name="block",
+        collect_failures=True,
+    )
+
+    assert metrics["total"] == 1
+    assert metrics["correct"] == 0
+    assert failures[0]["motif"] == "pure_missed_block"
+    assert failures[0]["source"] == "failure_pure_gap"
+    assert failures[0]["pureMissedBlockInOne"] is True
+
+
 def test_soft_policy_from_engine_hints_creates_distribution_not_one_hot() -> None:
     board = [0] * 25
     hints = [
@@ -379,6 +717,221 @@ def test_checkpoint_selection_score_uses_side_balance_as_tiebreaker() -> None:
     }
 
     assert _checkpoint_selection_score(balanced, 9) > _checkpoint_selection_score(skewed, 9)
+
+
+def test_checkpoint_selection_score_prefers_lower_pure_gap_on_equal_hybrid_strength() -> None:
+    higher_gap = {
+        "winrate": 0.75,
+        "decisiveWinRate": 0.5,
+        "drawRate": 0.25,
+        "winrateAsP1": 0.75,
+        "winrateAsP2": 0.75,
+        "pureGapRate": 0.45,
+        "pureGapRateAsP1": 0.50,
+        "pureGapRateAsP2": 0.40,
+    }
+    lower_gap = {
+        "winrate": 0.75,
+        "decisiveWinRate": 0.5,
+        "drawRate": 0.25,
+        "winrateAsP1": 0.75,
+        "winrateAsP2": 0.75,
+        "pureGapRate": 0.15,
+        "pureGapRateAsP1": 0.10,
+        "pureGapRateAsP2": 0.20,
+    }
+
+    assert _checkpoint_selection_score(lower_gap, 9) > _checkpoint_selection_score(higher_gap, 9)
+
+
+def test_build_pure_gap_relabel_candidate_captures_tactical_gap() -> None:
+    state = {
+        "board_size": 5,
+        "board": [[0] * 5 for _ in range(5)],
+        "current_player": 1,
+        "last_move": None,
+    }
+    hybrid = {
+        "move": 12,
+        "tacticalReason": "block_immediate",
+        "winningPressure": 0,
+        "forcingThreatsAfterMove": 0,
+        "searchScore": 0.0,
+        "unsafeMovesFiltered": 2,
+    }
+    pure = {
+        "move": 24,
+        "tacticalReason": "model_policy",
+        "winningPressure": 0,
+    }
+
+    candidate = _build_pure_gap_relabel_candidate(state, hybrid, pure)
+
+    assert candidate is not None
+    assert candidate["source"] == "failure_pure_gap"
+    assert candidate["motif"] == "pure_missed_block"
+    assert candidate["conversionTarget"] is False
+    assert candidate["pureMissedBlockInOne"] is True
+    assert candidate["pureMissedWinInOne"] is False
+
+
+def test_build_pure_gap_relabel_candidate_keeps_conversion_cases_high_priority() -> None:
+    state = {
+        "board_size": 5,
+        "board": [[0] * 5 for _ in range(5)],
+        "current_player": 1,
+        "last_move": None,
+    }
+    hybrid = {
+        "move": 12,
+        "tacticalReason": "press_winning_advantage",
+        "winningPressure": 3,
+        "forcingThreatsAfterMove": 2,
+        "searchScore": 1.0,
+        "unsafeMovesFiltered": 0,
+    }
+    pure = {
+        "move": 1,
+        "tacticalReason": "model_policy",
+        "winningPressure": 0,
+    }
+
+    candidate = _build_pure_gap_relabel_candidate(state, hybrid, pure)
+
+    assert candidate is not None
+    assert candidate["source"] == "failure_conversion"
+    assert candidate["motif"] == "conversion"
+    assert candidate["conversionTarget"] is True
+
+
+def test_build_pure_gap_relabel_candidate_marks_immediate_win_as_pure_missed_win() -> None:
+    state = {
+        "board_size": 5,
+        "board": [[0] * 5 for _ in range(5)],
+        "current_player": 1,
+        "last_move": None,
+    }
+    hybrid = {
+        "move": 4,
+        "tacticalReason": "immediate_win",
+        "winningPressure": 4,
+        "forcingThreatsAfterMove": 1,
+        "searchScore": 0.0,
+        "unsafeMovesFiltered": 0,
+    }
+    pure = {
+        "move": 12,
+        "tacticalReason": "model_policy",
+        "winningPressure": 0,
+    }
+
+    candidate = _build_pure_gap_relabel_candidate(state, hybrid, pure)
+
+    assert candidate is not None
+    assert candidate["source"] == "failure_conversion"
+    assert candidate["motif"] == "pure_missed_win"
+    assert candidate["conversionTarget"] is True
+    assert candidate["pureMissedWinInOne"] is True
+    assert candidate["pureMissedBlockInOne"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_engine_exam_pure_gap_side_rates_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def callback(_event: dict) -> None:
+        return None
+
+    class FakeEngine:
+        async def best_move(self, board: list[int], _current: int, _board_size: int, _win_len: int) -> int:
+            for idx, cell in enumerate(board):
+                if cell == 0:
+                    return idx
+            return -1
+
+    def fake_hybrid_decision(
+        board: list[int],
+        _board_size: int,
+        _win_len: int,
+        _current: int,
+        _model: object,
+        _device: object,
+    ) -> dict[str, object]:
+        legal = [idx for idx, cell in enumerate(board) if cell == 0]
+        return {
+            "move": legal[0],
+            "tacticalOverride": True,
+            "valueGuided": False,
+            "tacticalReason": "reject_unsafe_model_move",
+            "unsafeMovesFiltered": 1,
+        }
+
+    def fake_pure_decision(
+        board: list[int],
+        _current: int,
+        _board_size: int,
+        _win_len: int,
+        _model: object,
+        *,
+        decision_mode: str = "hybrid",
+    ) -> dict[str, object]:
+        assert decision_mode == "pure"
+        legal = [idx for idx, cell in enumerate(board) if cell == 0]
+        return {
+            "move": legal[-1],
+            "tacticalOverride": False,
+            "valueGuided": False,
+            "tacticalReason": "model_policy",
+            "unsafeMovesFiltered": 0,
+        }
+
+    monkeypatch.setattr("gomoku_api.ws.arena_eval._model_greedy_decision", fake_hybrid_decision)
+    monkeypatch.setattr("gomoku_api.ws.predict_service._loaded_model_decision", fake_pure_decision)
+
+    _result, _relabeled, summary = await _run_engine_exam(
+        model=object(),
+        board_size=3,
+        win_len=3,
+        device="cpu",
+        callback=callback,
+        engine_eval=FakeEngine(),
+        variant="ttt3",
+        cycle=1,
+        total_cycles=1,
+        num_pairs=1,
+        collect_failures=False,
+    )
+
+    assert summary["pureGapCount"] > 0
+    assert 0.0 <= summary["pureGapRate"] <= 1.0
+    assert 0.0 <= summary["pureGapRateAsP1"] <= 1.0
+    assert 0.0 <= summary["pureGapRateAsP2"] <= 1.0
+
+
+def test_choose_rapid_cycle_strategy_focuses_tactical_curriculum_on_pure_missed_wins() -> None:
+    strategy = _choose_rapid_cycle_strategy(
+        {
+            "frozenBlockAcc": 92.0,
+            "frozenWinAcc": 92.0,
+            "holdoutDeltaAcc": 0.5,
+        },
+        corrected_rate=0.10,
+        failure_bank_size=16,
+        engine_per_cycle=50,
+        exam_summary={
+            "winrateAsP1": 0.5,
+            "winrateAsP2": 0.5,
+            "decisiveWinRate": 0.10,
+            "drawRate": 0.45,
+            "pureGapRate": 0.35,
+            "pureGapRateAsP1": 0.40,
+            "pureGapRateAsP2": 0.20,
+            "pureMissedWinCount": 8,
+            "pureMissedBlockCount": 3,
+        },
+    )
+
+    assert strategy["tacticalFocus"] == "win"
+    assert strategy["tacticalRatio"] >= 0.60
+    assert strategy["conversionFocus"] is True
 
 
 def test_load_offline_dataset_positions_prefers_rapfi_dataset(tmp_path, monkeypatch) -> None:

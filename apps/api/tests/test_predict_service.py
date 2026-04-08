@@ -260,6 +260,41 @@ def test_model_predict_pure_mode_skips_hybrid_tactical_override(monkeypatch) -> 
     assert result["tacticalOverride"] is False
 
 
+def test_select_policy_value_move_prefers_policy_leader_over_value_outlier() -> None:
+    board = [0] * 25
+    probs_raw = [0.0] * 25
+    probs_raw[3] = 0.82
+    probs_raw[24] = 0.18
+
+    move, meta = predict_service._select_policy_value_move(
+        board,
+        probs_raw,
+        value_scores={3: 0.1, 24: 0.95},
+    )
+
+    assert move == 3
+    assert meta["tacticalReason"] == "model_policy"
+    assert meta["valueGuided"] is False
+
+
+def test_select_policy_value_move_uses_value_inside_top_policy_band() -> None:
+    board = [0] * 25
+    probs_raw = [0.0] * 25
+    probs_raw[3] = 0.42
+    probs_raw[4] = 0.40
+    probs_raw[24] = 0.18
+
+    move, meta = predict_service._select_policy_value_move(
+        board,
+        probs_raw,
+        value_scores={3: 0.1, 4: 0.9, 24: 1.0},
+    )
+
+    assert move == 4
+    assert meta["tacticalReason"] == "policy_value"
+    assert meta["valueGuided"] is True
+
+
 def test_model_predict_pure_mode_without_checkpoint_does_not_use_strong_tactical_fallback(monkeypatch) -> None:
     board = [
         2, 0, 0, 0, 0,

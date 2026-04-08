@@ -51,6 +51,10 @@ class ModelRegistry:
         return self.base_dir / "candidate.pt"
 
     @property
+    def working_candidate_path(self) -> Path:
+        return self.base_dir / "candidate_working.pt"
+
+    @property
     def champion_path(self) -> Path:
         return self.base_dir / "champion.pt"
 
@@ -62,14 +66,65 @@ class ModelRegistry:
     def manifest_path(self) -> Path:
         return self.base_dir / "manifest.json"
 
+    @property
+    def candidate_meta_path(self) -> Path:
+        return self.base_dir / "candidate_meta.json"
+
+    @property
+    def working_candidate_meta_path(self) -> Path:
+        return self.base_dir / "candidate_working_meta.json"
+
     # ------------------------------------------------------------------
     # Save / Load
     # ------------------------------------------------------------------
 
+    def _write_meta(self, path: Path, *, generation: int = 0, metrics: dict[str, Any] | None = None) -> None:
+        payload = {
+            "generation": generation,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            **(metrics or {}),
+        }
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _read_meta(self, path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+
     def save_candidate(self, model: nn.Module, *, generation: int = 0, metrics: dict[str, Any] | None = None) -> None:
-        """Save model state_dict as candidate checkpoint."""
+        """Save model state_dict as active candidate checkpoint."""
         torch.save(model.state_dict(), self.candidate_path)
-        logger.info("Saved candidate checkpoint: %s (gen %d)", self.candidate_path, generation)
+        self._write_meta(self.candidate_meta_path, generation=generation, metrics=metrics)
+        logger.info("Saved active candidate checkpoint: %s (gen %d)", self.candidate_path, generation)
+
+    def save_working_candidate(self, model: nn.Module, *, generation: int = 0, metrics: dict[str, Any] | None = None) -> None:
+        """Save model state_dict as working checkpoint for the current run only."""
+        torch.save(model.state_dict(), self.working_candidate_path)
+        self._write_meta(self.working_candidate_meta_path, generation=generation, metrics=metrics)
+        logger.info("Saved working candidate checkpoint: %s (gen %d)", self.working_candidate_path, generation)
+
+    def read_candidate_meta(self) -> dict[str, Any] | None:
+        return self._read_meta(self.candidate_meta_path)
+
+    def read_working_candidate_meta(self) -> dict[str, Any] | None:
+        return self._read_meta(self.working_candidate_meta_path)
+
+    def commit_working_candidate(self, *, generation: int = 0, metrics: dict[str, Any] | None = None) -> None:
+        """Commit working checkpoint to active candidate without touching champion."""
+        if not self.working_candidate_path.exists():
+            raise FileNotFoundError(f"No working candidate to commit: {self.working_candidate_path}")
+        tmp_path = self.base_dir / "candidate.pt.tmp"
+        try:
+            shutil.copy2(self.working_candidate_path, tmp_path)
+            tmp_path.replace(self.candidate_path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        self._write_meta(self.candidate_meta_path, generation=generation, metrics=metrics)
+        logger.info("Committed working candidate → active candidate (gen %d)", generation)
 
     def load_into(self, model: nn.Module, path: Path, device: torch.device) -> nn.Module:
         """Load state_dict from *path* into *model* and move to *device*."""
@@ -91,11 +146,21 @@ class ModelRegistry:
     def has_champion(self) -> bool:
         return self.champion_path.exists() or self.legacy_path.exists()
 
+    def has_active_candidate(self) -> bool:
+        return self.candidate_path.exists()
+
     # ------------------------------------------------------------------
     # Promotion
     # ------------------------------------------------------------------
 
-    def promote_candidate(self, *, generation: int = 0, metrics: dict[str, Any] | None = None, reason: str = "passed_promotion_gate") -> None:
+    def promote_candidate(
+        self,
+        *,
+        generation: int = 0,
+        metrics: dict[str, Any] | None = None,
+        reason: str = "passed_promotion_gate",
+        source_path: Path | None = None,
+    ) -> None:
         """Atomic promotion: candidate → champion (+ legacy model.pt sync).
 
         Uses temp file + os.replace for crash safety: if the process dies
@@ -103,13 +168,24 @@ class ModelRegistry:
 
         Also appends an entry to manifest.json.
         """
-        if not self.candidate_path.exists():
-            raise FileNotFoundError(f"No candidate to promote: {self.candidate_path}")
+        promote_source = source_path or self.candidate_path
+        if not promote_source.exists():
+            raise FileNotFoundError(f"No candidate to promote: {promote_source}")
+
+        # 0. Sync active candidate to the promoted source first.
+        tmp_candidate = self.base_dir / "candidate.pt.tmp"
+        try:
+            shutil.copy2(promote_source, tmp_candidate)
+            tmp_candidate.replace(self.candidate_path)
+        except BaseException:
+            tmp_candidate.unlink(missing_ok=True)
+            raise
+        self._write_meta(self.candidate_meta_path, generation=generation, metrics=metrics)
 
         # 1. Copy candidate → champion (crash-safe: copy to tmp, then rename)
         tmp_path = self.base_dir / "champion.pt.tmp"
         try:
-            shutil.copy2(self.candidate_path, tmp_path)
+            shutil.copy2(promote_source, tmp_path)
             tmp_path.replace(self.champion_path)
         except BaseException:
             tmp_path.unlink(missing_ok=True)

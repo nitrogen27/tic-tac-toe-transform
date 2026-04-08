@@ -80,8 +80,74 @@ def _checkpoint_selection_score(summary: dict[str, Any], cycle: int) -> tuple[fl
     winrate_as_p1 = float(summary.get("winrateAsP1", winrate) or winrate)
     winrate_as_p2 = float(summary.get("winrateAsP2", winrate) or winrate)
     balanced_side = min(winrate_as_p1, winrate_as_p2)
+    pure_gap_rate = float(summary.get("pureGapRate", 1.0) or 0.0)
+    pure_gap_rate_as_p1 = float(summary.get("pureGapRateAsP1", pure_gap_rate) or 0.0)
+    pure_gap_rate_as_p2 = float(summary.get("pureGapRateAsP2", pure_gap_rate) or 0.0)
+    pure_alignment = 1.0 - pure_gap_rate
+    balanced_pure_alignment = min(1.0 - pure_gap_rate_as_p1, 1.0 - pure_gap_rate_as_p2)
     draw_rate = float(summary.get("drawRate", 0.0) or 0.0)
-    return (decisive, winrate, balanced_side, -draw_rate, int(cycle))
+    return (decisive, winrate, balanced_side, balanced_pure_alignment, pure_alignment, -draw_rate, int(cycle))
+
+
+def _latest_train_done_payload(variant: str) -> dict[str, Any] | None:
+    log_dir = SAVED_DIR / "training_logs" / variant
+    if not log_dir.exists():
+        return None
+    logs = sorted(log_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in logs:
+        try:
+            for raw in reversed(path.read_text(encoding="utf-8").splitlines()):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                obj = json.loads(raw)
+                if obj.get("event") == "train.done":
+                    return obj.get("payload") or {}
+        except Exception:
+            continue
+    return None
+
+
+def _candidate_summary_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not metrics:
+        return None
+    if metrics.get("selectedCheckpointWinrate") is not None:
+        return {
+            "winrate": metrics.get("selectedCheckpointWinrate"),
+            "decisiveWinRate": metrics.get("selectedCheckpointDecisiveWinRate", metrics.get("confirmDecisiveWinRate")),
+            "drawRate": metrics.get("selectedCheckpointDrawRate", metrics.get("confirmDrawRate")),
+            "winrateAsP1": metrics.get("selectedCheckpointWinrateAsP1"),
+            "winrateAsP2": metrics.get("selectedCheckpointWinrateAsP2"),
+            "balancedSideWinrate": metrics.get("selectedCheckpointBalancedSideWinrate"),
+            "pureGapRate": metrics.get("selectedCheckpointPureGapRate", metrics.get("confirmPureGapRate")),
+            "pureGapRateAsP1": metrics.get("selectedCheckpointPureGapRateAsP1"),
+            "pureGapRateAsP2": metrics.get("selectedCheckpointPureGapRateAsP2"),
+            "cycle": metrics.get("selectedCheckpointCycle", 0),
+        }
+    if metrics.get("winrateVsAlgorithm") is not None:
+        return {
+            "winrate": metrics.get("winrateVsAlgorithm"),
+            "decisiveWinRate": metrics.get("confirmDecisiveWinRate", metrics.get("decisiveWinRate")),
+            "drawRate": metrics.get("confirmDrawRate", metrics.get("drawRate")),
+            "winrateAsP1": metrics.get("confirmWinrateAsP1", metrics.get("winrateAsP1")),
+            "winrateAsP2": metrics.get("confirmWinrateAsP2", metrics.get("winrateAsP2")),
+            "balancedSideWinrate": metrics.get("confirmBalancedSideWinrate", metrics.get("balancedSideWinrate")),
+            "pureGapRate": metrics.get("confirmPureGapRate", metrics.get("pureGapRate")),
+            "pureGapRateAsP1": metrics.get("confirmPureGapRateAsP1", metrics.get("pureGapRateAsP1")),
+            "pureGapRateAsP2": metrics.get("confirmPureGapRateAsP2", metrics.get("pureGapRateAsP2")),
+            "cycle": metrics.get("selectedCheckpointCycle", 0),
+        }
+    return None
+
+
+def _read_active_candidate_summary(registry: Any, variant: str) -> dict[str, Any] | None:
+    meta = registry.read_candidate_meta()
+    summary = _candidate_summary_from_metrics(meta)
+    if summary is not None:
+        return summary
+    if registry.has_active_candidate() and not registry.has_champion():
+        return _candidate_summary_from_metrics(_latest_train_done_payload(variant))
+    return None
 
 
 def _variant_model_hparams(board_size: int, cfg: Any, *, variant: str = "", model_profile: str | None = None, manifest: dict[str, Any] | None = None) -> tuple[str, tuple[int, int, int]]:
@@ -532,19 +598,29 @@ def _position_bank_importance(position: dict[str, Any]) -> float:
         importance += 0.35
     elif source == "failure_conversion":
         importance += 0.55
+    elif source == "failure_pure_gap":
+        importance += 0.45
     elif source == "user_mistake":
         importance += 0.45
     elif source == "user_conversion":
         importance += 0.40
     elif source == "user_game":
         importance += 0.15
+    elif source == "engine_conversion":
+        importance += 0.35
+    elif source == "engine_side_conversion":
+        importance += 0.45
+    elif source == "engine_side_focus":
+        importance += 0.28
     elif source == "engine":
         importance += 0.20
-    if motif in {"block", "win"}:
+    if motif in {"pure_missed_win", "pure_missed_block"}:
+        importance += 0.45
+    elif motif in {"block", "win"}:
         importance += 0.20
     elif motif == "conversion" or bool(position.get("conversionTarget")):
         importance += 0.35
-    if int(position.get("playerFocus", 0) or 0) == 1:
+    if int(position.get("playerFocus", 0) or 0) in (1, 2):
         importance += 0.12
     return importance
 
@@ -585,15 +661,29 @@ def _merge_position_records(existing: dict[str, Any], incoming: dict[str, Any]) 
         merged["source"] = "engine"
     elif existing.get("source") == "failure_conversion" or incoming.get("source") == "failure_conversion":
         merged["source"] = "failure_conversion"
-    if existing.get("motif") == "conversion" or incoming.get("motif") == "conversion":
-        merged["motif"] = "conversion"
+    elif existing.get("source") == "failure_pure_gap" or incoming.get("source") == "failure_pure_gap":
+        merged["source"] = "failure_pure_gap"
+    motif_priority = {
+        "pure_missed_win": 4,
+        "pure_missed_block": 3,
+        "conversion": 2,
+        "pure_gap": 1,
+    }
+    existing_motif = str(existing.get("motif", "") or "")
+    incoming_motif = str(incoming.get("motif", "") or "")
+    merged_motif = max(
+        (existing_motif, incoming_motif),
+        key=lambda motif: motif_priority.get(motif, 0),
+    )
+    if motif_priority.get(merged_motif, 0) > 0:
+        merged["motif"] = merged_motif
     if bool(existing.get("conversionTarget")) or bool(incoming.get("conversionTarget")):
         merged["conversionTarget"] = True
     merged["playerFocus"] = int(incoming.get("playerFocus", existing.get("playerFocus", 0)) or 0)
     return merged
 
 
-def _build_conversion_relabel_candidate(
+def _build_pure_gap_relabel_candidate(
     state: dict[str, Any],
     hybrid_decision: dict[str, Any],
     pure_decision: dict[str, Any],
@@ -607,6 +697,7 @@ def _build_conversion_relabel_candidate(
     hybrid_pressure = int(hybrid_decision.get("winningPressure", 0) or 0)
     hybrid_forcing = int(hybrid_decision.get("forcingThreatsAfterMove", 0) or 0)
     hybrid_search_score = float(hybrid_decision.get("searchScore", 0.0) or 0.0)
+    hybrid_unsafe_filtered = int(hybrid_decision.get("unsafeMovesFiltered", 0) or 0)
     pure_reason = str(pure_decision.get("tacticalReason", "") or "")
     pure_pressure = int(pure_decision.get("winningPressure", 0) or 0)
 
@@ -616,22 +707,56 @@ def _build_conversion_relabel_candidate(
         or hybrid_forcing >= 2
         or hybrid_search_score > 0.0
     )
+    hybrid_is_tactical = hybrid_reason in {
+        "immediate_win",
+        "block_immediate",
+        "reject_unsafe_model_move",
+        "search_exact_hold",
+        "search_exact_draw",
+        "search_exact_survival",
+        "least_bad_move",
+    } or hybrid_unsafe_filtered > 0
     pure_is_quiet = pure_reason in {"model_policy", "policy_value"} and pure_pressure <= hybrid_pressure
-    if not hybrid_is_conversion or not pure_is_quiet:
+    pure_gap = hybrid_move != pure_move and (pure_is_quiet or pure_reason != hybrid_reason)
+    if not pure_gap or not (hybrid_is_conversion or hybrid_is_tactical):
         return None
 
     current_player = int(state.get("current_player", 0) or 0)
-    sample_weight = 1.85 if current_player == 1 else 1.45
+    motif = "conversion"
+    source = "failure_conversion"
+    conversion_target = True
+    if hybrid_reason == "immediate_win":
+        motif = "pure_missed_win"
+        source = "failure_conversion"
+        conversion_target = True
+        sample_weight = 2.35
+    elif hybrid_reason == "block_immediate":
+        motif = "pure_missed_block"
+        source = "failure_pure_gap"
+        conversion_target = False
+        sample_weight = 2.10
+    elif hybrid_is_conversion:
+        source = "failure_conversion"
+        motif = "conversion"
+        conversion_target = True
+        sample_weight = 1.85
+    else:
+        source = "failure_pure_gap"
+        motif = "pure_gap"
+        conversion_target = False
+        sample_weight = 1.70
     enriched = dict(state)
-    enriched["source"] = "failure_conversion"
-    enriched["motif"] = "conversion"
+    enriched["source"] = source
+    enriched["motif"] = motif
     enriched["sampleWeight"] = sample_weight
     enriched["playerFocus"] = current_player
-    enriched["conversionTarget"] = True
+    enriched["conversionTarget"] = conversion_target
     enriched["hybridMove"] = hybrid_move
     enriched["pureMove"] = pure_move
     enriched["hybridReason"] = hybrid_reason
     enriched["pureReason"] = pure_reason
+    enriched["pureMissedWinInOne"] = motif == "pure_missed_win"
+    enriched["pureMissedBlockInOne"] = motif == "pure_missed_block"
     return enriched
 
 
@@ -800,6 +925,88 @@ def _sample_positions(positions: list[dict[str, Any]], count: int) -> list[dict[
     return [positions[idx] for idx in picks]
 
 
+def _position_focus_side(position: dict[str, Any]) -> int:
+    focus = int(position.get("playerFocus", 0) or 0)
+    if focus in (1, 2):
+        return focus
+    current = int(position.get("current_player", 0) or 0)
+    if current in (1, 2):
+        return current
+    return 0
+
+
+def _sample_positions_balanced(
+    positions: list[dict[str, Any]],
+    count: int,
+    *,
+    focus_player: int | None = None,
+    focus_ratio: float = 0.0,
+) -> list[dict[str, Any]]:
+    if count <= 0 or not positions:
+        return []
+    if focus_player not in (1, 2) or focus_ratio <= 0.0:
+        return _sample_positions(positions, count)
+
+    clamped_ratio = max(0.0, min(float(focus_ratio), 1.0))
+    focus_positions = [pos for pos in positions if _position_focus_side(pos) == int(focus_player)]
+    if not focus_positions:
+        return _sample_positions(positions, count)
+
+    focus_quota = min(len(focus_positions), max(int(round(count * clamped_ratio)), 0))
+    focused = _sample_positions(focus_positions, focus_quota) if focus_quota > 0 else []
+    if len(focused) >= count:
+        return focused[:count]
+
+    focused_ids = {id(pos) for pos in focused}
+    remaining_positions = [pos for pos in positions if id(pos) not in focused_ids]
+    remaining_needed = count - len(focused)
+    remainder = _sample_positions(remaining_positions, remaining_needed) if remaining_positions else []
+    combined = focused + remainder
+    if len(combined) < count:
+        combined.extend(_sample_positions(positions, min(count - len(combined), len(positions))))
+    return combined[:count]
+
+
+def _is_conversion_training_position(position: dict[str, Any]) -> bool:
+    source = str(position.get("source", "") or "")
+    motif = str(position.get("motif", "") or "")
+    return (
+        bool(position.get("conversionTarget"))
+        or source in {"failure_conversion", "engine_conversion", "engine_side_conversion", "user_conversion"}
+        or motif in {"conversion", "pure_missed_win"}
+    )
+
+
+def _sample_focus_conversion_positions(
+    positions: list[dict[str, Any]],
+    count: int,
+    *,
+    focus_player: int | None = None,
+) -> list[dict[str, Any]]:
+    if count <= 0 or not positions or focus_player not in (1, 2):
+        return []
+    candidates = [
+        pos
+        for pos in positions
+        if _position_focus_side(pos) == int(focus_player) and _is_conversion_training_position(pos)
+    ]
+    if not candidates:
+        return []
+    return _sample_positions(candidates, count)
+
+
+def _sample_counter_conversion_positions(
+    positions: list[dict[str, Any]],
+    count: int,
+    *,
+    focus_player: int | None = None,
+) -> list[dict[str, Any]]:
+    if focus_player not in (1, 2):
+        return []
+    counter_player = 1 if int(focus_player) == 2 else 2
+    return _sample_focus_conversion_positions(positions, count, focus_player=counter_player)
+
+
 def _merge_failure_bank(
     existing: list[dict[str, Any]],
     incoming: list[dict[str, Any]],
@@ -818,38 +1025,64 @@ def _build_repair_pool(
     user_corpus_positions: list[dict[str, Any]] | None = None,
     *,
     data_count: int,
+    focus_player: int | None = None,
+    focus_ratio: float = 0.0,
+    focus_conversion_ratio: float = 0.0,
+    counter_conversion_ratio: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Prioritize recent mistakes while keeping anchor/tactical stability."""
     if data_count <= 0:
         return []
 
     user_corpus_positions = list(user_corpus_positions or [])
+    pool: list[dict[str, Any]] = []
+    if focus_player in (1, 2) and focus_conversion_ratio > 0.0:
+        conversion_quota = max(int(round(data_count * max(0.0, min(float(focus_conversion_ratio), 1.0)))), 0)
+        conversion_sources = failure_bank + anchor_positions + user_corpus_positions
+        pool.extend(
+            _sample_focus_conversion_positions(
+                conversion_sources,
+                conversion_quota,
+                focus_player=focus_player,
+            )
+        )
+    if focus_player in (1, 2) and counter_conversion_ratio > 0.0:
+        counter_quota = max(int(round(data_count * max(0.0, min(float(counter_conversion_ratio), 1.0)))), 0)
+        conversion_sources = failure_bank + anchor_positions + user_corpus_positions
+        pool.extend(
+            _sample_counter_conversion_positions(
+                conversion_sources,
+                counter_quota,
+                focus_player=focus_player,
+            )
+        )
+
+    remaining_count = max(data_count - len(pool), 0)
     if user_corpus_positions:
-        fail_quota = min(len(failure_bank), max(int(data_count * 0.55), 0))
-        anchor_quota = min(len(anchor_positions), max(int(data_count * 0.20), 0))
-        tactical_quota = min(len(tactical_positions), max(int(data_count * 0.10), 0))
-        user_quota = min(len(user_corpus_positions), max(data_count - fail_quota - anchor_quota - tactical_quota, 0))
+        fail_quota = min(len(failure_bank), max(int(remaining_count * 0.55), 0))
+        anchor_quota = min(len(anchor_positions), max(int(remaining_count * 0.20), 0))
+        tactical_quota = min(len(tactical_positions), max(int(remaining_count * 0.10), 0))
+        user_quota = min(len(user_corpus_positions), max(remaining_count - fail_quota - anchor_quota - tactical_quota, 0))
     else:
-        fail_quota = min(len(failure_bank), max(int(data_count * 0.65), 0))
-        anchor_quota = min(len(anchor_positions), max(int(data_count * 0.25), 0))
-        tactical_quota = min(len(tactical_positions), max(data_count - fail_quota - anchor_quota, 0))
+        fail_quota = min(len(failure_bank), max(int(remaining_count * 0.65), 0))
+        anchor_quota = min(len(anchor_positions), max(int(remaining_count * 0.25), 0))
+        tactical_quota = min(len(tactical_positions), max(remaining_count - fail_quota - anchor_quota, 0))
         user_quota = 0
 
-    pool: list[dict[str, Any]] = []
     if fail_quota > 0:
-        pool.extend(_sample_positions(failure_bank, fail_quota))
+        pool.extend(_sample_positions_balanced(failure_bank, fail_quota, focus_player=focus_player, focus_ratio=focus_ratio))
     if anchor_quota > 0:
-        pool.extend(_sample_positions(anchor_positions, anchor_quota))
+        pool.extend(_sample_positions_balanced(anchor_positions, anchor_quota, focus_player=focus_player, focus_ratio=focus_ratio))
     if tactical_quota > 0:
-        pool.extend(_sample_positions(tactical_positions, tactical_quota))
+        pool.extend(_sample_positions_balanced(tactical_positions, tactical_quota, focus_player=focus_player, focus_ratio=focus_ratio))
     if user_quota > 0:
-        pool.extend(_sample_positions(user_corpus_positions, user_quota))
+        pool.extend(_sample_positions_balanced(user_corpus_positions, user_quota, focus_player=focus_player, focus_ratio=focus_ratio))
 
     if len(pool) < data_count:
         leftovers = failure_bank + anchor_positions + tactical_positions + user_corpus_positions
         needed = min(data_count - len(pool), len(leftovers))
         if needed > 0:
-            pool.extend(_sample_positions(leftovers, needed))
+            pool.extend(_sample_positions_balanced(leftovers, needed, focus_player=focus_player, focus_ratio=focus_ratio))
 
     random.shuffle(pool)
     return pool[:data_count]
@@ -863,35 +1096,61 @@ def _build_turbo_pool(
     *,
     data_count: int,
     tactical_ratio: float = 0.20,
+    focus_player: int | None = None,
+    focus_ratio: float = 0.0,
+    focus_conversion_ratio: float = 0.0,
+    counter_conversion_ratio: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Anchor-heavy pool for high-throughput short training bursts."""
     if data_count <= 0:
         return []
 
     user_corpus_positions = list(user_corpus_positions or [])
+    pool: list[dict[str, Any]] = []
+    if focus_player in (1, 2) and focus_conversion_ratio > 0.0:
+        conversion_quota = max(int(round(data_count * max(0.0, min(float(focus_conversion_ratio), 1.0)))), 0)
+        conversion_sources = anchor_positions + failure_bank + user_corpus_positions
+        pool.extend(
+            _sample_focus_conversion_positions(
+                conversion_sources,
+                conversion_quota,
+                focus_player=focus_player,
+            )
+        )
+    if focus_player in (1, 2) and counter_conversion_ratio > 0.0:
+        counter_quota = max(int(round(data_count * max(0.0, min(float(counter_conversion_ratio), 1.0)))), 0)
+        conversion_sources = anchor_positions + failure_bank + user_corpus_positions
+        pool.extend(
+            _sample_counter_conversion_positions(
+                conversion_sources,
+                counter_quota,
+                focus_player=focus_player,
+            )
+        )
+
+    remaining_count = max(data_count - len(pool), 0)
     user_ratio = 0.10 if user_corpus_positions else 0.0
     failure_ratio = 0.10 if user_corpus_positions else 0.20
     anchor_ratio = max(0.10, 1.0 - tactical_ratio - failure_ratio - user_ratio)
-    anchor_quota = min(len(anchor_positions), max(int(data_count * anchor_ratio), 0))
-    tactical_quota = min(len(tactical_positions), max(int(data_count * tactical_ratio), 0))
-    failure_quota = min(len(failure_bank), max(int(data_count * failure_ratio), 0))
-    user_quota = min(len(user_corpus_positions), max(data_count - anchor_quota - tactical_quota - failure_quota, 0))
+    anchor_quota = min(len(anchor_positions), max(int(remaining_count * anchor_ratio), 0))
+    tactical_quota = min(len(tactical_positions), max(int(remaining_count * tactical_ratio), 0))
+    failure_quota = min(len(failure_bank), max(int(remaining_count * failure_ratio), 0))
+    user_quota = min(len(user_corpus_positions), max(remaining_count - anchor_quota - tactical_quota - failure_quota, 0))
 
-    pool: list[dict[str, Any]] = []
     if anchor_quota > 0:
-        pool.extend(_sample_positions(anchor_positions, anchor_quota))
+        pool.extend(_sample_positions_balanced(anchor_positions, anchor_quota, focus_player=focus_player, focus_ratio=focus_ratio))
     if tactical_quota > 0:
-        pool.extend(_sample_positions(tactical_positions, tactical_quota))
+        pool.extend(_sample_positions_balanced(tactical_positions, tactical_quota, focus_player=focus_player, focus_ratio=focus_ratio))
     if failure_quota > 0:
-        pool.extend(_sample_positions(failure_bank, failure_quota))
+        pool.extend(_sample_positions_balanced(failure_bank, failure_quota, focus_player=focus_player, focus_ratio=focus_ratio))
     if user_quota > 0:
-        pool.extend(_sample_positions(user_corpus_positions, user_quota))
+        pool.extend(_sample_positions_balanced(user_corpus_positions, user_quota, focus_player=focus_player, focus_ratio=focus_ratio))
 
     if len(pool) < data_count:
         leftovers = anchor_positions + tactical_positions + failure_bank + user_corpus_positions
         needed = min(data_count - len(pool), len(leftovers))
         if needed > 0:
-            pool.extend(_sample_positions(leftovers, needed))
+            pool.extend(_sample_positions_balanced(leftovers, needed, focus_player=focus_player, focus_ratio=focus_ratio))
 
     random.shuffle(pool)
     return pool[:data_count]
@@ -912,6 +1171,9 @@ def _choose_rapid_cycle_strategy(
         "engineFocus": None,
         "engineCount": engine_per_cycle,
         "engineCurrentPlayerFocus": None,
+        "playerFocusRatio": 0.0,
+        "focusConversionRatio": 0.0,
+        "counterConversionRatio": 0.0,
         "conversionFocus": False,
         "weakestFrozenSuite": None,
         "midLateGap": None,
@@ -921,6 +1183,8 @@ def _choose_rapid_cycle_strategy(
     win_bench = validation_payload.get("frozenWinAcc")
     mid_bench = validation_payload.get("frozenMidAcc")
     late_bench = validation_payload.get("frozenLateAcc")
+    pure_block_recall = validation_payload.get("pureFrozenBlockRecall")
+    pure_win_recall = validation_payload.get("pureFrozenWinRecall")
     holdout_delta = float(validation_payload.get("holdoutDeltaAcc", 0.0) or 0.0)
 
     suites = [
@@ -944,6 +1208,26 @@ def _choose_rapid_cycle_strategy(
         elif float(win_bench) + 6.0 < float(block_bench):
             strategy["tacticalFocus"] = "win"
             strategy["tacticalRatio"] = 0.55
+
+    if pure_block_recall is not None and pure_win_recall is not None:
+        if float(pure_block_recall) + 6.0 < float(pure_win_recall):
+            strategy["tacticalFocus"] = "block"
+            strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.65)
+            strategy["failureSlice"] = max(int(strategy["failureSlice"]), 320)
+        elif float(pure_win_recall) + 6.0 < float(pure_block_recall):
+            strategy["tacticalFocus"] = "win"
+            strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.65)
+            strategy["failureSlice"] = max(int(strategy["failureSlice"]), 320)
+            strategy["conversionFocus"] = True
+        if float(pure_win_recall) < 20.0:
+            strategy["tacticalFocus"] = "win"
+            strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.75)
+            strategy["failureSlice"] = max(int(strategy["failureSlice"]), 448)
+            strategy["conversionFocus"] = True
+        if float(pure_block_recall) < 20.0:
+            strategy["tacticalFocus"] = "block"
+            strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.75)
+            strategy["failureSlice"] = max(int(strategy["failureSlice"]), 448)
 
     # Midgame conversion is the current bottleneck once tactical suites are strong.
     if mid_bench is not None and (late_bench is None or float(mid_bench) + 8.0 < float(late_bench)):
@@ -970,9 +1254,26 @@ def _choose_rapid_cycle_strategy(
         winrate_as_p2 = float(exam_summary.get("winrateAsP2", 0.0) or 0.0)
         decisive_winrate = float(exam_summary.get("decisiveWinRate", 0.0) or 0.0)
         draw_rate = float(exam_summary.get("drawRate", 0.0) or 0.0)
+        pure_gap_rate = float(exam_summary.get("pureGapRate", 0.0) or 0.0)
+        pure_gap_rate_as_p1 = float(exam_summary.get("pureGapRateAsP1", 0.0) or 0.0)
+        pure_gap_rate_as_p2 = float(exam_summary.get("pureGapRateAsP2", 0.0) or 0.0)
+        conversion_failures_as_p1 = int(exam_summary.get("conversionFailuresAsP1", 0) or 0)
+        conversion_failures_as_p2 = int(exam_summary.get("conversionFailuresAsP2", 0) or 0)
+        pure_missed_win_count = int(exam_summary.get("pureMissedWinCount", 0) or 0)
+        pure_missed_block_count = int(exam_summary.get("pureMissedBlockCount", 0) or 0)
+        balanced_side = float(exam_summary.get("balancedSideWinrate", min(winrate_as_p1, winrate_as_p2)) or 0.0)
 
         if abs(winrate_as_p1 - winrate_as_p2) >= 0.10:
             strategy["engineCurrentPlayerFocus"] = 1 if winrate_as_p1 < winrate_as_p2 else 2
+            side_gap = abs(winrate_as_p1 - winrate_as_p2)
+            if side_gap >= 0.50:
+                strategy["playerFocusRatio"] = max(float(strategy["playerFocusRatio"]), 0.60)
+                strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.18)
+            elif side_gap >= 0.25:
+                strategy["playerFocusRatio"] = max(float(strategy["playerFocusRatio"]), 0.45)
+                strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.12)
+            else:
+                strategy["playerFocusRatio"] = max(float(strategy["playerFocusRatio"]), 0.30)
             strategy["engineCount"] = min(144, max(int(strategy["engineCount"]), engine_per_cycle + 12))
 
         if decisive_winrate < 0.20 or draw_rate > 0.40:
@@ -981,6 +1282,59 @@ def _choose_rapid_cycle_strategy(
             strategy["tacticalRatio"] = min(float(strategy["tacticalRatio"]), 0.32)
             if strategy["engineFocus"] is None:
                 strategy["engineFocus"] = "mid"
+            if strategy["engineCurrentPlayerFocus"] in (1, 2):
+                strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.18)
+        if balanced_side < 0.25:
+            strategy["conversionFocus"] = True
+            strategy["failureSlice"] = max(int(strategy["failureSlice"]), 384)
+            if strategy["engineFocus"] is None:
+                strategy["engineFocus"] = "mid"
+            strategy["engineCount"] = min(160, max(int(strategy["engineCount"]), engine_per_cycle + 24))
+            if strategy["engineCurrentPlayerFocus"] in (1, 2):
+                strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.24)
+
+        if pure_gap_rate > 0.25:
+            strategy["failureSlice"] = 384
+            strategy["engineCount"] = min(160, max(int(strategy["engineCount"]), engine_per_cycle + 16))
+        if pure_gap_rate_as_p1 > pure_gap_rate_as_p2 + 0.05:
+            strategy["engineCurrentPlayerFocus"] = 1
+            strategy["conversionFocus"] = True
+            strategy["playerFocusRatio"] = max(float(strategy["playerFocusRatio"]), 0.45)
+            strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.18)
+        elif pure_gap_rate_as_p2 > pure_gap_rate_as_p1 + 0.05:
+            strategy["engineCurrentPlayerFocus"] = 2
+            strategy["conversionFocus"] = True
+            strategy["playerFocusRatio"] = max(float(strategy["playerFocusRatio"]), 0.45)
+            strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.18)
+        if pure_missed_win_count >= 6 or pure_missed_block_count >= 6:
+            strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.60)
+            if pure_missed_win_count >= pure_missed_block_count:
+                strategy["tacticalFocus"] = "win"
+            else:
+                strategy["tacticalFocus"] = "block"
+            strategy["failureSlice"] = 384
+        if pure_missed_win_count >= 8:
+            strategy["conversionFocus"] = True
+            if strategy["engineFocus"] is None:
+                strategy["engineFocus"] = "mid"
+            if strategy["engineCurrentPlayerFocus"] in (1, 2):
+                strategy["playerFocusRatio"] = max(float(strategy["playerFocusRatio"]), 0.50)
+                strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.22)
+        if abs(conversion_failures_as_p1 - conversion_failures_as_p2) >= 4:
+            weaker_side = 1 if conversion_failures_as_p1 > conversion_failures_as_p2 else 2
+            strategy["engineCurrentPlayerFocus"] = weaker_side
+            strategy["conversionFocus"] = True
+            strategy["playerFocusRatio"] = max(float(strategy["playerFocusRatio"]), 0.55)
+            strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.30)
+            strategy["failureSlice"] = max(int(strategy["failureSlice"]), 384)
+            if strategy["engineFocus"] is None:
+                strategy["engineFocus"] = "mid"
+
+        if strategy["engineCurrentPlayerFocus"] in (1, 2) and float(strategy["focusConversionRatio"]) > 0.0:
+            strategy["counterConversionRatio"] = max(
+                float(strategy["counterConversionRatio"]),
+                min(float(strategy["focusConversionRatio"]) * 0.45, 0.12),
+            )
 
     if corrected_rate < 0.20 and failure_bank_size > 8:
         strategy["failureSlice"] = 384
@@ -1375,11 +1729,26 @@ async def _run_engine_exam(
     decision_reason_counts: dict[str, int] = {}
     conversion_failure_count = 0
     conversion_failure_side_counts: dict[int, int] = {1: 0, 2: 0}
+    pure_gap_count = 0
+    pure_gap_side_counts: dict[int, int] = {1: 0, 2: 0}
+    candidate_move_side_counts: dict[int, int] = {1: 0, 2: 0}
+    pure_tactical_gap_count = 0
+    pure_conversion_gap_count = 0
+    pure_missed_win_count = 0
+    pure_missed_block_count = 0
+    pure_missed_win_side_counts: dict[int, int] = {1: 0, 2: 0}
+    pure_missed_block_side_counts: dict[int, int] = {1: 0, 2: 0}
 
     def _side_rate(side: int, numerator: str, *, draw_weight: float = 0.0) -> float:
         bucket = side_stats[side]
         total = max(bucket["total"], 1)
         return (bucket[numerator] + draw_weight * bucket["draws"]) / total
+
+    def _pure_gap_rate(side: int | None = None) -> float:
+        if side is None:
+            return pure_gap_count / max(candidate_move_count, 1)
+        side_total = max(candidate_move_side_counts.get(side, 0), 1)
+        return pure_gap_side_counts.get(side, 0) / side_total
 
     for pair in range(num_pairs):
         for candidate_side in (1, 2):
@@ -1413,12 +1782,27 @@ async def _run_engine_exam(
                         model,
                         decision_mode="pure",
                     )
-                    conversion_candidate = _build_conversion_relabel_candidate(candidate_state, decision, pure_decision)
-                    if conversion_candidate is not None:
-                        raw_conversion_failures.append(conversion_candidate)
-                        conversion_failure_count += 1
-                        conversion_failure_side_counts[current] = conversion_failure_side_counts.get(current, 0) + 1
+                    pure_gap_candidate = _build_pure_gap_relabel_candidate(candidate_state, decision, pure_decision)
+                    if pure_gap_candidate is not None:
+                        pure_gap_count += 1
+                        pure_gap_side_counts[current] = pure_gap_side_counts.get(current, 0) + 1
+                        if str(pure_gap_candidate.get("source")) == "failure_conversion":
+                            raw_conversion_failures.append(pure_gap_candidate)
+                            pure_conversion_gap_count += 1
+                            conversion_failure_count += 1
+                            conversion_failure_side_counts[current] = conversion_failure_side_counts.get(current, 0) + 1
+                        else:
+                            raw_failures.append(pure_gap_candidate)
+                            pure_tactical_gap_count += 1
+                        motif = str(pure_gap_candidate.get("motif", "") or "")
+                        if motif == "pure_missed_win":
+                            pure_missed_win_count += 1
+                            pure_missed_win_side_counts[current] = pure_missed_win_side_counts.get(current, 0) + 1
+                        elif motif == "pure_missed_block":
+                            pure_missed_block_count += 1
+                            pure_missed_block_side_counts[current] = pure_missed_block_side_counts.get(current, 0) + 1
                     candidate_move_count += 1
+                    candidate_move_side_counts[current] = candidate_move_side_counts.get(current, 0) + 1
                     if bool(decision.get("tacticalOverride")):
                         tactical_override_count += 1
                     if bool(decision.get("valueGuided")):
@@ -1523,6 +1907,19 @@ async def _run_engine_exam(
                 "conversionFailures": conversion_failure_count,
                 "conversionFailuresAsP1": conversion_failure_side_counts[1],
                 "conversionFailuresAsP2": conversion_failure_side_counts[2],
+                "pureGapCount": pure_gap_count,
+                "pureGapRate": round(_pure_gap_rate(), 4),
+                "pureGapRateAsP1": round(_pure_gap_rate(1), 4),
+                "pureGapRateAsP2": round(_pure_gap_rate(2), 4),
+                "pureAlignmentRate": round(1.0 - _pure_gap_rate(), 4),
+                "pureTacticalGapCount": pure_tactical_gap_count,
+                "pureConversionGapCount": pure_conversion_gap_count,
+                "pureMissedWinCount": pure_missed_win_count,
+                "pureMissedBlockCount": pure_missed_block_count,
+                "pureMissedWinAsP1": pure_missed_win_side_counts[1],
+                "pureMissedWinAsP2": pure_missed_win_side_counts[2],
+                "pureMissedBlockAsP1": pure_missed_block_side_counts[1],
+                "pureMissedBlockAsP2": pure_missed_block_side_counts[2],
             },
         })
         await asyncio.sleep(0)
@@ -1563,6 +1960,19 @@ async def _run_engine_exam(
         "conversionFailures": conversion_failure_count,
         "conversionFailuresAsP1": conversion_failure_side_counts[1],
         "conversionFailuresAsP2": conversion_failure_side_counts[2],
+        "pureGapCount": pure_gap_count,
+        "pureGapRate": round(_pure_gap_rate(), 4),
+        "pureGapRateAsP1": round(_pure_gap_rate(1), 4),
+        "pureGapRateAsP2": round(_pure_gap_rate(2), 4),
+        "pureAlignmentRate": round(1.0 - _pure_gap_rate(), 4),
+        "pureTacticalGapCount": pure_tactical_gap_count,
+        "pureConversionGapCount": pure_conversion_gap_count,
+        "pureMissedWinCount": pure_missed_win_count,
+        "pureMissedBlockCount": pure_missed_block_count,
+        "pureMissedWinAsP1": pure_missed_win_side_counts[1],
+        "pureMissedWinAsP2": pure_missed_win_side_counts[2],
+        "pureMissedBlockAsP1": pure_missed_block_side_counts[1],
+        "pureMissedBlockAsP2": pure_missed_block_side_counts[2],
         "conversionRelabels": sum(1 for pos in relabeled if pos.get("motif") == "conversion"),
         "newFailures": len(relabeled),
     }
@@ -2109,6 +2519,118 @@ async def _build_frozen_benchmark_suites(
     return suites
 
 
+def _position_flat_board(position: dict[str, Any]) -> list[int]:
+    board_2d = position.get("board") or []
+    if not board_2d:
+        return []
+    return [int(cell) for row in board_2d for cell in row]
+
+
+def _position_policy_target_move(position: dict[str, Any]) -> int:
+    board_size = int(position.get("board_size", 0) or 0)
+    policy = position.get("policy") or []
+    board = _position_flat_board(position)
+    if board_size <= 0 or not policy or not board:
+        return -1
+
+    legal = [idx for idx, cell in enumerate(board) if cell == 0]
+    if not legal:
+        return -1
+    return max(
+        legal,
+        key=lambda move: float(policy[_policy_cell_index(move, board_size)]),
+    )
+
+
+def _build_decision_suite_failure(
+    position: dict[str, Any],
+    *,
+    suite_name: str,
+    decision_mode: str,
+    chosen_move: int,
+    target_move: int,
+) -> dict[str, Any]:
+    failure = {
+        key: value
+        for key, value in position.items()
+    }
+    current_player = int(position.get("current_player", 1) or 1)
+    failure["source"] = "failure_pure_gap" if decision_mode == "pure" else "benchmark_miss"
+    if suite_name == "win":
+        failure["motif"] = "pure_missed_win" if decision_mode == "pure" else "win"
+        failure["conversionTarget"] = True
+        failure["sampleWeight"] = max(float(failure.get("sampleWeight", 1.0) or 1.0), 2.35 if current_player == 1 else 2.05)
+        if decision_mode == "pure":
+            failure["pureMissedWinInOne"] = True
+    elif suite_name == "block":
+        failure["motif"] = "pure_missed_block" if decision_mode == "pure" else "block"
+        failure["conversionTarget"] = False
+        failure["sampleWeight"] = max(float(failure.get("sampleWeight", 1.0) or 1.0), 2.10 if current_player == 1 else 1.85)
+        if decision_mode == "pure":
+            failure["pureMissedBlockInOne"] = True
+    failure["playerFocus"] = current_player
+    failure["decisionMode"] = decision_mode
+    failure["targetMove"] = target_move
+    failure["chosenMove"] = chosen_move
+    return failure
+
+
+def _evaluate_decision_suite(
+    model: Any,
+    positions: list[dict[str, Any]],
+    board_size: int,
+    win_len: int,
+    *,
+    decision_mode: str = "pure",
+    suite_name: str = "suite",
+    collect_failures: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    from gomoku_api.ws.predict_service import _loaded_model_decision
+
+    total = 0
+    correct = 0
+    failures: list[dict[str, Any]] = []
+
+    for position in positions:
+        target_move = _position_policy_target_move(position)
+        if target_move < 0:
+            continue
+        flat_board = _position_flat_board(position)
+        if not flat_board:
+            continue
+        current_player = int(position.get("current_player", 1) or 1)
+        decision = _loaded_model_decision(
+            flat_board,
+            current_player,
+            board_size,
+            win_len,
+            model,
+            decision_mode=decision_mode,
+        )
+        chosen_move = int(decision.get("move", -1))
+        total += 1
+        if chosen_move == target_move:
+            correct += 1
+            continue
+        if collect_failures:
+            failures.append(
+                _build_decision_suite_failure(
+                    position,
+                    suite_name=suite_name,
+                    decision_mode=decision_mode,
+                    chosen_move=chosen_move,
+                    target_move=target_move,
+                )
+            )
+
+    accuracy = (correct / total) if total else 0.0
+    return {
+        "correct": correct,
+        "total": total,
+        "accuracy": round(accuracy, 4),
+    }, failures
+
+
 async def _run_validation_snapshot(
     model: Any,
     holdout_positions: list[dict[str, Any]],
@@ -2163,6 +2685,47 @@ async def _run_validation_snapshot(
             payload["frozenMidAcc"] = round(benchmark_results["mid"], 2)
         if "late" in benchmark_results:
             payload["frozenLateAcc"] = round(benchmark_results["late"], 2)
+
+    win_suite = frozen_suites.get("win") or []
+    block_suite = frozen_suites.get("block") or []
+    if win_suite:
+        pure_win_metrics, _ = _evaluate_decision_suite(
+            model,
+            win_suite,
+            int(win_suite[0].get("board_size", 0) or 0),
+            4 if variant == "ttt5" else (3 if variant == "ttt3" else 5),
+            decision_mode="pure",
+            suite_name="win",
+        )
+        hybrid_win_metrics, _ = _evaluate_decision_suite(
+            model,
+            win_suite,
+            int(win_suite[0].get("board_size", 0) or 0),
+            4 if variant == "ttt5" else (3 if variant == "ttt3" else 5),
+            decision_mode="hybrid",
+            suite_name="win",
+        )
+        payload["pureFrozenWinRecall"] = round(pure_win_metrics["accuracy"] * 100.0, 2)
+        payload["hybridFrozenWinRecall"] = round(hybrid_win_metrics["accuracy"] * 100.0, 2)
+    if block_suite:
+        pure_block_metrics, _ = _evaluate_decision_suite(
+            model,
+            block_suite,
+            int(block_suite[0].get("board_size", 0) or 0),
+            4 if variant == "ttt5" else (3 if variant == "ttt3" else 5),
+            decision_mode="pure",
+            suite_name="block",
+        )
+        hybrid_block_metrics, _ = _evaluate_decision_suite(
+            model,
+            block_suite,
+            int(block_suite[0].get("board_size", 0) or 0),
+            4 if variant == "ttt5" else (3 if variant == "ttt3" else 5),
+            decision_mode="hybrid",
+            suite_name="block",
+        )
+        payload["pureFrozenBlockRecall"] = round(pure_block_metrics["accuracy"] * 100.0, 2)
+        payload["hybridFrozenBlockRecall"] = round(hybrid_block_metrics["accuracy"] * 100.0, 2)
 
     await callback({"type": "train.progress", "payload": payload})
     return payload
@@ -3392,7 +3955,7 @@ async def train_variant(
             **common,
         )
         completed_phases.append("foundation")
-        registry.save_candidate(model, generation=0, metrics={"phase": "foundation"})
+        registry.save_working_candidate(model, generation=0, metrics={"phase": "foundation"})
         foundation_validation = await _run_validation_snapshot(
             model,
             holdout_bank,
@@ -3418,6 +3981,9 @@ async def train_variant(
     current_engine_focus: str | None = None
     current_engine_count = engine_per_cycle
     current_engine_current_player_focus: int | None = 2 if (rapid_mode and board_size <= 5) else None
+    current_player_focus_ratio = 0.35 if current_engine_current_player_focus in (1, 2) else 0.0
+    current_focus_conversion_ratio = 0.0
+    current_counter_conversion_ratio = 0.0
     current_conversion_focus = False
     current_failure_slice = 256
     repair_effectiveness_history: list[float] = []
@@ -3468,6 +4034,21 @@ async def train_variant(
                     boost_weight=1.35,
                 )
                 new_engine.extend(conversion_positions)
+                if current_engine_current_player_focus in (1, 2):
+                    side_conversion_count = max(10, min(48, current_engine_count // 2))
+                    side_conversion_positions = await _generate_engine_labeled_positions(
+                        side_conversion_count,
+                        board_size,
+                        win_len,
+                        callback,
+                        engine_eval,
+                        source="engine_side_conversion",
+                        phase_focus=current_engine_focus or "mid",
+                        current_player_focus=current_engine_current_player_focus,
+                        min_value=0.55,
+                        boost_weight=1.55,
+                    )
+                    new_engine.extend(side_conversion_positions)
             train_engine, holdout_engine = _split_holdout_positions(
                 new_engine,
                 holdout_ratio=0.10,
@@ -3508,6 +4089,10 @@ async def train_variant(
             user_corpus.get_pool_for_builder(user_corpus_budget, user_corpus_mode) if (user_corpus is not None and user_corpus_budget > 0) else None,
             data_count=repair_pool_size,
             tactical_ratio=current_tactical_ratio if rapid_mode else 0.20,
+            focus_player=current_engine_current_player_focus,
+            focus_ratio=current_player_focus_ratio,
+            focus_conversion_ratio=current_focus_conversion_ratio,
+            counter_conversion_ratio=current_counter_conversion_ratio,
         )
 
         # Adaptive training budget: steps scale with pool size
@@ -3543,7 +4128,7 @@ async def train_variant(
             failureBankSize=len(failure_bank),
             **common,
         )
-        registry.save_candidate(model, generation=cycle, metrics={"phase": "turbo_train", "cycle": cycle})
+        registry.save_working_candidate(model, generation=cycle, metrics={"phase": "turbo_train", "cycle": cycle})
         pre_repair_state = _clone_model_state_dict(model)
 
         cycle_failures: list[dict[str, Any]] = []
@@ -3585,6 +4170,12 @@ async def train_variant(
                         "tacticalOverrideRate": round(exam_summary_current.get("tacticalOverrideRate", 0), 4),
                         "valueGuidedRate": round(exam_summary_current.get("valueGuidedRate", 0), 4),
                         "modelPolicyRate": round(exam_summary_current.get("modelPolicyRate", 0), 4),
+                        "pureGapRate": round(exam_summary_current.get("pureGapRate", 0), 4),
+                        "pureGapRateAsP1": round(exam_summary_current.get("pureGapRateAsP1", 0), 4),
+                        "pureGapRateAsP2": round(exam_summary_current.get("pureGapRateAsP2", 0), 4),
+                        "pureAlignmentRate": round(exam_summary_current.get("pureAlignmentRate", 0), 4),
+                        "pureMissedWinCount": int(exam_summary_current.get("pureMissedWinCount", 0) or 0),
+                        "pureMissedBlockCount": int(exam_summary_current.get("pureMissedBlockCount", 0) or 0),
                         "wins": exam_summary_current.get("wins", 0),
                         "losses": exam_summary_current.get("losses", 0),
                         "draws": exam_summary_current.get("draws", 0),
@@ -3650,6 +4241,10 @@ async def train_variant(
                 tactical_positions,
                 user_corpus.get_pool_for_builder(user_corpus_budget, user_corpus_mode) if (user_corpus is not None and user_corpus_budget > 0) else None,
                 data_count=max(batch_size, repair_pool_size),
+                focus_player=current_engine_current_player_focus,
+                focus_ratio=max(current_player_focus_ratio, 0.40 if current_engine_current_player_focus in (1, 2) else 0.0),
+                focus_conversion_ratio=max(current_focus_conversion_ratio, 0.18 if current_engine_current_player_focus in (1, 2) and current_conversion_focus else 0.0),
+                counter_conversion_ratio=current_counter_conversion_ratio,
             )
             await _run_training_steps(
                 model,
@@ -3675,7 +4270,7 @@ async def train_variant(
                 newFailures=len(cycle_failures),
                 **common,
             )
-            registry.save_candidate(model, generation=cycle, metrics={"phase": "repair", "cycle": cycle})
+            registry.save_working_candidate(model, generation=cycle, metrics={"phase": "repair", "cycle": cycle})
 
         after_matches = _score_policy_matches(model, cycle_failures, device) if cycle_failures else []
         fixed_errors = sum((not before) and after for before, after in zip(before_matches, after_matches))
@@ -3721,6 +4316,38 @@ async def train_variant(
         validation_history.append(dict(validation_payload))
         last_validation = validation_payload
 
+        pure_tactical_failures: list[dict[str, Any]] = []
+        win_suite = frozen_suites.get("win") or []
+        block_suite = frozen_suites.get("block") or []
+        if win_suite:
+            _win_bench, pure_win_failures = _evaluate_decision_suite(
+                model,
+                win_suite,
+                board_size,
+                win_len,
+                decision_mode="pure",
+                suite_name="win",
+                collect_failures=True,
+            )
+            pure_tactical_failures.extend(pure_win_failures[:16])
+        if block_suite:
+            _block_bench, pure_block_failures = _evaluate_decision_suite(
+                model,
+                block_suite,
+                board_size,
+                win_len,
+                decision_mode="pure",
+                suite_name="block",
+                collect_failures=True,
+            )
+            pure_tactical_failures.extend(pure_block_failures[:16])
+        if pure_tactical_failures:
+            failure_bank = _merge_failure_bank(
+                failure_bank,
+                pure_tactical_failures,
+                max_size=512 if rapid_mode else 768,
+            )
+
         if rapid_mode:
             strategy = _choose_rapid_cycle_strategy(
                 validation_payload,
@@ -3734,6 +4361,9 @@ async def train_variant(
             current_engine_focus = strategy["engineFocus"]
             current_engine_count = int(strategy["engineCount"])
             current_engine_current_player_focus = strategy.get("engineCurrentPlayerFocus")
+            current_player_focus_ratio = float(strategy.get("playerFocusRatio", 0.0) or 0.0)
+            current_focus_conversion_ratio = float(strategy.get("focusConversionRatio", 0.0) or 0.0)
+            current_counter_conversion_ratio = float(strategy.get("counterConversionRatio", 0.0) or 0.0)
             current_conversion_focus = bool(strategy.get("conversionFocus", False))
             current_failure_slice = int(strategy["failureSlice"])
 
@@ -3767,7 +4397,7 @@ async def train_variant(
         _restore_model_state_dict(model, best_quick_checkpoint_state)
         selected_checkpoint_cycle = best_quick_checkpoint_cycle
         selected_checkpoint_summary = dict(best_quick_checkpoint_summary or {})
-        registry.save_candidate(
+        registry.save_working_candidate(
             model,
             generation=cycle_count,
             metrics={
@@ -3775,6 +4405,23 @@ async def train_variant(
                 "cycle": selected_checkpoint_cycle,
                 "winrate": selected_checkpoint_summary.get("winrate"),
                 "decisiveWinRate": selected_checkpoint_summary.get("decisiveWinRate"),
+                "drawRate": selected_checkpoint_summary.get("drawRate"),
+                "winrateAsP1": selected_checkpoint_summary.get("winrateAsP1"),
+                "winrateAsP2": selected_checkpoint_summary.get("winrateAsP2"),
+                "balancedSideWinrate": selected_checkpoint_summary.get("balancedSideWinrate"),
+                "pureGapRate": selected_checkpoint_summary.get("pureGapRate"),
+                "pureGapRateAsP1": selected_checkpoint_summary.get("pureGapRateAsP1"),
+                "pureGapRateAsP2": selected_checkpoint_summary.get("pureGapRateAsP2"),
+                "selectedCheckpointCycle": selected_checkpoint_cycle,
+                "selectedCheckpointWinrate": selected_checkpoint_summary.get("winrate"),
+                "selectedCheckpointDecisiveWinRate": selected_checkpoint_summary.get("decisiveWinRate"),
+                "selectedCheckpointDrawRate": selected_checkpoint_summary.get("drawRate"),
+                "selectedCheckpointWinrateAsP1": selected_checkpoint_summary.get("winrateAsP1"),
+                "selectedCheckpointWinrateAsP2": selected_checkpoint_summary.get("winrateAsP2"),
+                "selectedCheckpointBalancedSideWinrate": selected_checkpoint_summary.get("balancedSideWinrate"),
+                "selectedCheckpointPureGapRate": selected_checkpoint_summary.get("pureGapRate"),
+                "selectedCheckpointPureGapRateAsP1": selected_checkpoint_summary.get("pureGapRateAsP1"),
+                "selectedCheckpointPureGapRateAsP2": selected_checkpoint_summary.get("pureGapRateAsP2"),
             },
         )
         await callback({
@@ -3891,6 +4538,7 @@ async def train_variant(
     })
 
     promoted_this_run = False
+    active_candidate_summary = _read_active_candidate_summary(registry, variant)
     if decision.promoted:
         registry.promote_candidate(
             generation=cycle_count,
@@ -3902,6 +4550,7 @@ async def train_variant(
                 "valueFc": value_fc,
             },
             reason=decision.reason,
+            source_path=registry.working_candidate_path if registry.working_candidate_path.exists() else None,
         )
         promoted_this_run = True
         await callback({
@@ -3914,6 +4563,49 @@ async def train_variant(
             },
         })
     else:
+        selected_summary_for_commit = selected_checkpoint_summary or confirm_summary or {}
+        should_commit_candidate = False
+        if not registry.has_champion():
+            if not registry.has_active_candidate():
+                should_commit_candidate = True
+            elif selected_summary_for_commit:
+                selected_score = _checkpoint_selection_score(
+                    selected_summary_for_commit,
+                    int((selected_checkpoint_cycle or cycle_count) or cycle_count),
+                )
+                current_score = (
+                    _checkpoint_selection_score(
+                        active_candidate_summary,
+                        int(active_candidate_summary.get("cycle", 0) or 0),
+                    )
+                    if active_candidate_summary
+                    else None
+                )
+                should_commit_candidate = current_score is None or selected_score > current_score
+        if should_commit_candidate and registry.working_candidate_path.exists():
+            registry.commit_working_candidate(
+                generation=cycle_count,
+                metrics={
+                    "phase": "checkpoint_selection",
+                    "selectedCheckpointCycle": selected_checkpoint_cycle,
+                    "selectedCheckpointWinrate": selected_summary_for_commit.get("winrate"),
+                    "selectedCheckpointDecisiveWinRate": selected_summary_for_commit.get("decisiveWinRate"),
+                    "selectedCheckpointDrawRate": selected_summary_for_commit.get("drawRate"),
+                    "selectedCheckpointWinrateAsP1": selected_summary_for_commit.get("winrateAsP1"),
+                    "selectedCheckpointWinrateAsP2": selected_summary_for_commit.get("winrateAsP2"),
+                    "selectedCheckpointBalancedSideWinrate": selected_summary_for_commit.get("balancedSideWinrate"),
+                    "selectedCheckpointPureGapRate": selected_summary_for_commit.get("pureGapRate"),
+                    "selectedCheckpointPureGapRateAsP1": selected_summary_for_commit.get("pureGapRateAsP1"),
+                    "selectedCheckpointPureGapRateAsP2": selected_summary_for_commit.get("pureGapRateAsP2"),
+                    "winrateVsAlgorithm": decision.winrate_vs_algorithm,
+                    "confirmDecisiveWinRate": confirm_summary.get("decisiveWinRate") if confirm_summary else None,
+                    "confirmDrawRate": confirm_summary.get("drawRate") if confirm_summary else None,
+                    "confirmWinrateAsP1": confirm_summary.get("winrateAsP1") if confirm_summary else None,
+                    "confirmWinrateAsP2": confirm_summary.get("winrateAsP2") if confirm_summary else None,
+                    "confirmBalancedSideWinrate": confirm_summary.get("balancedSideWinrate") if confirm_summary else None,
+                    "confirmPureGapRate": confirm_summary.get("pureGapRate") if confirm_summary else None,
+                },
+            )
         await callback({
             "type": "promotion.rejected",
             "payload": {
@@ -3965,6 +4657,17 @@ async def train_variant(
         done_payload["drawRate"] = round(strong_result.draw_rate, 4)
     final_exam_summary = confirm_summary or selected_checkpoint_summary or previous_exam
     if final_exam_summary:
+        count_like_exam_keys = {
+            "pureGapCount",
+            "pureTacticalGapCount",
+            "pureConversionGapCount",
+            "pureMissedWinCount",
+            "pureMissedBlockCount",
+            "pureMissedWinAsP1",
+            "pureMissedWinAsP2",
+            "pureMissedBlockAsP1",
+            "pureMissedBlockAsP2",
+        }
         for key in (
             "winrateAsP1",
             "winrateAsP2",
@@ -3973,9 +4676,23 @@ async def train_variant(
             "valueGuidedRate",
             "modelPolicyRate",
             "avgUnsafeMovesFiltered",
+            "pureGapRate",
+            "pureGapRateAsP1",
+            "pureGapRateAsP2",
+            "pureAlignmentRate",
+            "pureGapCount",
+            "pureTacticalGapCount",
+            "pureConversionGapCount",
+            "pureMissedWinCount",
+            "pureMissedBlockCount",
+            "pureMissedWinAsP1",
+            "pureMissedWinAsP2",
+            "pureMissedBlockAsP1",
+            "pureMissedBlockAsP2",
         ):
             if final_exam_summary.get(key) is not None:
-                done_payload[key] = round(float(final_exam_summary.get(key, 0.0) or 0.0), 4)
+                value = final_exam_summary.get(key, 0.0)
+                done_payload[key] = int(value) if key in count_like_exam_keys else round(float(value or 0.0), 4)
         if final_exam_summary.get("decisionReasonCounts") is not None:
             done_payload["decisionReasonCounts"] = dict(final_exam_summary.get("decisionReasonCounts") or {})
     if winrate_history:
@@ -3987,6 +4704,17 @@ async def train_variant(
         done_payload["confirmDecisiveWinRate"] = round(confirm_result.decisive_winrate_a, 4)
         done_payload["confirmDrawRate"] = round(confirm_result.draw_rate, 4)
     if confirm_summary:
+        count_like_confirm_keys = {
+            "pureGapCount",
+            "pureTacticalGapCount",
+            "pureConversionGapCount",
+            "pureMissedWinCount",
+            "pureMissedBlockCount",
+            "pureMissedWinAsP1",
+            "pureMissedWinAsP2",
+            "pureMissedBlockAsP1",
+            "pureMissedBlockAsP2",
+        }
         for key in (
             "winrateAsP1",
             "winrateAsP2",
@@ -3995,9 +4723,23 @@ async def train_variant(
             "valueGuidedRate",
             "modelPolicyRate",
             "avgUnsafeMovesFiltered",
+            "pureGapRate",
+            "pureGapRateAsP1",
+            "pureGapRateAsP2",
+            "pureAlignmentRate",
+            "pureGapCount",
+            "pureTacticalGapCount",
+            "pureConversionGapCount",
+            "pureMissedWinCount",
+            "pureMissedBlockCount",
+            "pureMissedWinAsP1",
+            "pureMissedWinAsP2",
+            "pureMissedBlockAsP1",
+            "pureMissedBlockAsP2",
         ):
             if confirm_summary.get(key) is not None:
-                done_payload[f"confirm{key[0].upper()}{key[1:]}"] = round(float(confirm_summary.get(key, 0.0) or 0.0), 4)
+                value = confirm_summary.get(key, 0.0)
+                done_payload[f"confirm{key[0].upper()}{key[1:]}"] = int(value) if key in count_like_confirm_keys else round(float(value or 0.0), 4)
         if confirm_summary.get("decisionReasonCounts") is not None:
             done_payload["confirmDecisionReasonCounts"] = dict(confirm_summary.get("decisionReasonCounts") or {})
     if validation_history:
@@ -4017,6 +4759,10 @@ async def train_variant(
             "frozenWinAcc",
             "frozenMidAcc",
             "frozenLateAcc",
+            "pureFrozenWinRecall",
+            "pureFrozenBlockRecall",
+            "hybridFrozenWinRecall",
+            "hybridFrozenBlockRecall",
         ):
             if latest_validation.get(key) is not None:
                 done_payload[key] = latest_validation[key]

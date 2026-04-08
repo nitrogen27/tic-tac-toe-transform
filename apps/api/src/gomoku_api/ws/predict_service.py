@@ -260,15 +260,37 @@ def _select_policy_value_move(
         }
 
     value_scores = value_scores or {}
-    best_move = max(
+    model_best = max(legal, key=lambda move: probs_raw[move])
+    best_prob = float(probs_raw[model_best])
+    sorted_by_policy = sorted(
         legal,
+        key=lambda move: (
+            probs_raw[move],
+            float(value_scores.get(move, 0.0)),
+            -move,
+        ),
+        reverse=True,
+    )
+
+    if best_prob > 0.0:
+        abs_margin = 0.03 if len(legal) <= 25 else 0.02
+        rel_floor = best_prob * 0.85
+        min_prob = max(best_prob - abs_margin, rel_floor)
+        candidate_pool = [move for move in legal if probs_raw[move] >= min_prob]
+    else:
+        candidate_pool = []
+    if not candidate_pool:
+        candidate_pool = sorted_by_policy[: min(3, len(sorted_by_policy))]
+
+    best_move = max(
+        candidate_pool,
         key=lambda move: (
             float(value_scores.get(move, 0.0)),
             probs_raw[move],
+            -move,
         ),
     )
-    model_best = max(legal, key=lambda move: probs_raw[move])
-    used_value = abs(float(value_scores.get(best_move, 0.0))) > 1e-6
+    used_value = best_move != model_best and len(candidate_pool) > 1
     reason = "policy_value" if used_value and best_move != model_best else "model_policy"
     return best_move, {
         "tacticalReason": reason,

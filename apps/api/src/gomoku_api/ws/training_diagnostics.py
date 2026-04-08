@@ -12,6 +12,7 @@ from gomoku_api.ws.model_registry import ModelRegistry
 from gomoku_api.ws.train_service_ws import (
     _build_frozen_benchmark_suites,
     _compute_target_sanity_metrics,
+    _evaluate_decision_suite,
     _evaluate_supervised_dataset,
     _generate_tactical_curriculum_positions,
     _load_offline_dataset_positions,
@@ -173,6 +174,37 @@ async def run_training_diagnostics(
                 for name, positions in frozen_suites.items()
                 if positions
             }
+            decision_bench: dict[str, Any] = {}
+            for suite_name in ("win", "block"):
+                suite_positions = frozen_suites.get(suite_name) or []
+                if not suite_positions:
+                    continue
+                pure_metrics, _ = _evaluate_decision_suite(
+                    model,
+                    suite_positions,
+                    board_size,
+                    win_len,
+                    decision_mode="pure",
+                    suite_name=suite_name,
+                )
+                hybrid_metrics, _ = _evaluate_decision_suite(
+                    model,
+                    suite_positions,
+                    board_size,
+                    win_len,
+                    decision_mode="hybrid",
+                    suite_name=suite_name,
+                )
+                decision_bench[suite_name] = {
+                    "pureRecall": round(pure_metrics["accuracy"] * 100.0, 2),
+                    "hybridRecall": round(hybrid_metrics["accuracy"] * 100.0, 2),
+                    "pureCorrect": pure_metrics["correct"],
+                    "pureTotal": pure_metrics["total"],
+                    "hybridCorrect": hybrid_metrics["correct"],
+                    "hybridTotal": hybrid_metrics["total"],
+                }
+            if decision_bench:
+                report["decisionBench"] = decision_bench
             if include_quick_probe:
                 probe_result, _, probe_summary = await _run_engine_exam(
                     model,
