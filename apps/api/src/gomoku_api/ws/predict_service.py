@@ -1058,7 +1058,7 @@ async def predict(
             }
         else:
             return await _engine_predict(board, current, board_size, win_length)
-    elif mode == "mcts":
+    elif mode == "mcts" or model_decision_mode == "mcts":
         return _mcts_predict(board, current, variant, board_size, num_simulations=50)
     else:
         return _model_predict(board, current, variant, board_size, decision_mode=model_decision_mode)

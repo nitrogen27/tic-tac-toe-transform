@@ -131,8 +131,12 @@
           </div>
           <div class="mode-selector" v-if="gameMode === 'model' && gameType === 'human'">
             <label class="mode-label">
+              <input type="radio" v-model="modelDecisionMode" value="mcts" :disabled="training || clearing || autoPlaying" />
+              <span>MCTS (думает)</span>
+            </label>
+            <label class="mode-label">
               <input type="radio" v-model="modelDecisionMode" value="hybrid" :disabled="training || clearing || autoPlaying" />
-              <span>Гибрид (нейронка + safety)</span>
+              <span>Гибрид (быстрый)</span>
             </label>
             <label class="mode-label">
               <input type="radio" v-model="modelDecisionMode" value="pure" :disabled="training || clearing || autoPlaying" />
@@ -141,7 +145,10 @@
           </div>
           <div v-if="gameMode === 'model'" class="setting-hint game-hint">
             <small>
-              <template v-if="modelDecisionMode === 'hybrid'">
+              <template v-if="modelDecisionMode === 'mcts'">
+                MCTS: модель просчитывает 50 вариантов вперёд. Сильнее, но чуть медленнее (~100ms).
+              </template>
+              <template v-else-if="modelDecisionMode === 'hybrid'">
                 Гибридный режим: сеть выбирает ход, но сервер страхует от простых тактических зевков.
               </template>
               <template v-else>
@@ -614,7 +621,7 @@ const current = ref(1) // 1 = X (человек/модель), 2 = O (бот/а�
 const waiting = ref(false) // Флаг ожидания ответа от сервера
 const status = ref('Ваш ход (X)')
 const gameMode = ref('model') // 'model' или 'algorithm' (для режима human)
-const modelDecisionMode = ref('hybrid') // 'hybrid' или 'pure' для model-mode
+const modelDecisionMode = ref('mcts') // 'mcts', 'hybrid' или 'pure' для model-mode
 const gameType = ref('human') // 'human' или 'auto'
 const gameOver = ref(false) // Игра завершена
 const lastMoveIdx = ref(-1) // Last played move index
