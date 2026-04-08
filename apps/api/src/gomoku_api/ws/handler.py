@@ -392,7 +392,7 @@ async def _dispatch(ws: WebSocket, msg_type: str, payload: dict) -> None:
         epochs = min(max(int(payload.get("epochs", 30)), 1), 60)
         batch_size = min(max(int(payload.get("batchSize", 256)), 32), 4096)
         extra = {}
-        for key in ("bootstrapGames", "mctsIterations", "mctsGamesPerIter", "foundationDatasetCount", "offlineDatasetLimit", "examThresholdAcc", "modelProfile", "teacherBackend", "confirmBackend"):
+        for key in ("bootstrapGames", "mctsIterations", "mctsGamesPerIter", "foundationDatasetCount", "offlineDatasetLimit", "examThresholdAcc", "modelProfile", "teacherBackend", "confirmBackend", "selfPlay", "selfPlayIterations", "selfPlayGames", "selfPlaySims", "selfPlayTrainSteps"):
             if key in payload:
                 extra[key] = payload[key]
         if "preferOfflineDataset" in payload:

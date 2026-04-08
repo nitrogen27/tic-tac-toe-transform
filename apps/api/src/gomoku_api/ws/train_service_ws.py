@@ -4483,6 +4483,131 @@ async def train_variant(
             )
             del champion_model
 
+    # ── Self-Play MCTS Loop (optional, for strong models) ────────────
+    do_selfplay = bool(kwargs.get("selfPlay", False))
+    sp_iterations = max(1, min(20, int(kwargs.get("selfPlayIterations", 10))))
+    sp_games = max(20, min(200, int(kwargs.get("selfPlayGames", 100))))
+    sp_sims = max(25, min(200, int(kwargs.get("selfPlaySims", 100))))
+    sp_train_steps = max(20, min(200, int(kwargs.get("selfPlayTrainSteps", 80))))
+
+    if do_selfplay and board_size <= 9:
+        from trainer_lab.self_play.player import SelfPlayPlayer, GameState, mcts_search
+        from trainer_lab.config import SelfPlayConfig
+        from collections import deque
+
+        logger.info("Self-play phase: %d iterations × %d games × %d sims", sp_iterations, sp_games, sp_sims)
+
+        sp_replay: deque[dict[str, Any]] = deque(maxlen=50000)
+        # Seed replay with existing anchor + tactical positions
+        sp_replay.extend(anchor_positions[:2000])
+        sp_replay.extend(tactical_positions[:1000])
+
+        sp_config = SelfPlayConfig(games=1, simulations=sp_sims)
+        best_sp_winrate = -1.0
+        best_sp_state = None
+
+        for sp_iter in range(1, sp_iterations + 1):
+            # --- Generate self-play games ---
+            model.eval()
+            sp_player = SelfPlayPlayer(model, sp_config, device)
+            sp_positions: list[dict[str, Any]] = []
+            sp_stats = {"wins_p1": 0, "wins_p2": 0, "draws": 0}
+
+            for g in range(sp_games):
+                game_positions = sp_player.play_game(board_size=board_size, win_length=win_len)
+                sp_positions.extend(game_positions)
+                # Track stats
+                if game_positions:
+                    last_val = game_positions[-1].get("value", 0)
+                    if last_val > 0:
+                        sp_stats["wins_p1"] += 1
+                    elif last_val < 0:
+                        sp_stats["wins_p2"] += 1
+                    else:
+                        sp_stats["draws"] += 1
+
+                if (g + 1) % 5 == 0 or g + 1 == sp_games:
+                    elapsed = time.monotonic() - started_at
+                    await callback({
+                        "type": "train.progress",
+                        "payload": {
+                            "phase": "self_play_gen",
+                            "stage": "generating",
+                            "variant": variant,
+                            "iteration": sp_iter,
+                            "totalIterations": sp_iterations,
+                            "game": g + 1,
+                            "totalGames": sp_games,
+                            "positionsCollected": len(sp_positions),
+                            "selfPlayStats": sp_stats,
+                            "elapsed": round(elapsed, 1),
+                            "percent": round(90 + 8 * ((sp_iter - 1 + (g + 1) / sp_games) / sp_iterations), 1),
+                        },
+                    })
+                    await asyncio.sleep(0)
+
+            # Add to replay buffer
+            sp_replay.extend(sp_positions)
+            logger.info("Self-play iter %d: %d positions, buffer=%d", sp_iter, len(sp_positions), len(sp_replay))
+
+            # --- Train on replay buffer ---
+            train_sample = random.sample(list(sp_replay), min(len(sp_replay), sp_train_steps * _cycle_batch_size))
+            model.train()
+            await _run_training_steps(
+                model, train_sample, sp_train_steps, _cycle_batch_size,
+                device, runtime_flags, callback, metrics_history,
+                phase="self_play_train", stage="training",
+                iteration=sp_iter, total_iterations=sp_iterations,
+                overall_started_at=started_at,
+                overall_percent_base=90 + 8 * (sp_iter - 0.5) / sp_iterations,
+                overall_percent_range=4 / sp_iterations,
+                variant=variant, boardSize=board_size, winLength=win_len,
+            )
+
+            # --- Arena eval vs engine ---
+            if engine_available and engine_eval is not None:
+                sp_exam_result, sp_failures, sp_exam_summary = await _run_engine_exam(
+                    model, board_size, win_len, device, callback, engine_eval,
+                    variant=variant, cycle=cycle_count + sp_iter, total_cycles=cycle_count + sp_iterations,
+                    num_pairs=8, previous_result=previous_exam,
+                    phase="self_play_exam", stage="engine_eval",
+                    collect_failures=True,
+                )
+                sp_wr = sp_exam_summary.get("winrate", 0.0) if sp_exam_summary else 0.0
+                logger.info("Self-play iter %d: winrate=%.2f", sp_iter, sp_wr)
+
+                if sp_wr > best_sp_winrate:
+                    best_sp_winrate = sp_wr
+                    best_sp_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+                if sp_failures:
+                    sp_replay.extend(sp_failures)
+
+                previous_exam = sp_exam_summary
+                strong_result = sp_exam_result
+
+                winrate_history.append({
+                    "cycle": cycle_count + sp_iter,
+                    "winrate": round(sp_wr, 4),
+                    "wins": sp_exam_summary.get("wins", 0) if sp_exam_summary else 0,
+                    "losses": sp_exam_summary.get("losses", 0) if sp_exam_summary else 0,
+                    "draws": sp_exam_summary.get("draws", 0) if sp_exam_summary else 0,
+                })
+
+            registry.save_candidate(model, generation=cycle_count + sp_iter,
+                                    metrics={"phase": "self_play", "iteration": sp_iter})
+
+            # Convergence check
+            sp_winrates = [h["winrate"] for h in winrate_history[-3:]]
+            if len(sp_winrates) >= 3 and min(sp_winrates) >= 0.70:
+                logger.info("Self-play converged at iter %d (winrate %.2f)", sp_iter, min(sp_winrates))
+                break
+
+        # Restore best self-play checkpoint
+        if best_sp_state is not None and best_sp_winrate > 0:
+            model.load_state_dict(best_sp_state)
+            logger.info("Restored best self-play checkpoint (winrate=%.2f)", best_sp_winrate)
+
     # Confirm exam: separate from quick probes, used for promotion only
     confirm_result = strong_result
     confirm_summary: dict[str, Any] | None = None

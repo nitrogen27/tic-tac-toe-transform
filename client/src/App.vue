@@ -221,6 +221,7 @@
               <button class="preset-pill" :class="{ active: activePreset === 'light' }" :disabled="training || clearing" @click="applyPreset('light')">⚡ 2м</button>
               <button class="preset-pill" :class="{ active: activePreset === 'medium' }" :disabled="training || clearing" @click="applyPreset('medium')">⚙️ 5м</button>
               <button class="preset-pill" :class="{ active: activePreset === 'deep' }" :disabled="training || clearing" @click="applyPreset('deep')">🧠 15м</button>
+              <button class="preset-pill preset-selfplay" :class="{ active: activePreset === 'selfplay' }" :disabled="training || clearing" @click="applyPreset('selfplay')">⚔️ Self-Play</button>
               <button class="preset-pill" :class="{ active: activePreset === 'custom' }" :disabled="training || clearing" @click="activePreset = 'custom'">🔧</button>
             </div>
           </div>
@@ -712,6 +713,7 @@ const PRESETS = {
   light:  { epochs: 10, batchSize: 512,  bootstrapGames: 50,  mctsIterations: 2, mctsGamesPerIter: 20,  label: 'Лёгкое', desc: '10 эпох · batch 512 · 50 teacher-pos · 2 коротких exam cycles' },
   medium: { epochs: 25, batchSize: 1024, bootstrapGames: 100, mctsIterations: 3, mctsGamesPerIter: 40,  label: 'Среднее', desc: '25 эпох · batch 1024 · 100 teacher-pos · 3 exam/repair cycles' },
   deep:   { epochs: 50, batchSize: 2048, bootstrapGames: 200, mctsIterations: 5, mctsGamesPerIter: 100, label: 'Глубокое', desc: '50 эпох · batch 2048 · 200 teacher-pos · 5 exam/repair cycles' },
+  selfplay: { epochs: 25, batchSize: 1024, bootstrapGames: 100, mctsIterations: 3, mctsGamesPerIter: 40, selfPlay: true, selfPlayIterations: 10, selfPlayGames: 100, selfPlaySims: 100, selfPlayTrainSteps: 80, label: 'Self-Play', desc: 'MCTS self-play · 10 итераций × 100 игр · ~30-60 мин' },
 }
 
 const presetDescription = computed(() => PRESETS[activePreset.value]?.desc || '')
@@ -1386,6 +1388,9 @@ function connectWS() {
               else if (p.phase === 'arena') statusText = `Arena evaluation`
               else if (p.phase === 'confirm_exam') statusText = `Confirm exam (${p.game || 0}/${p.totalGames || 0})`
               else if (p.phase === 'promotion') statusText = `Promotion gate`
+              else if (p.phase === 'self_play_gen') statusText = `Self-play ${p.iteration || ''}/${p.totalIterations || ''} (${p.game || 0}/${p.totalGames || 0} игр, ${p.positionsCollected || 0} поз)`
+              else if (p.phase === 'self_play_train') statusText = `SP train ${p.iteration || ''}/${p.totalIterations || ''}`
+              else if (p.phase === 'self_play_exam') statusText = `SP exam ${p.iteration || ''}/${p.totalIterations || ''}`
               else if (p.phase === 'mcts') statusText = `MCTS ${p.iteration || ''}/${p.totalIterations || ''}`
               if (p.epoch > 0) statusText += ` | Epoch ${p.epoch}/${p.totalEpochs}`
               if (p.winrateVsAlgorithm != null) statusText += ` | WR: ${(p.winrateVsAlgorithm * 100).toFixed(1)}%`
@@ -1792,6 +1797,14 @@ function startTrain() {
       payload.bootstrapGames = preset.bootstrapGames
       payload.mctsIterations = preset.mctsIterations
       payload.mctsGamesPerIter = preset.mctsGamesPerIter
+      // Self-play params
+      if (preset.selfPlay) {
+        payload.selfPlay = true
+        payload.selfPlayIterations = preset.selfPlayIterations || 10
+        payload.selfPlayGames = preset.selfPlayGames || 100
+        payload.selfPlaySims = preset.selfPlaySims || 100
+        payload.selfPlayTrainSteps = preset.selfPlayTrainSteps || 80
+      }
     }
     ws.value.send(JSON.stringify({ type: trainType, payload }))
     console.log(`[Train] ${trainType} sent:`, payload)
@@ -2596,6 +2609,11 @@ body {
   background: var(--accent);
   color: white;
   border-color: var(--accent);
+}
+
+.preset-selfplay.active {
+  background: var(--accent-orange);
+  border-color: var(--accent-orange);
 }
 
 .preset-pill:hover:not(:disabled) {
