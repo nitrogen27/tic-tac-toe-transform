@@ -65,16 +65,20 @@ def _restore_model_state_dict(model: torch.nn.Module, state_dict: dict[str, torc
     model.load_state_dict(state_dict)
 
 
-def _checkpoint_selection_score(summary: dict[str, Any], cycle: int) -> tuple[float, float, float, float, int]:
+def _checkpoint_selection_score(summary: dict[str, Any], cycle: int) -> tuple[float, float, float, float, float, float, float, int]:
     """Rank candidate checkpoints by actual game strength.
 
     Priority:
-    1. decisive wins first,
-    2. then total winrate,
-    3. then balanced strength across both sides,
-    4. then lower draw rate,
-    5. then later cycle as a tie-break.
+    1. challenger-vs-champion winrate when available,
+    2. challenger-vs-champion decisive wins,
+    3. then algorithm/engine decisive wins,
+    4. then total winrate,
+    5. then balanced strength across both sides,
+    6. then lower draw rate,
+    7. then later cycle as a tie-break.
     """
+    champion_wr = float(summary.get("winrateVsChampion", -1.0) or 0.0) if summary.get("winrateVsChampion") is not None else -1.0
+    champion_decisive = float(summary.get("decisiveWinRateVsChampion", 0.0) or 0.0)
     decisive = float(summary.get("decisiveWinRate", 0.0) or 0.0)
     winrate = float(summary.get("winrate", 0.0) or 0.0)
     winrate_as_p1 = float(summary.get("winrateAsP1", winrate) or winrate)
@@ -86,7 +90,16 @@ def _checkpoint_selection_score(summary: dict[str, Any], cycle: int) -> tuple[fl
     pure_alignment = 1.0 - pure_gap_rate
     balanced_pure_alignment = min(1.0 - pure_gap_rate_as_p1, 1.0 - pure_gap_rate_as_p2)
     draw_rate = float(summary.get("drawRate", 0.0) or 0.0)
-    return (decisive, winrate, balanced_side, balanced_pure_alignment, pure_alignment, -draw_rate, int(cycle))
+    return (
+        champion_wr,
+        champion_decisive,
+        decisive,
+        winrate,
+        balanced_side,
+        balanced_pure_alignment,
+        pure_alignment - draw_rate,
+        int(cycle),
+    )
 
 
 def _latest_train_done_payload(variant: str) -> dict[str, Any] | None:
@@ -205,6 +218,81 @@ def _maybe_compile_model(model: torch.nn.Module, device: torch.device, runtime_f
     runtime_flags["torchCompile"] = True
     runtime_flags["compileMode"] = compile_mode
     return compiled
+
+
+def _load_champion_model_for_arena(
+    registry: Any,
+    board_size: int,
+    *,
+    variant: str,
+    device: torch.device,
+) -> Any | None:
+    if not registry.has_champion():
+        return None
+
+    from trainer_lab.config import ModelConfig as _MC
+    from trainer_lab.models.resnet import PolicyValueResNet as _PVR
+
+    cfg = _MC()
+    champion_manifest = registry.read_manifest()
+    _, (res_filters, res_blocks, value_fc) = _variant_model_hparams(
+        board_size,
+        cfg,
+        variant=variant,
+        manifest=champion_manifest,
+    )
+    champion_model = _PVR(
+        in_channels=cfg.in_channels,
+        res_filters=res_filters,
+        res_blocks=res_blocks,
+        policy_filters=cfg.policy_filters,
+        value_fc=value_fc,
+        board_max=cfg.board_max,
+    )
+    champion_model = registry.load_champion_into(champion_model, device)
+    if champion_model is not None and device.type == "cuda":
+        champion_model = champion_model.to(memory_format=torch.channels_last)
+    return champion_model
+
+
+async def _run_challenger_vs_champion(
+    model: Any,
+    registry: Any,
+    *,
+    board_size: int,
+    win_len: int,
+    device: torch.device,
+    callback: TRAIN_CALLBACK,
+    variant: str,
+    num_pairs: int,
+    phase: str,
+    stage: str,
+) -> Any | None:
+    from gomoku_api.ws.arena_eval import arena_match
+
+    champion_model = _load_champion_model_for_arena(
+        registry,
+        board_size,
+        variant=variant,
+        device=device,
+    )
+    if champion_model is None:
+        return None
+    try:
+        return await arena_match(
+            model,
+            champion_model,
+            board_size,
+            win_len,
+            num_pairs=num_pairs,
+            device=device,
+            callback=callback,
+            variant=variant,
+            phase=phase,
+            stage=stage,
+        )
+    finally:
+        del champion_model
 
 
 def _should_emit_progress(now: float, last_emit_at: float, *, force: bool = False) -> bool:
@@ -616,6 +704,8 @@ def _position_bank_importance(position: dict[str, Any]) -> float:
         importance += 0.20
     if motif in {"pure_missed_win", "pure_missed_block"}:
         importance += 0.45
+    elif str(motif).startswith("exact_") or motif == "exact_trap":
+        importance += 0.30
     elif motif in {"block", "win"}:
         importance += 0.20
     elif motif == "conversion" or bool(position.get("conversionTarget")):
@@ -1156,6 +1246,36 @@ def _build_turbo_pool(
     return pool[:data_count]
 
 
+def _selfplay_replay_path(variant: str) -> Path:
+    return _ensure_saved_dir(variant) / "self_play_mixed_replay.json"
+
+
+def _selfplay_mixed_source_weights(iteration: int, total_iterations: int) -> dict[str, float]:
+    """Blend replay sources for the AlphaZero-style self-play phase.
+
+    Early iterations lean on stable teacher/tactical anchors.
+    Later iterations gradually raise the self-play contribution.
+    """
+    total = max(int(total_iterations), 1)
+    progress = max(0.0, min((float(iteration) - 1.0) / total, 1.0))
+    self_play_weight = min(0.45, 0.20 + 0.20 * progress)
+    anchor_weight = max(0.15, 0.30 - 0.10 * progress)
+    tactical_weight = max(0.15, 0.22 - 0.04 * progress)
+    failure_weight = max(0.12, 0.18 - 0.03 * progress)
+    user_weight = 1.0 - (self_play_weight + anchor_weight + tactical_weight + failure_weight)
+    if user_weight < 0.08:
+        deficit = 0.08 - user_weight
+        anchor_weight = max(0.10, anchor_weight - deficit)
+        user_weight = 0.08
+    return {
+        "anchor": round(anchor_weight, 4),
+        "tactical": round(tactical_weight, 4),
+        "failure": round(failure_weight, 4),
+        "user": round(max(user_weight, 0.08), 4),
+        "self_play": round(self_play_weight, 4),
+    }
+
+
 def _choose_rapid_cycle_strategy(
     validation_payload: dict[str, Any],
     *,
@@ -1185,6 +1305,7 @@ def _choose_rapid_cycle_strategy(
     late_bench = validation_payload.get("frozenLateAcc")
     pure_block_recall = validation_payload.get("pureFrozenBlockRecall")
     pure_win_recall = validation_payload.get("pureFrozenWinRecall")
+    pure_exact_recall = validation_payload.get("pureExactTrapRecall")
     holdout_delta = float(validation_payload.get("holdoutDeltaAcc", 0.0) or 0.0)
 
     suites = [
@@ -1228,6 +1349,15 @@ def _choose_rapid_cycle_strategy(
             strategy["tacticalFocus"] = "block"
             strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.75)
             strategy["failureSlice"] = max(int(strategy["failureSlice"]), 448)
+    if pure_exact_recall is not None:
+        exact_recall = float(pure_exact_recall)
+        if exact_recall < 85.0:
+            strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.65)
+            strategy["failureSlice"] = max(int(strategy["failureSlice"]), 384)
+        if exact_recall < 70.0:
+            strategy["conversionFocus"] = True
+            if strategy["engineFocus"] is None:
+                strategy["engineFocus"] = "mid"
 
     # Midgame conversion is the current bottleneck once tactical suites are strong.
     if mid_bench is not None and (late_bench is None or float(mid_bench) + 8.0 < float(late_bench)):
@@ -2465,6 +2595,54 @@ async def _generate_tactical_curriculum_positions(
     return positions
 
 
+def _build_exact_ttt5_validation_pack() -> list[dict[str, Any]]:
+    """Small deterministic solved pack for user-found 5x5 traps."""
+
+    def _board(stones: dict[int, int]) -> list[int]:
+        board = [0] * 25
+        for move, player in stones.items():
+            board[move] = player
+        return board
+
+    def _position(
+        stones: dict[int, int],
+        current_player: int,
+        target_move: int,
+        *,
+        motif: str,
+        value: float,
+        conversion_target: bool,
+        sample_weight: float,
+    ) -> dict[str, Any]:
+        board = _board(stones)
+        return {
+            "board_size": 5,
+            "board": _flat_to_board2d(board, 5),
+            "current_player": current_player,
+            "last_move": None,
+            "policy": _one_hot_policy(target_move, 5),
+            "value": value,
+            "motif": motif,
+            "source": "exact",
+            "sampleWeight": sample_weight,
+            "playerFocus": current_player,
+            "conversionTarget": conversion_target,
+        }
+
+    return [
+        _position({4: 1, 9: 1, 14: 1, 1: 2, 7: 2, 16: 2}, 2, 19, motif="exact_block_edge_vertical", value=0.35, conversion_target=False, sample_weight=2.15),
+        _position({3: 1, 7: 1, 11: 1, 1: 2, 12: 2, 22: 2}, 2, 15, motif="exact_block_edge_diagonal", value=0.35, conversion_target=False, sample_weight=2.15),
+        _position({0: 1, 6: 1, 12: 1, 4: 2, 8: 2, 17: 2}, 2, 18, motif="exact_block_main_diagonal", value=0.35, conversion_target=False, sample_weight=2.15),
+        _position({20: 2, 21: 2, 22: 2, 1: 1, 7: 1, 14: 1}, 1, 23, motif="exact_block_bottom_edge", value=0.35, conversion_target=False, sample_weight=2.1),
+        _position({0: 2, 5: 2, 10: 2, 12: 1, 18: 1}, 1, 15, motif="exact_block_left_edge", value=0.35, conversion_target=False, sample_weight=2.1),
+        _position({6: 2, 12: 2, 18: 2, 3: 1, 9: 1}, 1, 24, motif="exact_block_long_diagonal", value=0.35, conversion_target=False, sample_weight=2.15),
+        _position({2: 2, 7: 2, 12: 2, 4: 1, 9: 1}, 2, 17, motif="exact_win_vertical", value=1.0, conversion_target=True, sample_weight=2.3),
+        _position({15: 1, 16: 1, 17: 1, 2: 2, 7: 2, 12: 2}, 1, 18, motif="exact_win_horizontal", value=1.0, conversion_target=True, sample_weight=2.3),
+        _position({1: 1, 7: 1, 13: 1, 5: 2, 10: 2, 22: 2}, 1, 19, motif="exact_win_diagonal", value=1.0, conversion_target=True, sample_weight=2.3),
+        _position({4: 2, 8: 2, 12: 2, 0: 1, 6: 1}, 2, 16, motif="exact_win_edge_diagonal", value=1.0, conversion_target=True, sample_weight=2.3),
+    ]
+
+
 async def _build_frozen_benchmark_suites(
     variant: str,
     board_size: int,
@@ -2492,6 +2670,8 @@ async def _build_frozen_benchmark_suites(
             rng=random.Random(f"{variant}:win"),
         ),
     }
+    if variant == "ttt5" and board_size == 5 and win_len == 4:
+        suites["exact"] = _build_exact_ttt5_validation_pack()
 
     if engine_eval is not None:
         suites["mid"] = await _generate_engine_labeled_positions(
@@ -2568,6 +2748,12 @@ def _build_decision_suite_failure(
         failure["sampleWeight"] = max(float(failure.get("sampleWeight", 1.0) or 1.0), 2.10 if current_player == 1 else 1.85)
         if decision_mode == "pure":
             failure["pureMissedBlockInOne"] = True
+    elif suite_name == "exact":
+        failure["motif"] = str(position.get("motif", "") or "exact_trap")
+        failure["conversionTarget"] = bool(position.get("conversionTarget", False))
+        failure["sampleWeight"] = max(float(failure.get("sampleWeight", 1.0) or 1.0), 2.25 if failure["conversionTarget"] else 2.0)
+        if decision_mode == "pure":
+            failure["pureExactTrapMiss"] = True
     failure["playerFocus"] = current_player
     failure["decisionMode"] = decision_mode
     failure["targetMove"] = target_move
@@ -2681,6 +2867,8 @@ async def _run_validation_snapshot(
     if benchmark_results:
         payload["frozenBlockAcc"] = round(benchmark_results.get("block", 0.0), 2)
         payload["frozenWinAcc"] = round(benchmark_results.get("win", 0.0), 2)
+        if "exact" in benchmark_results:
+            payload["frozenExactAcc"] = round(benchmark_results["exact"], 2)
         if "mid" in benchmark_results:
             payload["frozenMidAcc"] = round(benchmark_results["mid"], 2)
         if "late" in benchmark_results:
@@ -2688,6 +2876,7 @@ async def _run_validation_snapshot(
 
     win_suite = frozen_suites.get("win") or []
     block_suite = frozen_suites.get("block") or []
+    exact_suite = frozen_suites.get("exact") or []
     if win_suite:
         pure_win_metrics, _ = _evaluate_decision_suite(
             model,
@@ -2726,6 +2915,25 @@ async def _run_validation_snapshot(
         )
         payload["pureFrozenBlockRecall"] = round(pure_block_metrics["accuracy"] * 100.0, 2)
         payload["hybridFrozenBlockRecall"] = round(hybrid_block_metrics["accuracy"] * 100.0, 2)
+    if exact_suite:
+        pure_exact_metrics, _ = _evaluate_decision_suite(
+            model,
+            exact_suite,
+            int(exact_suite[0].get("board_size", 0) or 0),
+            4 if variant == "ttt5" else (3 if variant == "ttt3" else 5),
+            decision_mode="pure",
+            suite_name="exact",
+        )
+        hybrid_exact_metrics, _ = _evaluate_decision_suite(
+            model,
+            exact_suite,
+            int(exact_suite[0].get("board_size", 0) or 0),
+            4 if variant == "ttt5" else (3 if variant == "ttt3" else 5),
+            decision_mode="hybrid",
+            suite_name="exact",
+        )
+        payload["pureExactTrapRecall"] = round(pure_exact_metrics["accuracy"] * 100.0, 2)
+        payload["hybridExactTrapRecall"] = round(hybrid_exact_metrics["accuracy"] * 100.0, 2)
 
     await callback({"type": "train.progress", "payload": payload})
     return payload
@@ -3372,7 +3580,7 @@ async def _run_training_epochs(
                         "tf32": runtime_flags["tf32"], "channelsLast": runtime_flags["channelsLast"],
                         "torchCompile": runtime_flags.get("torchCompile", False),
                         "compileMode": runtime_flags.get("compileMode"),
-                        "metricsHistory": cur_hist, "gpu": live_gpu, **telemetry,
+                        "metricsHistory": cur_hist, "gpu": live_gpu, **telemetry, **extra_fields,
                     },
                 })
                 last_emit_at = now
@@ -3608,6 +3816,7 @@ async def train_variant(
 
     registry = ModelRegistry(variant)
     manifest = registry.read_manifest()
+    serving_summary = registry.serving_summary()
     model_dir = _ensure_saved_dir(variant)
     requested_model_profile = str(kwargs.get("modelProfile", "auto"))
     current_manifest_profile = current_model_profile_from_manifest(manifest)
@@ -3800,6 +4009,7 @@ async def train_variant(
             "userCorpusEnabled": use_user_corpus,
             "userCorpusMode": user_corpus_mode if use_user_corpus else None,
             "userCorpusStats": user_corpus_stats if use_user_corpus else None,
+            **serving_summary,
             "gpu": live_gpu,
         },
     })
@@ -4159,6 +4369,25 @@ async def train_variant(
                 strong_result = exam_result
                 previous_exam = exam_summary_current
                 if exam_summary_current:
+                    challenger_result = await _run_challenger_vs_champion(
+                        model,
+                        registry,
+                        board_size=board_size,
+                        win_len=win_len,
+                        device=device,
+                        callback=callback,
+                        variant=variant,
+                        num_pairs=min(exam_pairs, 6),
+                        phase="arena",
+                        stage="challenger_eval",
+                    )
+                    if challenger_result is not None:
+                        exam_summary_current["winrateVsChampion"] = round(challenger_result.winrate_a, 4)
+                        exam_summary_current["decisiveWinRateVsChampion"] = round(challenger_result.decisive_winrate_a, 4)
+                        exam_summary_current["drawRateVsChampion"] = round(challenger_result.draw_rate, 4)
+                        exam_summary_current["winsVsChampion"] = int(challenger_result.wins_a)
+                        exam_summary_current["lossesVsChampion"] = int(challenger_result.wins_b)
+                        exam_summary_current["drawsVsChampion"] = int(challenger_result.draws)
                     winrate_history.append({
                         "cycle": cycle,
                         "winrate": round(exam_summary_current.get("winrate", 0), 4),
@@ -4176,6 +4405,8 @@ async def train_variant(
                         "pureAlignmentRate": round(exam_summary_current.get("pureAlignmentRate", 0), 4),
                         "pureMissedWinCount": int(exam_summary_current.get("pureMissedWinCount", 0) or 0),
                         "pureMissedBlockCount": int(exam_summary_current.get("pureMissedBlockCount", 0) or 0),
+                        "winrateVsChampion": round(exam_summary_current.get("winrateVsChampion", 0), 4),
+                        "decisiveWinRateVsChampion": round(exam_summary_current.get("decisiveWinRateVsChampion", 0), 4),
                         "wins": exam_summary_current.get("wins", 0),
                         "losses": exam_summary_current.get("losses", 0),
                         "draws": exam_summary_current.get("draws", 0),
@@ -4319,6 +4550,7 @@ async def train_variant(
         pure_tactical_failures: list[dict[str, Any]] = []
         win_suite = frozen_suites.get("win") or []
         block_suite = frozen_suites.get("block") or []
+        exact_suite = frozen_suites.get("exact") or []
         if win_suite:
             _win_bench, pure_win_failures = _evaluate_decision_suite(
                 model,
@@ -4341,6 +4573,17 @@ async def train_variant(
                 collect_failures=True,
             )
             pure_tactical_failures.extend(pure_block_failures[:16])
+        if exact_suite:
+            _exact_bench, pure_exact_failures = _evaluate_decision_suite(
+                model,
+                exact_suite,
+                board_size,
+                win_len,
+                decision_mode="pure",
+                suite_name="exact",
+                collect_failures=True,
+            )
+            pure_tactical_failures.extend(pure_exact_failures[:24])
         if pure_tactical_failures:
             failure_bank = _merge_failure_bank(
                 failure_bank,
@@ -4422,6 +4665,8 @@ async def train_variant(
                 "selectedCheckpointPureGapRate": selected_checkpoint_summary.get("pureGapRate"),
                 "selectedCheckpointPureGapRateAsP1": selected_checkpoint_summary.get("pureGapRateAsP1"),
                 "selectedCheckpointPureGapRateAsP2": selected_checkpoint_summary.get("pureGapRateAsP2"),
+                "selectedCheckpointWinrateVsChampion": selected_checkpoint_summary.get("winrateVsChampion"),
+                "selectedCheckpointDecisiveWinRateVsChampion": selected_checkpoint_summary.get("decisiveWinRateVsChampion"),
             },
         )
         await callback({
@@ -4436,6 +4681,8 @@ async def train_variant(
                 "selectedCheckpointDecisiveWinRate": selected_checkpoint_summary.get("decisiveWinRate"),
                 "selectedCheckpointDrawRate": selected_checkpoint_summary.get("drawRate"),
                 "message": "Restored best pre-repair checkpoint before final confirm exam",
+                "selectedCheckpointWinrateVsChampion": selected_checkpoint_summary.get("winrateVsChampion"),
+                "selectedCheckpointDecisiveWinRateVsChampion": selected_checkpoint_summary.get("decisiveWinRateVsChampion"),
             },
         })
         selected_validation = await _run_validation_snapshot(
@@ -4453,35 +4700,18 @@ async def train_variant(
         last_validation = selected_validation
 
     if registry.has_champion():
-        from trainer_lab.config import ModelConfig as _MC
-        from trainer_lab.models.resnet import PolicyValueResNet as _PVR
-
-        _cfg = _MC()
-        champion_manifest = registry.read_manifest()
-        _, (_rf, _rb, _vf) = _variant_model_hparams(board_size, _cfg, variant=variant, manifest=champion_manifest)
-        champion_model = _PVR(
-            in_channels=_cfg.in_channels,
-            res_filters=_rf,
-            res_blocks=_rb,
-            policy_filters=_cfg.policy_filters,
-            value_fc=_vf,
-            board_max=_cfg.board_max,
+        quick_result = await _run_challenger_vs_champion(
+            model,
+            registry,
+            board_size=board_size,
+            win_len=win_len,
+            device=device,
+            callback=callback,
+            variant=variant,
+            num_pairs=min(exam_pairs, 8),
+            phase="arena",
+            stage="quick_eval",
         )
-        champion_model = registry.load_champion_into(champion_model, device)
-        if champion_model is not None:
-            if device.type == "cuda":
-                champion_model = champion_model.to(memory_format=torch.channels_last)
-            quick_result = await arena_match(
-                model,
-                champion_model,
-                board_size,
-                win_len,
-                num_pairs=min(exam_pairs, 8),
-                device=device,
-                callback=callback,
-                variant=variant,
-            )
-            del champion_model
 
     # ── Self-Play MCTS Loop (optional, for strong models) ────────────
     do_selfplay = bool(kwargs.get("selfPlay", False))
@@ -4491,19 +4721,32 @@ async def train_variant(
     sp_train_steps = max(20, min(200, int(kwargs.get("selfPlayTrainSteps", 80))))
 
     if do_selfplay and board_size <= 9:
-        from trainer_lab.self_play.player import SelfPlayPlayer, GameState, mcts_search
+        from trainer_lab.self_play.mixed_replay import MixedReplay
+        from trainer_lab.self_play.player import SelfPlayPlayer
         from trainer_lab.config import SelfPlayConfig
-        from collections import deque
 
         logger.info("Self-play phase: %d iterations × %d games × %d sims", sp_iterations, sp_games, sp_sims)
 
-        sp_replay: deque[dict[str, Any]] = deque(maxlen=50000)
-        # Seed replay with existing anchor + tactical positions
-        sp_replay.extend(anchor_positions[:2000])
-        sp_replay.extend(tactical_positions[:1000])
+        replay_path = _selfplay_replay_path(variant)
+        sp_replay = MixedReplay(
+            total_capacity=50_000,
+            source_limits={
+                "anchor": 12_000,
+                "tactical": 8_000,
+                "failure": 10_000,
+                "user": 8_000,
+                "self_play": 20_000,
+            },
+        )
+        sp_replay.load(replay_path)
+        sp_replay.replace("anchor", anchor_positions[:2500])
+        sp_replay.replace("tactical", tactical_positions[:1500])
+        sp_replay.replace("failure", failure_bank[:1500])
+        sp_replay.replace("user", list(user_corpus_positions[:1500]) if user_corpus_positions else [])
 
         sp_config = SelfPlayConfig(games=1, simulations=sp_sims)
         best_sp_winrate = -1.0
+        best_sp_score: tuple[float, float, float, float, float, float, float, int] | None = None
         best_sp_state = None
 
         for sp_iter in range(1, sp_iterations + 1):
@@ -4547,11 +4790,22 @@ async def train_variant(
                     await asyncio.sleep(0)
 
             # Add to replay buffer
-            sp_replay.extend(sp_positions)
-            logger.info("Self-play iter %d: %d positions, buffer=%d", sp_iter, len(sp_positions), len(sp_replay))
+            sp_replay.add_many("self_play", sp_positions)
+            replay_weights = _selfplay_mixed_source_weights(sp_iter, sp_iterations)
+            replay_summary = sp_replay.summary()
+            logger.info(
+                "Self-play iter %d: %d new positions, mixed replay=%d (%s)",
+                sp_iter,
+                len(sp_positions),
+                len(sp_replay),
+                replay_summary["sources"],
+            )
 
             # --- Train on replay buffer ---
-            train_sample = random.sample(list(sp_replay), min(len(sp_replay), sp_train_steps * _cycle_batch_size))
+            train_sample = sp_replay.sample(
+                min(len(sp_replay), sp_train_steps * _cycle_batch_size),
+                source_weights=replay_weights,
+            )
             model.train()
             await _run_training_steps(
                 model, train_sample, sp_train_steps, _cycle_batch_size,
@@ -4562,6 +4816,8 @@ async def train_variant(
                 overall_percent_base=90 + 8 * (sp_iter - 0.5) / sp_iterations,
                 overall_percent_range=4 / sp_iterations,
                 variant=variant, boardSize=board_size, winLength=win_len,
+                mixedReplaySources=replay_summary["sources"],
+                mixedReplayWeights=replay_weights,
             )
 
             # --- Arena eval vs engine ---
@@ -4576,12 +4832,34 @@ async def train_variant(
                 sp_wr = sp_exam_summary.get("winrate", 0.0) if sp_exam_summary else 0.0
                 logger.info("Self-play iter %d: winrate=%.2f", sp_iter, sp_wr)
 
-                if sp_wr > best_sp_winrate:
+                challenger_result = await _run_challenger_vs_champion(
+                    model,
+                    registry,
+                    board_size=board_size,
+                    win_len=win_len,
+                    device=device,
+                    callback=callback,
+                    variant=variant,
+                    num_pairs=6,
+                    phase="arena",
+                    stage="self_play_challenger",
+                )
+                if challenger_result is not None and sp_exam_summary is not None:
+                    sp_exam_summary["winrateVsChampion"] = round(challenger_result.winrate_a, 4)
+                    sp_exam_summary["decisiveWinRateVsChampion"] = round(challenger_result.decisive_winrate_a, 4)
+                    sp_exam_summary["drawRateVsChampion"] = round(challenger_result.draw_rate, 4)
+
+                current_sp_score = _checkpoint_selection_score(
+                    sp_exam_summary or {"winrate": sp_wr, "decisiveWinRate": 0.0, "drawRate": 0.0},
+                    cycle_count + sp_iter,
+                )
+                if best_sp_score is None or current_sp_score > best_sp_score:
+                    best_sp_score = current_sp_score
                     best_sp_winrate = sp_wr
                     best_sp_state = {k: v.clone() for k, v in model.state_dict().items()}
 
                 if sp_failures:
-                    sp_replay.extend(sp_failures)
+                    sp_replay.add_many("failure", sp_failures)
 
                 previous_exam = sp_exam_summary
                 strong_result = sp_exam_result
@@ -4589,6 +4867,8 @@ async def train_variant(
                 winrate_history.append({
                     "cycle": cycle_count + sp_iter,
                     "winrate": round(sp_wr, 4),
+                    "winrateVsChampion": round((sp_exam_summary or {}).get("winrateVsChampion", 0), 4),
+                    "decisiveWinRateVsChampion": round((sp_exam_summary or {}).get("decisiveWinRateVsChampion", 0), 4),
                     "wins": sp_exam_summary.get("wins", 0) if sp_exam_summary else 0,
                     "losses": sp_exam_summary.get("losses", 0) if sp_exam_summary else 0,
                     "draws": sp_exam_summary.get("draws", 0) if sp_exam_summary else 0,
@@ -4596,6 +4876,7 @@ async def train_variant(
 
             registry.save_candidate(model, generation=cycle_count + sp_iter,
                                     metrics={"phase": "self_play", "iteration": sp_iter})
+            sp_replay.save(replay_path)
 
             # Convergence check
             sp_winrates = [h["winrate"] for h in winrate_history[-3:]]
@@ -4650,6 +4931,7 @@ async def train_variant(
         block_accuracy=block_acc,
         win_accuracy=win_acc,
         prev_algo_winrate=prev_algo_winrate,
+        require_champion_match=registry.has_champion(),
     )
     await callback({
         "type": "train.progress",
@@ -4722,6 +5004,8 @@ async def train_variant(
                     "selectedCheckpointPureGapRate": selected_summary_for_commit.get("pureGapRate"),
                     "selectedCheckpointPureGapRateAsP1": selected_summary_for_commit.get("pureGapRateAsP1"),
                     "selectedCheckpointPureGapRateAsP2": selected_summary_for_commit.get("pureGapRateAsP2"),
+                    "selectedCheckpointWinrateVsChampion": selected_summary_for_commit.get("winrateVsChampion"),
+                    "selectedCheckpointDecisiveWinRateVsChampion": selected_summary_for_commit.get("decisiveWinRateVsChampion"),
                     "winrateVsAlgorithm": decision.winrate_vs_algorithm,
                     "confirmDecisiveWinRate": confirm_summary.get("decisiveWinRate") if confirm_summary else None,
                     "confirmDrawRate": confirm_summary.get("drawRate") if confirm_summary else None,
@@ -4765,6 +5049,7 @@ async def train_variant(
         "teacherBackendResolved": engine_backend_resolved,
         "confirmBackendRequested": confirm_backend_requested,
         "confirmBackendResolved": confirm_backend_resolved,
+        **registry.serving_summary(),
     }
     if selected_checkpoint_summary:
         done_payload["selectedCheckpointWinrate"] = round(float(selected_checkpoint_summary.get("winrate", 0.0) or 0.0), 4)
@@ -4773,6 +5058,9 @@ async def train_variant(
         done_payload["selectedCheckpointWinrateAsP1"] = round(float(selected_checkpoint_summary.get("winrateAsP1", 0.0) or 0.0), 4)
         done_payload["selectedCheckpointWinrateAsP2"] = round(float(selected_checkpoint_summary.get("winrateAsP2", 0.0) or 0.0), 4)
         done_payload["selectedCheckpointBalancedSideWinrate"] = round(float(selected_checkpoint_summary.get("balancedSideWinrate", 0.0) or 0.0), 4)
+        if selected_checkpoint_summary.get("winrateVsChampion") is not None:
+            done_payload["selectedCheckpointWinrateVsChampion"] = round(float(selected_checkpoint_summary.get("winrateVsChampion", 0.0) or 0.0), 4)
+            done_payload["selectedCheckpointDecisiveWinRateVsChampion"] = round(float(selected_checkpoint_summary.get("decisiveWinRateVsChampion", 0.0) or 0.0), 4)
     if quick_result:
         done_payload["winrateVsChampion"] = round(quick_result.winrate_a, 4)
         done_payload["decisiveWinRateVsChampion"] = round(quick_result.decisive_winrate_a, 4)
@@ -4882,12 +5170,15 @@ async def train_variant(
             "holdoutNonFiniteTargetRate",
             "frozenBlockAcc",
             "frozenWinAcc",
+            "frozenExactAcc",
             "frozenMidAcc",
             "frozenLateAcc",
             "pureFrozenWinRecall",
             "pureFrozenBlockRecall",
             "hybridFrozenWinRecall",
             "hybridFrozenBlockRecall",
+            "pureExactTrapRecall",
+            "hybridExactTrapRecall",
         ):
             if latest_validation.get(key) is not None:
                 done_payload[key] = latest_validation[key]

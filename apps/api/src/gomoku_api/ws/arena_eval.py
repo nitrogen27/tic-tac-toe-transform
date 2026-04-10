@@ -216,6 +216,8 @@ async def arena_match(
     device: torch.device = torch.device("cpu"),
     callback: TRAIN_CALLBACK | None = None,
     variant: str = "",
+    phase: str = "arena",
+    stage: str = "quick_eval",
 ) -> ArenaResult:
     """Paired matches: candidate vs champion.
 
@@ -265,8 +267,8 @@ async def arena_match(
             await callback({
                 "type": "train.progress",
                 "payload": {
-                    "phase": "arena",
-                    "stage": "quick_eval",
+                    "phase": phase,
+                    "stage": stage,
                     "variant": variant,
                     "game": games_done,
                     "totalGames": total,

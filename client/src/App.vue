@@ -431,6 +431,12 @@
               <span v-if="ttt5Progress.winrateVsAlgorithm != null" class="strength-pill">
                 vs engine: {{ (ttt5Progress.winrateVsAlgorithm * 100).toFixed(1) }}%
               </span>
+              <span v-if="(ttt5Progress.servingSource ?? trainingMeta?.servingSource) != null" class="strength-pill">
+                serving: {{ ttt5Progress.servingSource ?? trainingMeta?.servingSource }}
+                <template v-if="(ttt5Progress.servingGeneration ?? trainingMeta?.servingGeneration) != null">
+                  #{{ ttt5Progress.servingGeneration ?? trainingMeta?.servingGeneration }}
+                </template>
+              </span>
               <span v-if="ttt5Progress.decisiveWinRate != null" class="strength-pill">
                 decisive: {{ (ttt5Progress.decisiveWinRate * 100).toFixed(1) }}%
               </span>
@@ -491,6 +497,9 @@
               <span v-if="(ttt5Progress.frozenWinAcc ?? trainingMeta?.frozenWinAcc) != null" class="strength-pill">
                 frozen win: {{ (ttt5Progress.frozenWinAcc ?? trainingMeta?.frozenWinAcc).toFixed(1) }}%
               </span>
+              <span v-if="(ttt5Progress.frozenExactAcc ?? trainingMeta?.frozenExactAcc) != null" class="strength-pill">
+                frozen exact: {{ (ttt5Progress.frozenExactAcc ?? trainingMeta?.frozenExactAcc).toFixed(1) }}%
+              </span>
               <span v-if="(ttt5Progress.frozenMidAcc ?? trainingMeta?.frozenMidAcc) != null" class="strength-pill">
                 frozen mid: {{ (ttt5Progress.frozenMidAcc ?? trainingMeta?.frozenMidAcc).toFixed(1) }}%
               </span>
@@ -500,6 +509,42 @@
               <span v-if="ttt5Progress.promotionDecision != null" class="strength-pill" :class="ttt5Progress.promoted ? 'promoted' : 'rejected'">
                 {{ ttt5Progress.promoted ? 'PROMOTED' : 'not promoted' }}
               </span>
+            </div>
+            <div v-if="
+              (ttt5Progress.pureFrozenWinRecall ?? trainingMeta?.pureFrozenWinRecall) != null ||
+              (ttt5Progress.pureFrozenBlockRecall ?? trainingMeta?.pureFrozenBlockRecall) != null ||
+              (ttt5Progress.pureExactTrapRecall ?? trainingMeta?.pureExactTrapRecall) != null
+            " class="strength-subblock">
+              <div class="strength-subheader">Pure</div>
+              <div class="strength-metrics">
+                <span v-if="(ttt5Progress.pureFrozenWinRecall ?? trainingMeta?.pureFrozenWinRecall) != null" class="strength-pill">
+                  win recall: {{ (ttt5Progress.pureFrozenWinRecall ?? trainingMeta?.pureFrozenWinRecall).toFixed(1) }}%
+                </span>
+                <span v-if="(ttt5Progress.pureFrozenBlockRecall ?? trainingMeta?.pureFrozenBlockRecall) != null" class="strength-pill">
+                  block recall: {{ (ttt5Progress.pureFrozenBlockRecall ?? trainingMeta?.pureFrozenBlockRecall).toFixed(1) }}%
+                </span>
+                <span v-if="(ttt5Progress.pureExactTrapRecall ?? trainingMeta?.pureExactTrapRecall) != null" class="strength-pill">
+                  exact traps: {{ (ttt5Progress.pureExactTrapRecall ?? trainingMeta?.pureExactTrapRecall).toFixed(1) }}%
+                </span>
+              </div>
+            </div>
+            <div v-if="
+              (ttt5Progress.hybridFrozenWinRecall ?? trainingMeta?.hybridFrozenWinRecall) != null ||
+              (ttt5Progress.hybridFrozenBlockRecall ?? trainingMeta?.hybridFrozenBlockRecall) != null ||
+              (ttt5Progress.hybridExactTrapRecall ?? trainingMeta?.hybridExactTrapRecall) != null
+            " class="strength-subblock">
+              <div class="strength-subheader">Hybrid</div>
+              <div class="strength-metrics">
+                <span v-if="(ttt5Progress.hybridFrozenWinRecall ?? trainingMeta?.hybridFrozenWinRecall) != null" class="strength-pill">
+                  win recall: {{ (ttt5Progress.hybridFrozenWinRecall ?? trainingMeta?.hybridFrozenWinRecall).toFixed(1) }}%
+                </span>
+                <span v-if="(ttt5Progress.hybridFrozenBlockRecall ?? trainingMeta?.hybridFrozenBlockRecall) != null" class="strength-pill">
+                  block recall: {{ (ttt5Progress.hybridFrozenBlockRecall ?? trainingMeta?.hybridFrozenBlockRecall).toFixed(1) }}%
+                </span>
+                <span v-if="(ttt5Progress.hybridExactTrapRecall ?? trainingMeta?.hybridExactTrapRecall) != null" class="strength-pill">
+                  exact traps: {{ (ttt5Progress.hybridExactTrapRecall ?? trainingMeta?.hybridExactTrapRecall).toFixed(1) }}%
+                </span>
+              </div>
             </div>
           </div>
 
@@ -3468,6 +3513,19 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
+}
+
+.strength-subblock {
+  margin-top: 8px;
+}
+
+.strength-subheader {
+  font-size: 0.72em;
+  font-weight: 700;
+  color: color-mix(in srgb, var(--text-secondary, #c8d0dd) 82%, var(--accent) 18%);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
 }
 
 .strength-pill {

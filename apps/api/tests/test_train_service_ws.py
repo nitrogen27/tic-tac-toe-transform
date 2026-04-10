@@ -5,10 +5,12 @@ import random
 import pytest
 
 from gomoku_api.ws.train_service_ws import (
+    _build_exact_ttt5_validation_pack,
     _build_pure_gap_relabel_candidate,
     _build_repair_pool,
     _build_turbo_pool,
     _build_train_pool,
+    _build_frozen_benchmark_suites,
     _checkpoint_selection_score,
     _choose_rapid_cycle_strategy,
     _compute_target_sanity_metrics,
@@ -23,10 +25,34 @@ from gomoku_api.ws.train_service_ws import (
     _resolve_engine_sampling_bounds,
     _run_engine_exam,
     _sample_engine_position,
+    _selfplay_mixed_source_weights,
     _soft_policy_from_engine_hints,
     _variant_model_hparams,
 )
 from trainer_lab.config import ModelConfig
+
+
+def test_build_exact_ttt5_validation_pack_contains_legal_targets() -> None:
+    positions = _build_exact_ttt5_validation_pack()
+
+    assert len(positions) >= 8
+    assert all(pos["source"] == "exact" for pos in positions)
+    assert any(bool(pos.get("conversionTarget")) for pos in positions)
+    for pos in positions:
+        board = [cell for row in pos["board"] for cell in row]
+        policy_index = next(i for i, weight in enumerate(pos["policy"]) if weight > 0.5)
+        row, col = divmod(policy_index, 16)
+        move = row * 5 + col
+        assert board[move] == 0
+        assert sum(pos["policy"]) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_build_frozen_benchmark_suites_adds_exact_pack_for_ttt5() -> None:
+    suites = await _build_frozen_benchmark_suites("ttt5", 5, 4, None)
+
+    assert "exact" in suites
+    assert len(suites["exact"]) >= 8
 
 
 @pytest.mark.asyncio
@@ -86,6 +112,16 @@ def test_variant_model_hparams_supports_ttt5_small_profile() -> None:
 
     assert profile == "small"
     assert ttt5_small == (64, 6, 128)
+
+
+def test_selfplay_mixed_source_weights_shift_toward_self_play() -> None:
+    early = _selfplay_mixed_source_weights(1, 10)
+    late = _selfplay_mixed_source_weights(10, 10)
+
+    assert sum(early.values()) == pytest.approx(1.0, abs=1e-6)
+    assert sum(late.values()) == pytest.approx(1.0, abs=1e-6)
+    assert late["self_play"] > early["self_play"]
+    assert late["anchor"] < early["anchor"]
 
 
 def test_policy_cell_index_maps_inside_padded_grid() -> None:
@@ -310,6 +346,28 @@ def test_choose_rapid_cycle_strategy_uses_pure_frozen_recalls() -> None:
     assert strategy["tacticalFocus"] == "block"
     assert strategy["tacticalRatio"] >= 0.65
     assert strategy["failureSlice"] >= 320
+
+
+def test_choose_rapid_cycle_strategy_responds_to_exact_trap_recall() -> None:
+    strategy = _choose_rapid_cycle_strategy(
+        {
+            "frozenBlockAcc": 95.0,
+            "frozenWinAcc": 95.0,
+            "pureFrozenBlockRecall": 92.0,
+            "pureFrozenWinRecall": 92.0,
+            "pureExactTrapRecall": 62.5,
+            "frozenMidAcc": 62.0,
+            "frozenLateAcc": 66.0,
+            "holdoutDeltaAcc": 0.0,
+        },
+        corrected_rate=0.25,
+        failure_bank_size=12,
+        engine_per_cycle=50,
+    )
+
+    assert strategy["failureSlice"] >= 384
+    assert strategy["tacticalRatio"] >= 0.65
+    assert strategy["conversionFocus"] is True
 
 
 def test_choose_rapid_cycle_strategy_enters_tactical_rescue_mode_on_zero_pure_win_recall() -> None:
@@ -742,6 +800,29 @@ def test_checkpoint_selection_score_prefers_lower_pure_gap_on_equal_hybrid_stren
     }
 
     assert _checkpoint_selection_score(lower_gap, 9) > _checkpoint_selection_score(higher_gap, 9)
+
+
+def test_checkpoint_selection_score_prefers_stronger_challenger_vs_champion() -> None:
+    weaker_vs_champion = {
+        "winrate": 0.80,
+        "decisiveWinRate": 0.60,
+        "drawRate": 0.20,
+        "winrateAsP1": 0.80,
+        "winrateAsP2": 0.80,
+        "winrateVsChampion": 0.45,
+        "decisiveWinRateVsChampion": 0.20,
+    }
+    stronger_vs_champion = {
+        "winrate": 0.72,
+        "decisiveWinRate": 0.50,
+        "drawRate": 0.22,
+        "winrateAsP1": 0.72,
+        "winrateAsP2": 0.72,
+        "winrateVsChampion": 0.60,
+        "decisiveWinRateVsChampion": 0.35,
+    }
+
+    assert _checkpoint_selection_score(stronger_vs_champion, 9) > _checkpoint_selection_score(weaker_vs_champion, 9)
 
 
 def test_build_pure_gap_relabel_candidate_captures_tactical_gap() -> None:

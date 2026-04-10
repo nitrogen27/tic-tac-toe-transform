@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from gomoku_api.ws import user_game_corpus
 from gomoku_api.ws.user_game_corpus import (
     CONVERSION_TYPES,
     UserGameCorpus,
@@ -131,7 +132,7 @@ def test_classify_move_quality_does_not_overcall_conversion_for_top_rank_move() 
 
 
 @pytest.mark.asyncio
-async def test_analyze_game_builds_teacher_backed_position() -> None:
+async def test_analyze_game_builds_teacher_backed_position(monkeypatch) -> None:
     board = [0] * 25
     board[0] = 1
     board[1] = 1
@@ -145,11 +146,23 @@ async def test_analyze_game_builds_teacher_backed_position() -> None:
         ],
     }
 
+    monkeypatch.setattr(
+        user_game_corpus,
+        "_model_predict",
+        lambda board, current, variant, board_size, decision_mode="hybrid": {
+            "move": 3,
+            "tacticalReason": "immediate_win",
+            "modelSource": "champion",
+        },
+    )
     positions = await analyze_game(game, 5, 4, FakeEngine())
 
     assert len(positions) == 1
     pos = positions[0]
     assert pos["teacher_best_move"] == 3
+    assert pos["hybrid_best_move"] == 3
+    assert pos["hybrid_matches_teacher"] is True
+    assert pos["hybrid_model_source"] == "champion"
     assert pos["mistake_type"] == "missed_win"
     assert pos["source"] == "user_conversion"
     assert pos["conversionTarget"] is True

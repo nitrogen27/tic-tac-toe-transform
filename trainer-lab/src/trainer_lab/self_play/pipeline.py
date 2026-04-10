@@ -15,7 +15,7 @@ from trainer_lab.evaluation.eval_script import evaluate_vs_random
 from trainer_lab.export.onnx_export import export_to_onnx
 from trainer_lab.models.resnet import PolicyValueResNet
 from trainer_lab.self_play.player import SelfPlayPlayer
-from trainer_lab.self_play.replay_buffer import ReplayBuffer
+from trainer_lab.self_play.mixed_replay import MixedReplay
 from trainer_lab.training.loss import GomokuLoss
 from trainer_lab.training.trainer import train_epoch
 
@@ -54,7 +54,7 @@ class SelfPlayPipeline:
         ).to(self.device)
 
         self.player = SelfPlayPlayer(self.model, self.selfplay_cfg, self.device)
-        self.buffer = ReplayBuffer(self.selfplay_cfg)
+        self.buffer = MixedReplay(total_capacity=self.selfplay_cfg.replay_buffer_max)
 
     def run(self, generations: int = 10, eval_every: int = 5) -> None:
         """Execute the self-play loop for *generations* iterations."""
@@ -75,13 +75,16 @@ class SelfPlayPipeline:
             logger.info("Gen %d: generating %d games...", gen, self.selfplay_cfg.games)
             self.model.eval()
             positions = self.player.generate_games()
-            self.buffer.add_many(positions)
+            self.buffer.add_many("self_play", positions)
             logger.info("Gen %d: buffer=%d, new=%d", gen, len(self.buffer), len(positions))
 
             # 2. Train on sampled positions
             if len(self.buffer) >= self.train_cfg.batch_size:
                 self.model.train()
-                sampled = self.buffer.sample(self.train_cfg.batch_size * 4)
+                sampled = self.buffer.sample(
+                    self.train_cfg.batch_size * 4,
+                    source_weights={"self_play": 1.0},
+                )
                 loader = self._make_loader(sampled)
                 for epoch in range(1, self.train_cfg.epochs + 1):
                     metrics = train_epoch(

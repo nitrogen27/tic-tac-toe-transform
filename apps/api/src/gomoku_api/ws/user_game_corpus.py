@@ -17,7 +17,7 @@ from typing import Any
 
 from gomoku_api.ws.offline_gen import _soft_policy_from_engine_hints
 from gomoku_api.ws.oracle_backends import create_oracle_evaluator
-from gomoku_api.ws.predict_service import _find_immediate_move
+from gomoku_api.ws.predict_service import _find_immediate_move, _model_predict
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +243,7 @@ async def analyze_game(
     model_player = int(game.get("playerRole", 2) or 2)
     previous_move = -1
     game_id = str(game.get("gameId", ""))
+    variant = str(game.get("variant") or (moves[0].get("variant") if moves else "ttt5") or "ttt5")
 
     for move_index, item in enumerate(moves, start=1):
         board = [int(v) for v in item.get("board", [])]
@@ -300,6 +301,37 @@ async def analyze_game(
         losing_side = winner in (1, 2) and winner != current
         conversion_target = mistake_type in CONVERSION_TYPES or teacher_value >= 0.45
         motif = mistake_type if mistake_type not in {"best", "good"} else phase
+        hybrid_best_move = -1
+        hybrid_decision_reason = ""
+        hybrid_model_source = "none"
+        hybrid_matches_teacher: bool | None = None
+        hybrid_matches_user: bool | None = None
+        should_query_hybrid = variant == "ttt5" and (
+            user_move != teacher_best
+            or had_immediate_win
+            or had_immediate_block
+            or teacher_value >= 0.35
+        )
+        if should_query_hybrid:
+            try:
+                hybrid_decision = _model_predict(board, current, variant, board_size, decision_mode="hybrid")
+                hybrid_best_move = int(hybrid_decision.get("move", -1))
+                hybrid_decision_reason = str(hybrid_decision.get("tacticalReason", "") or "")
+                hybrid_model_source = str(hybrid_decision.get("modelSource", "none") or "none")
+                hybrid_matches_teacher = hybrid_best_move == teacher_best
+                hybrid_matches_user = hybrid_best_move == user_move
+            except Exception as exc:
+                logger.debug("Hybrid relabel skipped for user corpus [game=%s move=%s]: %s", game_id, move_index, exc)
+
+        sample_weight = _sample_weight_for_position(
+            quality=quality,
+            mistake_type=mistake_type,
+            actor=actor,
+            current_player=current,
+            teacher_value=teacher_value,
+        )
+        if hybrid_matches_teacher and user_move != teacher_best:
+            sample_weight = round(sample_weight + 0.15, 4)
 
         positions.append({
             "board_size": board_size,
@@ -310,17 +342,16 @@ async def analyze_game(
             "value": teacher_value,
             "source": source,
             "motif": motif,
-            "sampleWeight": _sample_weight_for_position(
-                quality=quality,
-                mistake_type=mistake_type,
-                actor=actor,
-                current_player=current,
-                teacher_value=teacher_value,
-            ),
+            "sampleWeight": sample_weight,
             "playerFocus": current,
             "conversionTarget": conversion_target,
             "teacher_best_move": teacher_best,
             "teacher_value": teacher_value,
+            "hybrid_best_move": hybrid_best_move if hybrid_best_move >= 0 else None,
+            "hybrid_decision_reason": hybrid_decision_reason or None,
+            "hybrid_model_source": hybrid_model_source if hybrid_model_source != "none" else None,
+            "hybrid_matches_teacher": hybrid_matches_teacher,
+            "hybrid_matches_user": hybrid_matches_user,
             "user_move": user_move,
             "user_move_rank": rank,
             "move_quality": quality,

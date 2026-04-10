@@ -57,3 +57,22 @@ def test_promote_candidate_can_use_working_checkpoint_source(tmp_path, monkeypat
     assert registry.legacy_path.exists()
     manifest = registry.read_manifest()
     assert manifest["history"][-1]["winrateVsAlgorithm"] == 0.9
+
+
+def test_serving_summary_prefers_champion(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(model_registry, "SAVED_DIR", tmp_path)
+    registry = ModelRegistry("ttt5")
+    model = _tiny_model()
+
+    registry.save_working_candidate(model, generation=9, metrics={"winrateVsAlgorithm": 0.9})
+    registry.promote_candidate(
+        generation=9,
+        metrics={"winrateVsAlgorithm": 0.9},
+        source_path=registry.working_candidate_path,
+    )
+
+    summary = registry.serving_summary()
+
+    assert summary["servingReady"] is True
+    assert summary["servingSource"] == "champion"
+    assert summary["servingGeneration"] == 9

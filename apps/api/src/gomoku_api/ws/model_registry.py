@@ -146,6 +146,30 @@ class ModelRegistry:
     def has_champion(self) -> bool:
         return self.champion_path.exists() or self.legacy_path.exists()
 
+    def resolve_serving_checkpoint(self) -> tuple[Path | None, str]:
+        """Return the verified checkpoint that runtime is allowed to serve.
+
+        Serving must stay on the promoted champion. The legacy ``model.pt`` is
+        only kept as a compatibility alias for the same promoted weights.
+        """
+        if self.champion_path.exists():
+            return self.champion_path, "champion"
+        if self.legacy_path.exists():
+            return self.legacy_path, "legacy"
+        return None, "none"
+
+    def serving_summary(self) -> dict[str, Any]:
+        """Return lightweight metadata describing the active serving source."""
+        path, source = self.resolve_serving_checkpoint()
+        manifest = self.read_manifest()
+        return {
+            "variant": self.variant,
+            "servingReady": path is not None,
+            "servingSource": source,
+            "servingCheckpointPath": str(path) if path is not None else None,
+            "servingGeneration": manifest.get("current_champion_generation"),
+        }
+
     def has_active_candidate(self) -> bool:
         return self.candidate_path.exists()
 

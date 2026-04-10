@@ -783,6 +783,11 @@ async def _engine_predict(board: list[int], current: int, board_size: int, win_l
 # ---------------------------------------------------------------------------
 
 _loaded_models: dict[str, Any] = {}
+_loaded_model_sources: dict[str, str] = {}
+
+
+def _current_model_source(variant: str) -> str:
+    return _loaded_model_sources.get(variant, "none")
 
 
 def _maybe_compile_model(model: Any) -> Any:
@@ -805,17 +810,13 @@ def _get_model(variant: str):
     if variant in _loaded_models:
         return _loaded_models[variant]
 
-    # Prefer champion.pt (verified model), then candidate.pt (latest trained
-    # model), then legacy model.pt. This keeps pure-model mode usable even
-    # when a fresh training run has produced only candidate.pt and promotion
-    # has not happened yet.
-    variant_dir = SAVED_DIR / f"{variant}_resnet"
-    model_path = variant_dir / "champion.pt"
-    if not model_path.exists():
-        model_path = variant_dir / "candidate.pt"
-    if not model_path.exists():
-        model_path = variant_dir / "model.pt"
-    if not model_path.exists():
+    registry = ModelRegistry(variant)
+    # Serve only the promoted checkpoint. ``model.pt`` is just a legacy alias
+    # for the same promoted weights and remains safe to use as compatibility
+    # fallback, but active candidates must not leak into runtime serving.
+    model_path, model_source = registry.resolve_serving_checkpoint()
+    if model_path is None:
+        _loaded_model_sources[variant] = "none"
         return None
 
     try:
@@ -850,16 +851,19 @@ def _get_model(variant: str):
             model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
         except Exception as exc:
             logger.warning("Model checkpoint %s is incompatible with current architecture: %s", model_path, exc)
+            _loaded_model_sources[variant] = "none"
             return None
         model.eval()
         if torch.cuda.is_available():
             model = model.cuda()
             model = _maybe_compile_model(model)
         _loaded_models[variant] = model
-        logger.info("Loaded model for %s from %s (profile=%s)", variant, model_path, model_profile)
+        _loaded_model_sources[variant] = model_source
+        logger.info("Loaded serving model for %s from %s (source=%s, profile=%s)", variant, model_path, model_source, model_profile)
         return model
     except Exception as exc:
         logger.error("Failed to load model %s: %s", variant, exc)
+        _loaded_model_sources[variant] = "none"
         return None
 
 
@@ -902,6 +906,7 @@ def _model_predict(
             "isRandom": resolved_mode == "pure",
             "fallback": True,
             "decisionMode": resolved_mode,
+            "modelSource": "none",
             **tactical_meta,
         }
 
@@ -919,6 +924,7 @@ def _model_predict(
             "mode": "model",
             "isRandom": False,
             "fallback": False,
+            "modelSource": _current_model_source(variant),
             **selection,
         }
     except Exception as exc:
@@ -933,6 +939,7 @@ def _model_predict(
             "isRandom": False,
             "fallback": True,
             "decisionMode": resolved_mode,
+            "modelSource": _current_model_source(variant),
             **tactical_meta,
         }
 
@@ -940,6 +947,7 @@ def _model_predict(
 def clear_cached_model(variant: str) -> None:
     """Remove model from cache so it's reloaded next time."""
     _loaded_models.pop(variant, None)
+    _loaded_model_sources.pop(variant, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1006,6 +1014,7 @@ def _mcts_predict(
         "mode": "model",
         "isRandom": False,
         "fallback": False,
+        "modelSource": _current_model_source(variant),
         "value": round(root_value, 4),
         "searchBacked": True,
         "searchMode": "mcts",

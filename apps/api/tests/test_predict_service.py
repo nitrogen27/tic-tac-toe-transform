@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from pathlib import Path
 
+from gomoku_api.ws import model_registry
 from gomoku_api.ws import predict_service
 
 
@@ -313,7 +314,7 @@ def test_model_predict_pure_mode_without_checkpoint_does_not_use_strong_tactical
     assert result["move"] != 15
 
 
-def test_get_model_falls_back_to_candidate_checkpoint(tmp_path, monkeypatch) -> None:
+def test_get_model_requires_verified_serving_checkpoint_not_candidate(tmp_path, monkeypatch) -> None:
     saved_dir = tmp_path / "saved"
     variant_dir = saved_dir / "ttt5_resnet"
     variant_dir.mkdir(parents=True)
@@ -332,6 +333,35 @@ def test_get_model_falls_back_to_candidate_checkpoint(tmp_path, monkeypatch) -> 
     )
     torch.save(model.state_dict(), variant_dir / "candidate.pt")
 
+    monkeypatch.setattr(model_registry, "SAVED_DIR", Path(saved_dir))
+    monkeypatch.setattr(predict_service, "SAVED_DIR", Path(saved_dir))
+    predict_service.clear_cached_model("ttt5")
+
+    loaded = predict_service._get_model("ttt5")
+
+    assert loaded is None
+
+
+def test_get_model_loads_champion_checkpoint_for_serving(tmp_path, monkeypatch) -> None:
+    saved_dir = tmp_path / "saved"
+    variant_dir = saved_dir / "ttt5_resnet"
+    variant_dir.mkdir(parents=True)
+
+    from trainer_lab.config import ModelConfig
+    from trainer_lab.models.resnet import PolicyValueResNet
+
+    cfg = ModelConfig()
+    model = PolicyValueResNet(
+        in_channels=cfg.in_channels,
+        res_filters=96,
+        res_blocks=8,
+        policy_filters=cfg.policy_filters,
+        value_fc=160,
+        board_max=cfg.board_max,
+    )
+    torch.save(model.state_dict(), variant_dir / "champion.pt")
+
+    monkeypatch.setattr(model_registry, "SAVED_DIR", Path(saved_dir))
     monkeypatch.setattr(predict_service, "SAVED_DIR", Path(saved_dir))
     predict_service.clear_cached_model("ttt5")
 

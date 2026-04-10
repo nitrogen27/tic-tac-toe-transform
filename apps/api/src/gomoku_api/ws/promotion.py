@@ -50,6 +50,7 @@ def evaluate_promotion(
     win_threshold: float = 70.0,
     prev_algo_winrate: float | None = None,
     algo_regression_margin: float = 0.10,
+    require_champion_match: bool = False,
 ) -> PromotionDecision:
     """Evaluate whether candidate should be promoted to champion.
 
@@ -77,6 +78,9 @@ def evaluate_promotion(
     # Check win accuracy
     if win_accuracy < win_threshold:
         reasons.append(f"winAcc {win_accuracy:.1f}% < {win_threshold:.0f}%")
+
+    if require_champion_match and quick_arena is None:
+        reasons.append("wrVsChampion unavailable")
 
     # Check winrate vs champion
     if wr_champion is not None and wr_champion < champion_threshold:
