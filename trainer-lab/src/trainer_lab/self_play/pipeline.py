@@ -1,9 +1,10 @@
-"""End-to-end self-play training pipeline: generate → train → evaluate → export."""
+"""End-to-end self-play training pipeline: self-play → replay → learner → evaluator."""
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
+from copy import deepcopy
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -11,7 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from trainer_lab.config import ModelConfig, TrainConfig, SelfPlayConfig
 from trainer_lab.data.encoder import board_to_tensor
 from trainer_lab.data.policy import pad_policy_target
-from trainer_lab.evaluation.eval_script import evaluate_vs_random
+from trainer_lab.evaluation.eval_script import evaluate_vs_previous_checkpoint, evaluate_vs_random
 from trainer_lab.export.onnx_export import export_to_onnx
 from trainer_lab.models.resnet import PolicyValueResNet
 from trainer_lab.self_play.player import SelfPlayPlayer
@@ -23,13 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 class SelfPlayPipeline:
-    """Orchestrates the generate → train → evaluate → export loop.
+    """Orchestrates a compact AlphaZero-style self-play loop.
 
-    1. Use the current model to play self-play games via MCTS.
-    2. Collect positions into the replay buffer.
-    3. Train the model on sampled positions for N epochs.
-    4. Evaluate the model against a random opponent every E generations.
-    5. Export to ONNX every E generations.
+    1. Use the current checkpoint to generate self-play games via MCTS.
+    2. Store visit-count targets in replay.
+    3. Train on replay only after enough samples accumulate.
+    4. Evaluate against the previous checkpoint every E generations.
+    5. Export ONNX snapshots for inspection.
     """
 
     def __init__(
@@ -69,6 +70,8 @@ class SelfPlayPipeline:
         criterion = GomokuLoss(weight_value=self.train_cfg.weight_value)
         use_amp = self.train_cfg.mixed_precision and self.device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda") if use_amp else None
+        previous_eval_model = deepcopy(self.model).to(self.device)
+        previous_eval_model.eval()
 
         for gen in range(1, generations + 1):
             # 1. Generate self-play games
@@ -78,8 +81,8 @@ class SelfPlayPipeline:
             self.buffer.add_many("self_play", positions)
             logger.info("Gen %d: buffer=%d, new=%d", gen, len(self.buffer), len(positions))
 
-            # 2. Train on sampled positions
-            if len(self.buffer) >= self.train_cfg.batch_size:
+            # 2. Train on replay only after a healthy warm-up, like AlphaZero.
+            if len(self.buffer) >= max(self.train_cfg.batch_size, self.selfplay_cfg.min_replay_samples):
                 self.model.train()
                 sampled = self.buffer.sample(
                     self.train_cfg.batch_size * 4,
@@ -99,12 +102,38 @@ class SelfPlayPipeline:
                             metrics.get("value_mae", 0),
                         )
 
-            # 3. Evaluate every N generations
+            # 3. Evaluate against the previous checkpoint every N generations.
             if gen % eval_every == 0:
                 self.model.eval()
-                results = evaluate_vs_random(self.model, num_games=20, device=self.device)
-                logger.info("Gen %d eval: wins=%.0f%% draws=%.0f%% losses=%.0f%%",
-                            gen, results["wins"] * 100, results["draws"] * 100, results["losses"] * 100)
+                results = evaluate_vs_previous_checkpoint(
+                    self.model,
+                    previous_eval_model,
+                    num_games=self.selfplay_cfg.evaluation_games,
+                    board_size=15,
+                    simulations=self.selfplay_cfg.evaluation_simulations,
+                    deterministic=self.selfplay_cfg.deterministic_eval,
+                    device=self.device,
+                )
+                logger.info(
+                    "Gen %d eval vs prev: wins=%.0f%% draws=%.0f%% losses=%.0f%% first=%.0f%% second=%.0f%%",
+                    gen,
+                    results["wins"] * 100,
+                    results["draws"] * 100,
+                    results["losses"] * 100,
+                    results["wins_as_first"] * 100,
+                    results["wins_as_second"] * 100,
+                )
+
+                random_results = evaluate_vs_random(self.model, num_games=10, device=self.device)
+                logger.info(
+                    "Gen %d eval vs random: wins=%.0f%% draws=%.0f%% losses=%.0f%%",
+                    gen,
+                    random_results["wins"] * 100,
+                    random_results["draws"] * 100,
+                    random_results["losses"] * 100,
+                )
+                previous_eval_model.load_state_dict(self.model.state_dict())
+                previous_eval_model.eval()
 
             # 4. Export ONNX every N generations
             if gen % eval_every == 0:

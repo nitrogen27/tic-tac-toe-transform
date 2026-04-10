@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from trainer_lab.config import ModelConfig, SelfPlayConfig
+from trainer_lab.evaluation.eval_script import evaluate_vs_previous_checkpoint
 from trainer_lab.models.resnet import PolicyValueResNet
 from trainer_lab.self_play.player import GameState, MCTSNode, SelfPlayPlayer, mcts_search
 from trainer_lab.self_play.replay_buffer import ReplayBuffer
@@ -132,6 +133,17 @@ class TestMCTSNode:
         parent.children = [c1, c2]
         assert parent.best_child().move == 1  # higher prior → higher UCB initially
 
+    def test_best_child_flips_q_from_child_perspective(self):
+        parent = MCTSNode(parent=None, move=-1, prior=1.0)
+        parent.visit_count = 20
+        c1 = MCTSNode(parent=parent, move=0, prior=0.5)
+        c2 = MCTSNode(parent=parent, move=1, prior=0.5)
+        c1.visit_count = c2.visit_count = 10
+        c1.value_sum = 8.0   # Q=0.8, good for child/opponent
+        c2.value_sum = 1.0   # Q=0.1, better for parent
+        parent.children = [c1, c2]
+        assert parent.best_child().move == 1
+
 
 # ---------------------------------------------------------------------------
 # MCTS search smoke test
@@ -142,7 +154,7 @@ class TestMCTSSearch:
     def test_returns_valid_policy(self):
         model = _make_small_model()
         state = GameState(7)
-        policy, value = mcts_search(state, model, torch.device("cpu"), num_simulations=8)
+        policy, value = mcts_search(state, model, torch.device("cpu"), num_simulations=8, root_noise=False)
         assert len(policy) == 49
         assert sum(policy) == pytest.approx(1.0, abs=0.01)
         assert all(p >= 0 for p in policy)
@@ -156,7 +168,7 @@ class TestMCTSSearch:
 class TestSelfPlayPlayer:
     def test_play_game_returns_positions(self):
         model = _make_small_model()
-        cfg = SelfPlayConfig(simulations=4, games=1)
+        cfg = SelfPlayConfig(simulations=4, games=1, warm_up_steps=4)
         player = SelfPlayPlayer(model, cfg, torch.device("cpu"))
         positions = player.play_game(board_size=7)
         assert len(positions) > 0
@@ -166,6 +178,23 @@ class TestSelfPlayPlayer:
         assert "policy" in pos
         assert "value" in pos
         assert len(pos["policy"]) == 256  # padded to 16x16
+
+
+class TestEvaluation:
+    def test_evaluate_vs_previous_checkpoint_smoke(self):
+        current = _make_small_model()
+        previous = _make_small_model()
+        results = evaluate_vs_previous_checkpoint(
+            current,
+            previous,
+            num_games=2,
+            board_size=5,
+            win_length=4,
+            simulations=2,
+            deterministic=True,
+            device=torch.device("cpu"),
+        )
+        assert set(results.keys()) == {"wins", "losses", "draws", "wins_as_first", "wins_as_second"}
 
 
 # ---------------------------------------------------------------------------

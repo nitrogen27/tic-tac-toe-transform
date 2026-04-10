@@ -1,4 +1,4 @@
-"""Evaluate a trained model against random or engine-based opponents."""
+"""Evaluate a trained model against random or previous-checkpoint opponents."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import torch
 from trainer_lab.config import ModelConfig
 from trainer_lab.data.encoder import board_to_tensor
 from trainer_lab.models.resnet import PolicyValueResNet
+from trainer_lab.self_play.player import GameState, mcts_search
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,34 @@ def _model_move(
                     best_score = logits[idx].item()
                     best_move = (r, c)
     return best_move
+
+
+def _mcts_model_move(
+    model: PolicyValueResNet,
+    state: GameState,
+    device: torch.device,
+    *,
+    simulations: int,
+    deterministic: bool,
+) -> int | None:
+    """Choose a move from MCTS visit counts."""
+    policy_flat, _ = mcts_search(
+        state,
+        model,
+        device,
+        num_simulations=simulations,
+        root_noise=False,
+    )
+    legal = state.legal_moves()
+    if not legal:
+        return None
+    if deterministic:
+        return max(legal, key=lambda idx: policy_flat[idx])
+    total = sum(policy_flat[idx] for idx in legal)
+    if total <= 0:
+        return random.choice(legal)
+    weights = [policy_flat[idx] for idx in legal]
+    return random.choices(legal, weights=weights, k=1)[0]
 
 
 def _apply_move(position: dict, move: tuple[int, int]) -> dict:
@@ -158,4 +187,87 @@ def evaluate_vs_random(
         "wins": wins / total,
         "losses": losses / total,
         "draws": draws / total,
+    }
+
+
+def evaluate_vs_previous_checkpoint(
+    current_model: PolicyValueResNet,
+    previous_model: PolicyValueResNet,
+    *,
+    num_games: int = 20,
+    board_size: int = 15,
+    win_length: int | None = None,
+    max_moves: int | None = None,
+    simulations: int = 400,
+    deterministic: bool = True,
+    device: torch.device | None = None,
+) -> dict[str, float]:
+    """Head-to-head evaluation of current model against previous checkpoint.
+
+    Colors alternate by game so the result is not biased by first-move advantage.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    wl = win_length if win_length is not None else (4 if board_size <= 5 else 5)
+    limit = max_moves if max_moves is not None else board_size * board_size
+
+    current_model.eval()
+    previous_model.eval()
+    current_model.to(device)
+    previous_model.to(device)
+
+    wins = draws = losses = 0
+    wins_as_first = wins_as_second = 0
+
+    for game_idx in range(num_games):
+        state = GameState(board_size, wl)
+        current_is_first = (game_idx % 2 == 0)
+        game_result = 0
+
+        for _ in range(limit):
+            if (state.current_player == 1 and current_is_first) or (state.current_player == 2 and not current_is_first):
+                move = _mcts_model_move(
+                    current_model,
+                    state,
+                    device,
+                    simulations=simulations,
+                    deterministic=deterministic,
+                )
+            else:
+                move = _mcts_model_move(
+                    previous_model,
+                    state,
+                    device,
+                    simulations=simulations,
+                    deterministic=deterministic,
+                )
+            if move is None:
+                break
+            state = state.apply_move(move)
+            terminal, winner = state.is_terminal()
+            if terminal:
+                game_result = winner
+                break
+
+        if game_result == 0:
+            draws += 1
+            continue
+
+        current_won = (game_result == 1 and current_is_first) or (game_result == 2 and not current_is_first)
+        if current_won:
+            wins += 1
+            if current_is_first:
+                wins_as_first += 1
+            else:
+                wins_as_second += 1
+        else:
+            losses += 1
+
+    total = max(num_games, 1)
+    return {
+        "wins": wins / total,
+        "losses": losses / total,
+        "draws": draws / total,
+        "wins_as_first": wins_as_first / max(1, (num_games + 1) // 2),
+        "wins_as_second": wins_as_second / max(1, num_games // 2),
     }

@@ -124,7 +124,10 @@ class MCTSNode:
     def ucb_score(self, c_puct: float = 1.5) -> float:
         parent_visits = self.parent.visit_count if self.parent else 1
         u = c_puct * self.prior * math.sqrt(parent_visits) / (1 + self.visit_count)
-        return self.q_value + u
+        # Child Q is stored from the child/to-play perspective.
+        # When selecting from the parent node in a two-player zero-sum game
+        # we need the score from the parent perspective, hence -Q + U.
+        return -self.q_value + u
 
     def best_child(self, c_puct: float = 1.5) -> MCTSNode:
         return max(self.children, key=lambda c: c.ucb_score(c_puct))
@@ -180,6 +183,7 @@ def mcts_search(
     c_puct: float = 1.5,
     dirichlet_alpha: float = 0.03,
     dirichlet_weight: float = 0.25,
+    root_noise: bool = True,
 ) -> tuple[list[float], float]:
     """Run MCTS from root_state. Returns (policy_vector, root_value).
 
@@ -189,8 +193,8 @@ def mcts_search(
     root = MCTSNode(parent=None, move=-1, prior=1.0)
     root_value = _expand_node(root, root_state, model, device)
 
-    # Add Dirichlet noise to root priors for exploration
-    if root.children:
+    # Add Dirichlet noise to root priors for exploration during self-play.
+    if root_noise and root.children:
         noise = np.random.dirichlet([dirichlet_alpha] * len(root.children))
         for child, n in zip(root.children, noise):
             child.prior = (1 - dirichlet_weight) * child.prior + dirichlet_weight * n
@@ -265,8 +269,8 @@ class SelfPlayPlayer:
         state = GameState(board_size, wl)
         positions: list[dict] = []
         move_count = 0
-        # Temperature exploration: proportional for first N moves, then greedy
-        tau_threshold = max(4, board_size)  # 5 for ttt5, 15 for gomoku15
+        # Follow AlphaZero warm-up behavior: sample early, then become greedy.
+        tau_threshold = max(1, int(self.config.warm_up_steps))
 
         while True:
             terminal, winner = state.is_terminal()
@@ -278,6 +282,10 @@ class SelfPlayPlayer:
                 self.model,
                 self.device,
                 num_simulations=self.config.simulations,
+                c_puct=self.config.c_puct,
+                dirichlet_alpha=self.config.dirichlet_alpha,
+                dirichlet_weight=self.config.dirichlet_weight,
+                root_noise=True,
             )
 
             # Convert board_size^2 policy to 256-padded (16x16) format
@@ -300,14 +308,14 @@ class SelfPlayPlayer:
 
             # Temperature-based move selection
             if move_count < tau_threshold:
-                # Sample proportionally (tau=1)
+                # Sample proportionally during opening exploration.
                 total = sum(policy_flat)
                 if total > 0:
                     move = random.choices(range(len(policy_flat)), weights=policy_flat, k=1)[0]
                 else:
                     move = random.choice(state.legal_moves())
             else:
-                # Greedy (tau->0)
+                # Greedy after warm-up, like deterministic evaluation.
                 move = max(range(len(policy_flat)), key=lambda i: policy_flat[i])
 
             state = state.apply_move(move)

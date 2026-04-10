@@ -35,8 +35,10 @@ from trainer_lab.config import ModelConfig
 def test_build_exact_ttt5_validation_pack_contains_legal_targets() -> None:
     positions = _build_exact_ttt5_validation_pack()
 
-    assert len(positions) >= 8
+    assert len(positions) >= 12
     assert all(pos["source"] == "exact" for pos in positions)
+    assert all(str(pos.get("exactFamily", "")) for pos in positions)
+    assert len({str(pos.get("exactFamily")) for pos in positions}) >= 8
     assert any(bool(pos.get("conversionTarget")) for pos in positions)
     for pos in positions:
         board = [cell for row in pos["board"] for cell in row]
@@ -52,7 +54,7 @@ async def test_build_frozen_benchmark_suites_adds_exact_pack_for_ttt5() -> None:
     suites = await _build_frozen_benchmark_suites("ttt5", 5, 4, None)
 
     assert "exact" in suites
-    assert len(suites["exact"]) >= 8
+    assert len(suites["exact"]) >= 12
 
 
 @pytest.mark.asyncio
@@ -367,6 +369,32 @@ def test_choose_rapid_cycle_strategy_responds_to_exact_trap_recall() -> None:
 
     assert strategy["failureSlice"] >= 384
     assert strategy["tacticalRatio"] >= 0.65
+    assert strategy["conversionFocus"] is True
+
+
+def test_choose_rapid_cycle_strategy_responds_to_worst_trap_family_and_p2_traps() -> None:
+    strategy = _choose_rapid_cycle_strategy(
+        {
+            "frozenBlockAcc": 95.0,
+            "frozenWinAcc": 95.0,
+            "pureFrozenBlockRecall": 92.0,
+            "pureFrozenWinRecall": 92.0,
+            "pureExactTrapRecall": 88.0,
+            "pureWorstTrapFamilyRecall": 60.0,
+            "pureP2TrapRecall": 50.0,
+            "frozenMidAcc": 62.0,
+            "frozenLateAcc": 66.0,
+            "holdoutDeltaAcc": 0.0,
+        },
+        corrected_rate=0.25,
+        failure_bank_size=12,
+        engine_per_cycle=50,
+    )
+
+    assert strategy["engineCurrentPlayerFocus"] == 2
+    assert strategy["playerFocusRatio"] >= 0.45
+    assert strategy["failureSlice"] >= 416
+    assert strategy["tacticalRatio"] >= 0.68
     assert strategy["conversionFocus"] is True
 
 
@@ -726,6 +754,39 @@ def test_evaluate_decision_suite_collects_pure_block_failures(monkeypatch) -> No
     assert failures[0]["motif"] == "pure_missed_block"
     assert failures[0]["source"] == "failure_pure_gap"
     assert failures[0]["pureMissedBlockInOne"] is True
+
+
+def test_evaluate_decision_suite_reports_family_and_side_recalls(monkeypatch) -> None:
+    exact_pack = _build_exact_ttt5_validation_pack()
+    positions = [exact_pack[0], exact_pack[6]]
+    target_index = next(i for i, weight in enumerate(positions[0]["policy"]) if weight > 0.5)
+    row, col = divmod(target_index, 16)
+    target_move = row * 5 + col
+    winning_player = int(positions[0]["current_player"])
+
+    def fake_loaded_model_decision(board, current_player, board_size, win_len, model, decision_mode="pure"):
+        if current_player == winning_player:
+            return {"move": target_move}
+        return {"move": 24}
+
+    monkeypatch.setattr("gomoku_api.ws.predict_service._loaded_model_decision", fake_loaded_model_decision)
+
+    metrics, _ = _evaluate_decision_suite(
+        model=None,
+        positions=positions,
+        board_size=5,
+        win_len=4,
+        decision_mode="pure",
+        suite_name="exact",
+    )
+
+    assert metrics["total"] == 2
+    assert metrics["accuracy"] == pytest.approx(0.5)
+    assert metrics["familyCount"] >= 1
+    assert metrics["worstFamilyRecall"] <= metrics["accuracy"]
+    assert metrics["p1Recall"] == pytest.approx(0.0)
+    assert metrics["p2Recall"] == pytest.approx(1.0)
+    assert metrics["familyRecall"]
 
 
 def test_soft_policy_from_engine_hints_creates_distribution_not_one_hot() -> None:

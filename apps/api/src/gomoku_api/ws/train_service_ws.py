@@ -1306,6 +1306,8 @@ def _choose_rapid_cycle_strategy(
     pure_block_recall = validation_payload.get("pureFrozenBlockRecall")
     pure_win_recall = validation_payload.get("pureFrozenWinRecall")
     pure_exact_recall = validation_payload.get("pureExactTrapRecall")
+    pure_p2_trap_recall = validation_payload.get("pureP2TrapRecall")
+    pure_worst_trap_family_recall = validation_payload.get("pureWorstTrapFamilyRecall")
     holdout_delta = float(validation_payload.get("holdoutDeltaAcc", 0.0) or 0.0)
 
     suites = [
@@ -1358,6 +1360,20 @@ def _choose_rapid_cycle_strategy(
             strategy["conversionFocus"] = True
             if strategy["engineFocus"] is None:
                 strategy["engineFocus"] = "mid"
+    if pure_worst_trap_family_recall is not None:
+        worst_family_recall = float(pure_worst_trap_family_recall)
+        if worst_family_recall < 80.0:
+            strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.68)
+            strategy["failureSlice"] = max(int(strategy["failureSlice"]), 416)
+        if worst_family_recall < 65.0:
+            strategy["conversionFocus"] = True
+            if strategy["engineFocus"] is None:
+                strategy["engineFocus"] = "mid"
+    if pure_p2_trap_recall is not None and float(pure_p2_trap_recall) < 85.0:
+        strategy["engineCurrentPlayerFocus"] = 2
+        strategy["playerFocusRatio"] = max(float(strategy["playerFocusRatio"]), 0.45)
+        strategy["failureSlice"] = max(int(strategy["failureSlice"]), 384)
+        strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.65)
 
     # Midgame conversion is the current bottleneck once tactical suites are strong.
     if mid_bench is not None and (late_bench is None or float(mid_bench) + 8.0 < float(late_bench)):
@@ -2609,6 +2625,7 @@ def _build_exact_ttt5_validation_pack() -> list[dict[str, Any]]:
         current_player: int,
         target_move: int,
         *,
+        family: str,
         motif: str,
         value: float,
         conversion_target: bool,
@@ -2627,19 +2644,25 @@ def _build_exact_ttt5_validation_pack() -> list[dict[str, Any]]:
             "sampleWeight": sample_weight,
             "playerFocus": current_player,
             "conversionTarget": conversion_target,
+            "exactFamily": family,
         }
 
     return [
-        _position({4: 1, 9: 1, 14: 1, 1: 2, 7: 2, 16: 2}, 2, 19, motif="exact_block_edge_vertical", value=0.35, conversion_target=False, sample_weight=2.15),
-        _position({3: 1, 7: 1, 11: 1, 1: 2, 12: 2, 22: 2}, 2, 15, motif="exact_block_edge_diagonal", value=0.35, conversion_target=False, sample_weight=2.15),
-        _position({0: 1, 6: 1, 12: 1, 4: 2, 8: 2, 17: 2}, 2, 18, motif="exact_block_main_diagonal", value=0.35, conversion_target=False, sample_weight=2.15),
-        _position({20: 2, 21: 2, 22: 2, 1: 1, 7: 1, 14: 1}, 1, 23, motif="exact_block_bottom_edge", value=0.35, conversion_target=False, sample_weight=2.1),
-        _position({0: 2, 5: 2, 10: 2, 12: 1, 18: 1}, 1, 15, motif="exact_block_left_edge", value=0.35, conversion_target=False, sample_weight=2.1),
-        _position({6: 2, 12: 2, 18: 2, 3: 1, 9: 1}, 1, 24, motif="exact_block_long_diagonal", value=0.35, conversion_target=False, sample_weight=2.15),
-        _position({2: 2, 7: 2, 12: 2, 4: 1, 9: 1}, 2, 17, motif="exact_win_vertical", value=1.0, conversion_target=True, sample_weight=2.3),
-        _position({15: 1, 16: 1, 17: 1, 2: 2, 7: 2, 12: 2}, 1, 18, motif="exact_win_horizontal", value=1.0, conversion_target=True, sample_weight=2.3),
-        _position({1: 1, 7: 1, 13: 1, 5: 2, 10: 2, 22: 2}, 1, 19, motif="exact_win_diagonal", value=1.0, conversion_target=True, sample_weight=2.3),
-        _position({4: 2, 8: 2, 12: 2, 0: 1, 6: 1}, 2, 16, motif="exact_win_edge_diagonal", value=1.0, conversion_target=True, sample_weight=2.3),
+        _position({4: 1, 9: 1, 14: 1, 1: 2, 7: 2, 16: 2}, 2, 19, family="right_edge_vertical_block", motif="exact_block_edge_vertical", value=0.35, conversion_target=False, sample_weight=2.15),
+        _position({4: 1, 9: 1, 14: 1, 6: 2, 12: 2, 15: 2}, 2, 19, family="right_edge_vertical_block", motif="exact_block_edge_vertical_alt", value=0.35, conversion_target=False, sample_weight=2.2),
+        _position({2: 1, 3: 1, 4: 1, 11: 2, 12: 2, 13: 2}, 2, 1, family="top_edge_horizontal_block", motif="exact_block_top_edge", value=0.35, conversion_target=False, sample_weight=2.2),
+        _position({1: 1, 2: 1, 3: 1, 7: 2, 12: 2, 17: 2}, 2, 4, family="top_edge_horizontal_block", motif="exact_block_top_edge_open_right", value=0.35, conversion_target=False, sample_weight=2.2),
+        _position({3: 1, 7: 1, 11: 1, 1: 2, 12: 2, 22: 2}, 2, 15, family="edge_diagonal_block", motif="exact_block_edge_diagonal", value=0.35, conversion_target=False, sample_weight=2.15),
+        _position({0: 1, 6: 1, 12: 1, 4: 2, 8: 2, 17: 2}, 2, 18, family="main_diagonal_block", motif="exact_block_main_diagonal", value=0.35, conversion_target=False, sample_weight=2.15),
+        _position({20: 2, 21: 2, 22: 2, 1: 1, 7: 1, 14: 1}, 1, 23, family="bottom_edge_horizontal_block", motif="exact_block_bottom_edge", value=0.35, conversion_target=False, sample_weight=2.1),
+        _position({20: 2, 21: 2, 22: 2, 4: 1, 8: 1, 13: 1}, 1, 23, family="bottom_edge_horizontal_block", motif="exact_block_bottom_edge_alt", value=0.35, conversion_target=False, sample_weight=2.1),
+        _position({0: 2, 5: 2, 10: 2, 12: 1, 18: 1}, 1, 15, family="left_edge_vertical_block", motif="exact_block_left_edge", value=0.35, conversion_target=False, sample_weight=2.1),
+        _position({0: 2, 5: 2, 10: 2, 6: 1, 12: 1, 24: 1}, 1, 15, family="left_edge_vertical_block", motif="exact_block_left_edge_alt", value=0.35, conversion_target=False, sample_weight=2.15),
+        _position({6: 2, 12: 2, 18: 2, 3: 1, 9: 1}, 1, 24, family="long_diagonal_block", motif="exact_block_long_diagonal", value=0.35, conversion_target=False, sample_weight=2.15),
+        _position({2: 2, 7: 2, 12: 2, 4: 1, 9: 1}, 2, 17, family="vertical_win", motif="exact_win_vertical", value=1.0, conversion_target=True, sample_weight=2.3),
+        _position({15: 1, 16: 1, 17: 1, 2: 2, 7: 2, 12: 2}, 1, 18, family="horizontal_win", motif="exact_win_horizontal", value=1.0, conversion_target=True, sample_weight=2.3),
+        _position({1: 1, 7: 1, 13: 1, 5: 2, 10: 2, 22: 2}, 1, 19, family="diagonal_win", motif="exact_win_diagonal", value=1.0, conversion_target=True, sample_weight=2.3),
+        _position({4: 2, 8: 2, 12: 2, 0: 1, 6: 1}, 2, 16, family="edge_diagonal_win", motif="exact_win_edge_diagonal", value=1.0, conversion_target=True, sample_weight=2.3),
     ]
 
 
@@ -2752,6 +2775,7 @@ def _build_decision_suite_failure(
         failure["motif"] = str(position.get("motif", "") or "exact_trap")
         failure["conversionTarget"] = bool(position.get("conversionTarget", False))
         failure["sampleWeight"] = max(float(failure.get("sampleWeight", 1.0) or 1.0), 2.25 if failure["conversionTarget"] else 2.0)
+        failure["exactFamily"] = str(position.get("exactFamily", "") or position.get("motif", "") or "exact_trap")
         if decision_mode == "pure":
             failure["pureExactTrapMiss"] = True
     failure["playerFocus"] = current_player
@@ -2776,6 +2800,10 @@ def _evaluate_decision_suite(
     total = 0
     correct = 0
     failures: list[dict[str, Any]] = []
+    family_total: dict[str, int] = {}
+    family_correct: dict[str, int] = {}
+    player_total: dict[int, int] = {}
+    player_correct: dict[int, int] = {}
 
     for position in positions:
         target_move = _position_policy_target_move(position)
@@ -2794,9 +2822,14 @@ def _evaluate_decision_suite(
             decision_mode=decision_mode,
         )
         chosen_move = int(decision.get("move", -1))
+        family = str(position.get("exactFamily", "") or position.get("motif", "") or suite_name)
         total += 1
+        family_total[family] = int(family_total.get(family, 0)) + 1
+        player_total[current_player] = int(player_total.get(current_player, 0)) + 1
         if chosen_move == target_move:
             correct += 1
+            family_correct[family] = int(family_correct.get(family, 0)) + 1
+            player_correct[current_player] = int(player_correct.get(current_player, 0)) + 1
             continue
         if collect_failures:
             failures.append(
@@ -2810,10 +2843,26 @@ def _evaluate_decision_suite(
             )
 
     accuracy = (correct / total) if total else 0.0
+    family_recall = {
+        family: round(float(family_correct.get(family, 0)) / float(count), 4)
+        for family, count in family_total.items()
+        if count > 0
+    }
+    worst_family_name = min(family_recall, key=family_recall.get) if family_recall else None
+    p1_total = int(player_total.get(1, 0))
+    p2_total = int(player_total.get(2, 0))
+    p1_recall = (int(player_correct.get(1, 0)) / p1_total) if p1_total else 0.0
+    p2_recall = (int(player_correct.get(2, 0)) / p2_total) if p2_total else 0.0
     return {
         "correct": correct,
         "total": total,
         "accuracy": round(accuracy, 4),
+        "familyRecall": family_recall,
+        "familyCount": len(family_recall),
+        "worstFamilyRecall": round(float(family_recall.get(worst_family_name, 0.0)), 4) if worst_family_name else 0.0,
+        "worstFamilyName": worst_family_name,
+        "p1Recall": round(p1_recall, 4),
+        "p2Recall": round(p2_recall, 4),
     }, failures
 
 
@@ -2932,8 +2981,26 @@ async def _run_validation_snapshot(
             decision_mode="hybrid",
             suite_name="exact",
         )
+        payload["exactPackSize"] = len(exact_suite)
+        payload["exactPackFamilyCount"] = int(pure_exact_metrics.get("familyCount", 0) or 0)
         payload["pureExactTrapRecall"] = round(pure_exact_metrics["accuracy"] * 100.0, 2)
         payload["hybridExactTrapRecall"] = round(hybrid_exact_metrics["accuracy"] * 100.0, 2)
+        payload["pureWorstTrapFamilyRecall"] = round(float(pure_exact_metrics.get("worstFamilyRecall", 0.0) or 0.0) * 100.0, 2)
+        payload["hybridWorstTrapFamilyRecall"] = round(float(hybrid_exact_metrics.get("worstFamilyRecall", 0.0) or 0.0) * 100.0, 2)
+        payload["pureWorstTrapFamily"] = pure_exact_metrics.get("worstFamilyName")
+        payload["hybridWorstTrapFamily"] = hybrid_exact_metrics.get("worstFamilyName")
+        payload["pureP1TrapRecall"] = round(float(pure_exact_metrics.get("p1Recall", 0.0) or 0.0) * 100.0, 2)
+        payload["pureP2TrapRecall"] = round(float(pure_exact_metrics.get("p2Recall", 0.0) or 0.0) * 100.0, 2)
+        payload["hybridP1TrapRecall"] = round(float(hybrid_exact_metrics.get("p1Recall", 0.0) or 0.0) * 100.0, 2)
+        payload["hybridP2TrapRecall"] = round(float(hybrid_exact_metrics.get("p2Recall", 0.0) or 0.0) * 100.0, 2)
+        payload["pureExactFamilyRecall"] = {
+            family: round(float(recall) * 100.0, 2)
+            for family, recall in dict(pure_exact_metrics.get("familyRecall") or {}).items()
+        }
+        payload["hybridExactFamilyRecall"] = {
+            family: round(float(recall) * 100.0, 2)
+            for family, recall in dict(hybrid_exact_metrics.get("familyRecall") or {}).items()
+        }
 
     await callback({"type": "train.progress", "payload": payload})
     return payload
@@ -5179,6 +5246,22 @@ async def train_variant(
             "hybridFrozenBlockRecall",
             "pureExactTrapRecall",
             "hybridExactTrapRecall",
+            "pureWorstTrapFamilyRecall",
+            "hybridWorstTrapFamilyRecall",
+            "pureP1TrapRecall",
+            "pureP2TrapRecall",
+            "hybridP1TrapRecall",
+            "hybridP2TrapRecall",
+            "exactPackSize",
+            "exactPackFamilyCount",
+        ):
+            if latest_validation.get(key) is not None:
+                done_payload[key] = latest_validation[key]
+        for key in (
+            "pureWorstTrapFamily",
+            "hybridWorstTrapFamily",
+            "pureExactFamilyRecall",
+            "hybridExactFamilyRecall",
         ):
             if latest_validation.get(key) is not None:
                 done_payload[key] = latest_validation[key]

@@ -39,5 +39,13 @@ class SelfPlayConfig(BaseSettings):
     games: int = Field(default=200, description="Number of self-play games per generation")
     simulations: int = Field(default=400, description="MCTS simulations per move")
     replay_buffer_max: int = Field(default=20_000, description="Maximum positions in the replay buffer")
+    c_puct: float = Field(default=1.5, description="PUCT exploration constant for MCTS")
+    dirichlet_alpha: float = Field(default=0.03, description="Dirichlet alpha for root exploration noise")
+    dirichlet_weight: float = Field(default=0.25, description="Dirichlet epsilon mixed into root priors")
+    warm_up_steps: int = Field(default=16, description="Opening steps sampled with temperature before greedy play")
+    evaluation_games: int = Field(default=20, description="Head-to-head games for previous-checkpoint evaluation")
+    evaluation_simulations: int = Field(default=400, description="MCTS simulations during evaluation matches")
+    deterministic_eval: bool = Field(default=True, description="Use greedy visit-count selection during evaluation")
+    min_replay_samples: int = Field(default=1024, description="Minimum replay size before learner updates")
 
     model_config = {"env_prefix": "SELFPLAY_"}
