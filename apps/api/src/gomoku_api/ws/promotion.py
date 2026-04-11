@@ -26,6 +26,8 @@ class PromotionDecision:
     winrate_vs_algorithm: float | None
     block_accuracy: float
     win_accuracy: float
+    balanced_side_winrate: float | None
+    winrate_as_p2: float | None
     reason: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -35,6 +37,8 @@ class PromotionDecision:
             "winrateVsAlgorithm": self.winrate_vs_algorithm,
             "blockAccuracy": round(self.block_accuracy, 1),
             "winAccuracy": round(self.win_accuracy, 1),
+            "balancedSideWinrate": self.balanced_side_winrate,
+            "winrateAsP2": self.winrate_as_p2,
             "reason": self.reason,
         }
 
@@ -48,6 +52,10 @@ def evaluate_promotion(
     champion_threshold: float = 0.55,
     block_threshold: float = 88.0,
     win_threshold: float = 70.0,
+    balanced_side_winrate: float | None = None,
+    balanced_threshold: float = 0.25,
+    winrate_as_p2: float | None = None,
+    p2_threshold: float = 0.20,
     prev_algo_winrate: float | None = None,
     algo_regression_margin: float = 0.10,
     require_champion_match: bool = False,
@@ -79,6 +87,12 @@ def evaluate_promotion(
     if win_accuracy < win_threshold:
         reasons.append(f"winAcc {win_accuracy:.1f}% < {win_threshold:.0f}%")
 
+    if balanced_side_winrate is not None and balanced_side_winrate < balanced_threshold:
+        reasons.append(f"balanced {balanced_side_winrate:.2f} < {balanced_threshold:.2f}")
+
+    if winrate_as_p2 is not None and winrate_as_p2 < p2_threshold:
+        reasons.append(f"wrAsP2 {winrate_as_p2:.2f} < {p2_threshold:.2f}")
+
     if require_champion_match and quick_arena is None:
         reasons.append("wrVsChampion unavailable")
 
@@ -100,6 +114,8 @@ def evaluate_promotion(
             winrate_vs_algorithm=wr_algo,
             block_accuracy=block_accuracy,
             win_accuracy=win_accuracy,
+            balanced_side_winrate=balanced_side_winrate,
+            winrate_as_p2=winrate_as_p2,
             reason=reason_str,
         )
 
@@ -112,5 +128,7 @@ def evaluate_promotion(
         winrate_vs_algorithm=wr_algo,
         block_accuracy=block_accuracy,
         win_accuracy=win_accuracy,
+        balanced_side_winrate=balanced_side_winrate,
+        winrate_as_p2=winrate_as_p2,
         reason=reason_str,
     )

@@ -398,6 +398,34 @@ def test_choose_rapid_cycle_strategy_responds_to_worst_trap_family_and_p2_traps(
     assert strategy["conversionFocus"] is True
 
 
+def test_choose_rapid_cycle_strategy_hard_focuses_p2_when_p2_collapses() -> None:
+    strategy = _choose_rapid_cycle_strategy(
+        {
+            "frozenBlockAcc": 95.0,
+            "frozenWinAcc": 95.0,
+            "frozenMidAcc": 62.0,
+            "frozenLateAcc": 66.0,
+            "holdoutDeltaAcc": 0.0,
+        },
+        corrected_rate=0.25,
+        failure_bank_size=12,
+        engine_per_cycle=50,
+        exam_summary={
+            "winrateAsP1": 1.0,
+            "winrateAsP2": 0.0,
+            "balancedSideWinrate": 0.0,
+            "decisiveWinRate": 0.5,
+            "drawRate": 0.0,
+        },
+    )
+
+    assert strategy["engineCurrentPlayerFocus"] == 2
+    assert strategy["playerFocusRatio"] >= 0.70
+    assert strategy["focusConversionRatio"] >= 0.32
+    assert strategy["failureSlice"] >= 448
+    assert strategy["conversionFocus"] is True
+
+
 def test_choose_rapid_cycle_strategy_enters_tactical_rescue_mode_on_zero_pure_win_recall() -> None:
     strategy = _choose_rapid_cycle_strategy(
         {
@@ -836,6 +864,25 @@ def test_checkpoint_selection_score_uses_side_balance_as_tiebreaker() -> None:
     }
 
     assert _checkpoint_selection_score(balanced, 9) > _checkpoint_selection_score(skewed, 9)
+
+
+def test_checkpoint_selection_score_prefers_nonzero_p2_even_with_slightly_lower_raw_winrate() -> None:
+    skewed = {
+        "winrate": 0.55,
+        "decisiveWinRate": 0.55,
+        "drawRate": 0.0,
+        "winrateAsP1": 1.0,
+        "winrateAsP2": 0.0,
+    }
+    more_balanced = {
+        "winrate": 0.50,
+        "decisiveWinRate": 0.50,
+        "drawRate": 0.0,
+        "winrateAsP1": 0.75,
+        "winrateAsP2": 0.25,
+    }
+
+    assert _checkpoint_selection_score(more_balanced, 9) > _checkpoint_selection_score(skewed, 9)
 
 
 def test_checkpoint_selection_score_prefers_lower_pure_gap_on_equal_hybrid_strength() -> None:

@@ -65,24 +65,27 @@ def _restore_model_state_dict(model: torch.nn.Module, state_dict: dict[str, torc
     model.load_state_dict(state_dict)
 
 
-def _checkpoint_selection_score(summary: dict[str, Any], cycle: int) -> tuple[float, float, float, float, float, float, float, int]:
+def _checkpoint_selection_score(summary: dict[str, Any], cycle: int) -> tuple[float, float, float, float, float, float, float, float, int]:
     """Rank candidate checkpoints by actual game strength.
 
     Priority:
     1. challenger-vs-champion winrate when available,
-    2. challenger-vs-champion decisive wins,
-    3. then algorithm/engine decisive wins,
-    4. then total winrate,
-    5. then balanced strength across both sides,
-    6. then lower draw rate,
-    7. then later cycle as a tie-break.
+    2. balanced strength across both sides,
+    3. strength as P2 specifically,
+    4. challenger-vs-champion decisive wins,
+    5. algorithm/engine decisive wins,
+    6. total winrate,
+    7. lower draw rate and lower pure-gap,
+    8. later cycle as a tie-break.
     """
     champion_wr = float(summary.get("winrateVsChampion", -1.0) or 0.0) if summary.get("winrateVsChampion") is not None else -1.0
     champion_decisive = float(summary.get("decisiveWinRateVsChampion", 0.0) or 0.0)
     decisive = float(summary.get("decisiveWinRate", 0.0) or 0.0)
     winrate = float(summary.get("winrate", 0.0) or 0.0)
-    winrate_as_p1 = float(summary.get("winrateAsP1", winrate) or winrate)
-    winrate_as_p2 = float(summary.get("winrateAsP2", winrate) or winrate)
+    winrate_as_p1_raw = summary.get("winrateAsP1")
+    winrate_as_p2_raw = summary.get("winrateAsP2")
+    winrate_as_p1 = winrate if winrate_as_p1_raw is None else float(winrate_as_p1_raw)
+    winrate_as_p2 = winrate if winrate_as_p2_raw is None else float(winrate_as_p2_raw)
     balanced_side = min(winrate_as_p1, winrate_as_p2)
     pure_gap_rate = float(summary.get("pureGapRate", 1.0) or 0.0)
     pure_gap_rate_as_p1 = float(summary.get("pureGapRateAsP1", pure_gap_rate) or 0.0)
@@ -92,10 +95,11 @@ def _checkpoint_selection_score(summary: dict[str, Any], cycle: int) -> tuple[fl
     draw_rate = float(summary.get("drawRate", 0.0) or 0.0)
     return (
         champion_wr,
+        balanced_side,
+        winrate_as_p2,
         champion_decisive,
         decisive,
         winrate,
-        balanced_side,
         balanced_pure_alignment,
         pure_alignment - draw_rate,
         int(cycle),
@@ -1438,6 +1442,28 @@ def _choose_rapid_cycle_strategy(
             strategy["engineCount"] = min(160, max(int(strategy["engineCount"]), engine_per_cycle + 24))
             if strategy["engineCurrentPlayerFocus"] in (1, 2):
                 strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.24)
+        if winrate_as_p2 <= 0.05:
+            strategy["engineCurrentPlayerFocus"] = 2
+            strategy["conversionFocus"] = True
+            strategy["failureSlice"] = max(int(strategy["failureSlice"]), 448)
+            strategy["playerFocusRatio"] = max(float(strategy["playerFocusRatio"]), 0.70)
+            strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.32)
+            strategy["counterConversionRatio"] = max(float(strategy["counterConversionRatio"]), 0.10)
+            strategy["engineCount"] = min(160, max(int(strategy["engineCount"]), engine_per_cycle + 32))
+            strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.42)
+            if strategy["engineFocus"] is None:
+                strategy["engineFocus"] = "mid"
+        elif winrate_as_p1 <= 0.05:
+            strategy["engineCurrentPlayerFocus"] = 1
+            strategy["conversionFocus"] = True
+            strategy["failureSlice"] = max(int(strategy["failureSlice"]), 448)
+            strategy["playerFocusRatio"] = max(float(strategy["playerFocusRatio"]), 0.70)
+            strategy["focusConversionRatio"] = max(float(strategy["focusConversionRatio"]), 0.32)
+            strategy["counterConversionRatio"] = max(float(strategy["counterConversionRatio"]), 0.10)
+            strategy["engineCount"] = min(160, max(int(strategy["engineCount"]), engine_per_cycle + 32))
+            strategy["tacticalRatio"] = max(float(strategy["tacticalRatio"]), 0.42)
+            if strategy["engineFocus"] is None:
+                strategy["engineFocus"] = "mid"
 
         if pure_gap_rate > 0.25:
             strategy["failureSlice"] = 384
@@ -4781,11 +4807,16 @@ async def train_variant(
         )
 
     # ── Self-Play MCTS Loop (optional, for strong models) ────────────
-    do_selfplay = bool(kwargs.get("selfPlay", False))
-    sp_iterations = max(1, min(20, int(kwargs.get("selfPlayIterations", 10))))
-    sp_games = max(20, min(200, int(kwargs.get("selfPlayGames", 100))))
-    sp_sims = max(25, min(200, int(kwargs.get("selfPlaySims", 100))))
-    sp_train_steps = max(20, min(200, int(kwargs.get("selfPlayTrainSteps", 80))))
+    auto_selfplay = variant == "ttt5" and board_size <= 5 and kwargs.get("selfPlay") is None
+    do_selfplay = bool(kwargs.get("selfPlay", auto_selfplay))
+    sp_iterations_default = 4 if auto_selfplay else 10
+    sp_games_default = 40 if auto_selfplay else 100
+    sp_sims_default = 64 if auto_selfplay else 100
+    sp_train_steps_default = 48 if auto_selfplay else 80
+    sp_iterations = max(1, min(20, int(kwargs.get("selfPlayIterations", sp_iterations_default))))
+    sp_games = max(20, min(200, int(kwargs.get("selfPlayGames", sp_games_default))))
+    sp_sims = max(25, min(200, int(kwargs.get("selfPlaySims", sp_sims_default))))
+    sp_train_steps = max(20, min(200, int(kwargs.get("selfPlayTrainSteps", sp_train_steps_default))))
 
     if do_selfplay and board_size <= 9:
         from trainer_lab.self_play.mixed_replay import MixedReplay
@@ -4997,6 +5028,8 @@ async def train_variant(
         strong_result,
         block_accuracy=block_acc,
         win_accuracy=win_acc,
+        balanced_side_winrate=confirm_summary.get("balancedSideWinrate") if confirm_summary else None,
+        winrate_as_p2=confirm_summary.get("winrateAsP2") if confirm_summary else None,
         prev_algo_winrate=prev_algo_winrate,
         require_champion_match=registry.has_champion(),
     )
