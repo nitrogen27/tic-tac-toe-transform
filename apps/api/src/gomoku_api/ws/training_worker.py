@@ -56,8 +56,6 @@ async def _run_worker(
     try:
         result = await train_variant(variant, callback, **kwargs)
         deferred = result.get("deferredEvaluator") if isinstance(result, dict) else None
-        if deferred:
-            await run_deferred_evaluator_tail(deferred, callback)
     except asyncio.CancelledError:
         final_event = "train.cancelled"
         logger.log({"type": "train.cancelled", "payload": {"variant": variant}})
@@ -66,6 +64,33 @@ async def _run_worker(
         final_event = "train.error"
         logger.log({"type": "train.error", "payload": {"variant": variant, "error": str(exc)}})
         exit_code = 1
+    else:
+        final_event = "train.done"
+        if deferred:
+            try:
+                await run_deferred_evaluator_tail(deferred, callback)
+                final_event = "background_train.done"
+            except asyncio.CancelledError:
+                final_event = "background_train.error"
+                logger.log({
+                    "type": "background_train.error",
+                    "payload": {
+                        "variant": variant,
+                        "message": "Фоновая оценка отменена.",
+                    },
+                })
+                exit_code = 2
+            except Exception as exc:
+                final_event = "background_train.error"
+                logger.log({
+                    "type": "background_train.error",
+                    "payload": {
+                        "variant": variant,
+                        "message": f"Фоновая оценка завершилась с ошибкой: {exc}",
+                        "error": str(exc),
+                    },
+                })
+                exit_code = 1
     finally:
         meta = _read_json(meta_path) if meta_path.exists() else {}
         meta.update(

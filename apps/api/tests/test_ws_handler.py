@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tempfile
+from pathlib import Path
 
 import pytest
 
 from gomoku_api.ws import handler
+from gomoku_api.ws import training_run_logger
 
 
 class DummyWebSocket:
@@ -14,6 +18,27 @@ class DummyWebSocket:
 
     async def send_json(self, message: dict) -> None:
         self.messages.append(message)
+
+
+class _DummyLogger:
+    _counter = 0
+
+    def __init__(self, variant: str, base_dir: Path) -> None:
+        type(self)._counter += 1
+        self.variant = variant
+        self.run_id = f"ws-test-{type(self)._counter}"
+        self.path = base_dir / f"{self.run_id}_{variant}.jsonl"
+
+    def log(self, event: dict) -> None:
+        record = {
+            "ts": "2026-04-11T00:00:00",
+            "variant": self.variant,
+            "runId": self.run_id,
+            "event": event.get("type"),
+            "payload": event.get("payload", {}),
+        }
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 @pytest.mark.asyncio
@@ -152,6 +177,7 @@ async def test_run_training_schedules_deferred_evaluator(monkeypatch) -> None:
         await cb({"type": "background_train.done", "payload": {"variant": context["variant"], "message": "bg done"}})
         return {"variant": context["variant"]}
 
+    monkeypatch.setattr(training_run_logger, "TrainingRunLogger", lambda variant: _DummyLogger(variant, Path(tempfile.mkdtemp())))
     monkeypatch.setattr(handler, "train_variant", fake_train_variant)
     monkeypatch.setattr(handler, "run_deferred_evaluator_tail", fake_run_deferred_evaluator_tail)
 
@@ -268,3 +294,79 @@ def test_build_training_status_restores_chart_histories(tmp_path, monkeypatch) -
         "losses": 2,
         "draws": 0,
     }]
+
+
+def test_build_training_status_prefers_latest_completed_run_over_older_stale_nonterminal(tmp_path, monkeypatch) -> None:
+    log_dir = tmp_path / "saved" / "training_logs" / "ttt5"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    older = log_dir / "20260411T100000_ttt5.jsonl"
+    newer = log_dir / "20260411T110000_ttt5.jsonl"
+    older.write_text(
+        json.dumps({
+            "ts": "2026-04-11T10:00:00",
+            "event": "train.progress",
+            "runId": "run-old",
+            "payload": {"phase": "turbo_train"},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    newer.write_text(
+        json.dumps({
+            "ts": "2026-04-11T11:00:00",
+            "event": "background_train.done",
+            "runId": "run-new",
+            "payload": {"phase": "promotion", "message": "done"},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    os.utime(older, (1_700_000_000, 1_700_000_000))
+    os.utime(newer, (1_700_000_100, 1_700_000_100))
+
+    monkeypatch.setattr(handler, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(handler.TrainingWorkerManager, "is_active", lambda self: False)
+    monkeypatch.setattr(handler.TrainingWorkerManager, "read_meta", lambda self: {})
+
+    status = handler._build_training_status("ttt5")
+
+    assert status["runId"] == "run-new"
+    assert status["lastEvent"] == "background_train.done"
+    assert status["logActive"] is False
+
+
+def test_build_training_status_prefers_active_worker_log_path(tmp_path, monkeypatch) -> None:
+    log_dir = tmp_path / "saved" / "training_logs" / "ttt5"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    old_log = log_dir / "20260411T100000_ttt5.jsonl"
+    worker_log = log_dir / "20260411T120000_ttt5.jsonl"
+    old_log.write_text(
+        json.dumps({
+            "ts": "2026-04-11T10:00:00",
+            "event": "background_train.done",
+            "runId": "run-old",
+            "payload": {"phase": "promotion"},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    worker_log.write_text(
+        json.dumps({
+            "ts": "2026-04-11T12:00:00",
+            "event": "train.progress",
+            "runId": "run-worker",
+            "payload": {"phase": "self_play_train"},
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(handler, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(handler.TrainingWorkerManager, "is_active", lambda self: True)
+    monkeypatch.setattr(
+        handler.TrainingWorkerManager,
+        "read_meta",
+        lambda self: {"active": True, "logPath": str(worker_log)},
+    )
+
+    status = handler._build_training_status("ttt5")
+
+    assert status["runId"] == "run-worker"
+    assert status["lastEvent"] == "train.progress"
+    assert status["active"] is True

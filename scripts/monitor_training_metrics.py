@@ -47,23 +47,40 @@ def _iso_local(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
 
 
-def latest_training_log(root: Path, variant: str) -> Path | None:
+def _is_terminal_training_event(event: str, payload: dict[str, Any] | None = None) -> bool:
+    payload = payload or {}
+    if event in TERMINAL_TRAINING_EVENTS:
+        return True
+    if event == "train.done":
+        return not bool(payload.get("evaluationQueued"))
+    return False
+
+
+def _worker_meta_path(root: Path, variant: str) -> Path:
+    return root / ".runtime" / "training-workers" / variant / "worker.json"
+
+
+def active_worker_log(root: Path, variant: str) -> Path | None:
+    meta_path = _worker_meta_path(root, variant)
+    meta = read_manifest(meta_path)
+    log_path = meta.get("logPath")
+    if not meta.get("active") or not isinstance(log_path, str) or not log_path:
+        return None
+    path = Path(log_path)
+    if path.exists():
+        return path
+    return None
+
+
+def latest_training_log(root: Path, variant: str, *, preferred_path: Path | None = None) -> Path | None:
+    if preferred_path is not None and preferred_path.exists():
+        return preferred_path
     log_dir = root / "saved" / "training_logs" / variant
     if not log_dir.exists():
         return None
     logs = sorted(log_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not logs:
         return None
-
-    active_logs: list[Path] = []
-    for log_path in logs:
-        last_obj = read_last_jsonl_object(log_path)
-        event = str(last_obj.get("event") or "")
-        if event and event not in TERMINAL_TRAINING_EVENTS:
-            active_logs.append(log_path)
-
-    if active_logs:
-        return max(active_logs, key=lambda p: p.stat().st_mtime)
     return logs[0]
 
 
@@ -205,7 +222,7 @@ def compact_training_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_training_state(root: Path, variant: str) -> dict[str, Any]:
-    log_path = latest_training_log(root, variant)
+    log_path = latest_training_log(root, variant, preferred_path=active_worker_log(root, variant))
     if log_path is None:
         return {
             "active": False,
@@ -221,7 +238,7 @@ def read_training_state(root: Path, variant: str) -> dict[str, Any]:
     last_obj = read_last_jsonl_object(log_path)
     event = str(last_obj.get("event") or "")
     payload = last_obj.get("payload") or {}
-    active = event not in TERMINAL_TRAINING_EVENTS
+    active = not _is_terminal_training_event(event, payload)
     return {
         "active": active,
         "logPath": str(log_path),

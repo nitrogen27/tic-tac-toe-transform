@@ -88,23 +88,35 @@ def _read_last_jsonl_object(path: Path) -> dict[str, Any]:
     return {}
 
 
-def _latest_training_log_path(variant: str) -> Path | None:
+def _is_terminal_training_event(event: str, payload: dict[str, Any] | None = None) -> bool:
+    payload = payload or {}
+    if event in _TERMINAL_TRAINING_EVENTS:
+        return True
+    if event == "train.done":
+        return not bool(payload.get("evaluationQueued"))
+    return False
+
+
+def _active_worker_log_path(variant: str) -> Path | None:
+    meta = TrainingWorkerManager(variant).read_meta()
+    log_path = meta.get("logPath")
+    if not isinstance(log_path, str) or not log_path:
+        return None
+    path = Path(log_path)
+    if path.exists() and TrainingWorkerManager(variant).is_active():
+        return path
+    return None
+
+
+def _latest_training_log_path(variant: str, *, preferred_path: Path | None = None) -> Path | None:
+    if preferred_path is not None and preferred_path.exists():
+        return preferred_path
     log_dir = _repo_root() / "saved" / "training_logs" / variant
     if not log_dir.exists():
         return None
     logs = sorted(log_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not logs:
         return None
-
-    active_logs: list[Path] = []
-    for log_path in logs:
-        last_obj = _read_last_jsonl_object(log_path)
-        event = str(last_obj.get("event") or "")
-        if event and event not in _TERMINAL_TRAINING_EVENTS:
-            active_logs.append(log_path)
-
-    if active_logs:
-        return max(active_logs, key=lambda p: p.stat().st_mtime)
     return logs[0]
 
 
@@ -289,17 +301,19 @@ def _parse_event_epoch(ts_value: Any, *, fallback: float | None = None) -> float
 
 
 def _build_training_status(variant: str) -> dict[str, Any]:
-    log_path = _latest_training_log_path(variant)
+    manager = TrainingWorkerManager(variant)
+    worker_active = manager.is_active()
+    worker_log_path = _active_worker_log_path(variant) if worker_active else None
+    log_path = _latest_training_log_path(variant, preferred_path=worker_log_path)
     last_obj = _read_last_jsonl_object(log_path) if log_path is not None else {}
     last_event = str(last_obj.get("event") or "")
     payload = dict(last_obj.get("payload") or {})
-    worker_active = TrainingWorkerManager(variant).is_active()
     train_task = _active_train_tasks.get(variant)
     background_task = _active_background_eval_tasks.get(variant)
     train_active = worker_active or (train_task is not None and not train_task.done())
     background_active = background_task is not None and not background_task.done()
     any_active = train_active or background_active
-    log_active = bool(last_event) and last_event not in _TERMINAL_TRAINING_EVENTS
+    log_active = bool(last_event) and not _is_terminal_training_event(last_event, payload)
     phase = str(payload.get("phase") or "")
     stage = str(payload.get("stage") or "")
 
