@@ -5532,20 +5532,66 @@ async def train_variant(
             model.eval()
             from trainer_lab.self_play.player import generate_games_parallel
 
-            sp_positions = await asyncio.to_thread(
-                generate_games_parallel,
-                model,
-                sp_games,
-                board_size=board_size,
-                win_length=win_len,
-                num_simulations=sp_sims,
-                num_workers=min(4, sp_games),
-                device=device,
-                warm_up_steps=sp_config.warm_up_steps,
-                c_puct=sp_config.c_puct,
-                dirichlet_alpha=sp_config.dirichlet_alpha,
-                dirichlet_weight=sp_config.dirichlet_weight,
-            )
+            sp_generation_started_at = time.monotonic()
+            sp_generation_progress = {"completed": 0, "positions": 0}
+            loop = asyncio.get_running_loop()
+            sp_generation_done = asyncio.Event()
+
+            def _on_selfplay_generation_progress(completed: int, total_games: int, positions_count: int) -> None:
+                def _store_progress() -> None:
+                    sp_generation_progress["completed"] = completed
+                    sp_generation_progress["positions"] = positions_count
+
+                loop.call_soon_threadsafe(_store_progress)
+
+            async def _emit_selfplay_generation_progress() -> None:
+                while not sp_generation_done.is_set():
+                    completed_games = int(sp_generation_progress.get("completed", 0) or 0)
+                    positions_count = int(sp_generation_progress.get("positions", 0) or 0)
+                    fraction = min(max(completed_games / max(sp_games, 1), 0.0), 1.0)
+                    elapsed = time.monotonic() - sp_generation_started_at
+                    await callback({
+                        "type": "train.progress",
+                        "payload": {
+                            "phase": "self_play_gen",
+                            "stage": "generating",
+                            "variant": variant,
+                            "iteration": sp_iter,
+                            "totalIterations": sp_iterations,
+                            "game": completed_games,
+                            "totalGames": sp_games,
+                            "positionsCollected": positions_count,
+                            "elapsed": round(elapsed, 1),
+                            "percent": round(90 + 8 * ((sp_iter - 1 + fraction) / sp_iterations), 1),
+                            "message": f"Self-play generation: {completed_games}/{sp_games} games",
+                        },
+                    })
+                    await asyncio.sleep(1.0)
+
+            generation_progress_task = asyncio.create_task(_emit_selfplay_generation_progress())
+            try:
+                sp_positions = await asyncio.to_thread(
+                    generate_games_parallel,
+                    model,
+                    sp_games,
+                    board_size=board_size,
+                    win_length=win_len,
+                    num_simulations=sp_sims,
+                    num_workers=min(4, sp_games),
+                    device=device,
+                    warm_up_steps=sp_config.warm_up_steps,
+                    c_puct=sp_config.c_puct,
+                    dirichlet_alpha=sp_config.dirichlet_alpha,
+                    dirichlet_weight=sp_config.dirichlet_weight,
+                    progress_callback=_on_selfplay_generation_progress,
+                )
+            finally:
+                sp_generation_done.set()
+                generation_progress_task.cancel()
+                try:
+                    await generation_progress_task
+                except asyncio.CancelledError:
+                    pass
 
             sp_stats = {"wins_p1": 0, "wins_p2": 0, "draws": 0}
             # Count game outcomes from positions (group by game via value sign changes)
@@ -5846,13 +5892,12 @@ async def train_variant(
 def clear_model(variant: str = "all") -> dict[str, Any]:
     """Delete saved model files."""
     from gomoku_api.ws.predict_service import clear_cached_model
+    from gomoku_api.ws.model_registry import ModelRegistry
 
     variants = ["ttt3", "ttt5"] if variant == "all" else [variant]
     for current_variant in variants:
-        for fname in ("model.pt", "candidate.pt", "champion.pt"):
-            fpath = SAVED_DIR / f"{current_variant}_resnet" / fname
-            if fpath.exists():
-                fpath.unlink()
-                logger.info("Cleared: %s", fpath)
+        registry = ModelRegistry(current_variant)
+        registry.clear_checkpoints(preserve_history=True)
+        logger.info("Cleared model checkpoints for %s", current_variant)
         clear_cached_model(current_variant)
     return {"cleared": True, "variant": variant}

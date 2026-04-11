@@ -234,6 +234,29 @@ async def arena_match(
     total = num_pairs * 2
     started_at = time.monotonic()
 
+    async def emit_progress(games_done: int) -> None:
+        if callback is None:
+            return
+        elapsed = time.monotonic() - started_at
+        await callback({
+            "type": "train.progress",
+            "payload": {
+                "phase": phase,
+                "stage": stage,
+                "variant": variant,
+                "game": games_done,
+                "totalGames": total,
+                "arenaWins": wins_candidate,
+                "arenaLosses": wins_champion,
+                "arenaDraws": draws,
+                "winrateVsChampion": round((wins_candidate + 0.5 * draws) / max(games_done, 1), 4),
+                "decisiveWinRate": round(wins_candidate / max(games_done, 1), 4),
+                "drawRate": round(draws / max(games_done, 1), 4),
+                "elapsed": round(elapsed, 1),
+            },
+        })
+        await asyncio.sleep(0)
+
     def make_move_fn(model: torch.nn.Module):
         def fn(board: list[int], current: int) -> int:
             return _model_greedy_move(board, board_size, win_len, current, model, device)
@@ -251,6 +274,7 @@ async def arena_match(
             wins_champion += 1
         else:
             draws += 1
+        await emit_progress(pair * 2 + 1)
 
         # Game 2: champion = P1, candidate = P2
         winner = _play_arena_game(fn_champion, fn_candidate, board_size, win_len)
@@ -260,28 +284,7 @@ async def arena_match(
             wins_candidate += 1
         else:
             draws += 1
-
-        if callback is not None:
-            games_done = (pair + 1) * 2
-            elapsed = time.monotonic() - started_at
-            await callback({
-                "type": "train.progress",
-                "payload": {
-                    "phase": phase,
-                    "stage": stage,
-                    "variant": variant,
-                    "game": games_done,
-                    "totalGames": total,
-                    "arenaWins": wins_candidate,
-                    "arenaLosses": wins_champion,
-                    "arenaDraws": draws,
-                    "winrateVsChampion": round((wins_candidate + 0.5 * draws) / max(games_done, 1), 4),
-                    "decisiveWinRate": round(wins_candidate / max(games_done, 1), 4),
-                    "drawRate": round(draws / max(games_done, 1), 4),
-                    "elapsed": round(elapsed, 1),
-                },
-            })
-            await asyncio.sleep(0)
+        await emit_progress((pair + 1) * 2)
 
     return ArenaResult(
         wins_a=wins_candidate,
@@ -320,11 +323,34 @@ async def arena_vs_algorithm(
     total = num_pairs * 2
     started_at = time.monotonic()
 
+    async def emit_progress(games_done: int) -> None:
+        if callback is None:
+            return
+        elapsed = time.monotonic() - started_at
+        await callback({
+            "type": "train.progress",
+            "payload": {
+                "phase": "arena",
+                "stage": "strong_eval",
+                "variant": variant,
+                "game": games_done,
+                "totalGames": total,
+                "arenaWins": wins_candidate,
+                "arenaLosses": wins_engine,
+                "arenaDraws": draws,
+                "winrateVsAlgorithm": round((wins_candidate + 0.5 * draws) / max(games_done, 1), 4),
+                "decisiveWinRate": round(wins_candidate / max(games_done, 1), 4),
+                "drawRate": round(draws / max(games_done, 1), 4),
+                "elapsed": round(elapsed, 1),
+            },
+        })
+        await asyncio.sleep(0)
+
     def fn_candidate(board: list[int], current: int) -> int:
         return _model_greedy_move(board, board_size, win_len, current, candidate, device)
 
     for pair in range(num_pairs):
-        for candidate_side in (1, 2):
+        for side_idx, candidate_side in enumerate((1, 2), start=1):
             board = [0] * (board_size * board_size)
             current = 1
             winner = 0
@@ -363,28 +389,7 @@ async def arena_vs_algorithm(
                 wins_engine += 1
             else:
                 draws += 1
-
-        if callback is not None:
-            games_done = (pair + 1) * 2
-            elapsed = time.monotonic() - started_at
-            await callback({
-                "type": "train.progress",
-                "payload": {
-                    "phase": "arena",
-                    "stage": "strong_eval",
-                    "variant": variant,
-                    "game": games_done,
-                    "totalGames": total,
-                    "arenaWins": wins_candidate,
-                    "arenaLosses": wins_engine,
-                    "arenaDraws": draws,
-                    "winrateVsAlgorithm": round((wins_candidate + 0.5 * draws) / max(games_done, 1), 4),
-                    "decisiveWinRate": round(wins_candidate / max(games_done, 1), 4),
-                    "drawRate": round(draws / max(games_done, 1), 4),
-                    "elapsed": round(elapsed, 1),
-                },
-            })
-            await asyncio.sleep(0)
+            await emit_progress(pair * 2 + side_idx)
 
     return ArenaResult(
         wins_a=wins_candidate,

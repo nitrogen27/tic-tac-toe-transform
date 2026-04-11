@@ -10,7 +10,7 @@ import torch
 from trainer_lab.config import ModelConfig, SelfPlayConfig
 from trainer_lab.evaluation.eval_script import evaluate_vs_previous_checkpoint
 from trainer_lab.models.resnet import PolicyValueResNet
-from trainer_lab.self_play.player import GameState, MCTSNode, SelfPlayPlayer, mcts_search
+from trainer_lab.self_play.player import GameState, MCTSNode, SelfPlayPlayer, generate_games_parallel, mcts_search
 from trainer_lab.self_play.replay_buffer import ReplayBuffer
 
 # Small model config for fast tests
@@ -178,6 +178,27 @@ class TestSelfPlayPlayer:
         assert "policy" in pos
         assert "value" in pos
         assert len(pos["policy"]) == 256  # padded to 16x16
+
+    def test_generate_games_parallel_reports_progress(self):
+        model = _make_small_model()
+        updates: list[tuple[int, int, int]] = []
+
+        positions = generate_games_parallel(
+            model,
+            2,
+            board_size=5,
+            win_length=4,
+            num_simulations=1,
+            num_workers=2,
+            device=torch.device("cpu"),
+            warm_up_steps=2,
+            progress_callback=lambda completed, total, count: updates.append((completed, total, count)),
+        )
+
+        assert len(positions) > 0
+        assert updates
+        assert updates[-1][0] == 2
+        assert updates[-1][1] == 2
 
 
 class TestEvaluation:

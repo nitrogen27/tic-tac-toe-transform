@@ -7,6 +7,8 @@ import shutil
 import subprocess
 from typing import Any
 
+from gomoku_api.ws.subprocess_utils import windows_hidden_subprocess_kwargs
+
 
 def _parse_float(value: str) -> float | None:
     value = value.strip()
@@ -44,6 +46,7 @@ def _query_nvidia_smi() -> dict[str, Any] | None:
             text=True,
             timeout=1.5,
             check=True,
+            **windows_hidden_subprocess_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return None

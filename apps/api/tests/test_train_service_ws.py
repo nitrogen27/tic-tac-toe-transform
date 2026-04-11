@@ -25,7 +25,9 @@ from gomoku_api.ws.train_service_ws import (
     _resolve_engine_sampling_bounds,
     _run_engine_exam,
     _sample_engine_position,
+    _selfplay_previous_checkpoint_accepted,
     _selfplay_mixed_source_weights,
+    _selfplay_eval_num_pairs,
     _soft_policy_from_engine_hints,
     _variant_model_hparams,
 )
@@ -124,6 +126,27 @@ def test_selfplay_mixed_source_weights_shift_toward_self_play() -> None:
     assert sum(late.values()) == pytest.approx(1.0, abs=1e-6)
     assert late["self_play"] > early["self_play"]
     assert late["anchor"] < early["anchor"]
+    assert early["self_play"] >= 0.55
+    assert late["self_play"] >= 0.75
+    assert late["self_play"] > (late["anchor"] + late["tactical"])
+
+
+def test_selfplay_previous_checkpoint_acceptance_requires_non_regression() -> None:
+    assert _selfplay_previous_checkpoint_accepted({"winrateVsPreviousCheckpoint": 0.50}) is True
+    assert _selfplay_previous_checkpoint_accepted({"winrateVsPreviousCheckpoint": 0.61}) is True
+    assert _selfplay_previous_checkpoint_accepted({"winrateVsPreviousCheckpoint": 0.49}) is False
+    assert _selfplay_previous_checkpoint_accepted({"winrate": 0.80}) is False
+    assert _selfplay_previous_checkpoint_accepted(None) is False
+
+
+def test_selfplay_eval_num_pairs_is_fast_early_and_stricter_late() -> None:
+    assert _selfplay_eval_num_pairs(1, 4, purpose="engine") == 4
+    assert _selfplay_eval_num_pairs(4, 4, purpose="engine") == 6
+    assert _selfplay_eval_num_pairs(1, 4, purpose="challenger") == 2
+    assert _selfplay_eval_num_pairs(4, 4, purpose="challenger") == 3
+    assert _selfplay_eval_num_pairs(1, 4, purpose="previous") == 2
+    assert _selfplay_eval_num_pairs(3, 4, purpose="previous") == 3
+    assert _selfplay_eval_num_pairs(4, 4, purpose="previous") == 4
 
 
 def test_policy_cell_index_maps_inside_padded_grid() -> None:
@@ -931,6 +954,31 @@ def test_checkpoint_selection_score_prefers_stronger_challenger_vs_champion() ->
     }
 
     assert _checkpoint_selection_score(stronger_vs_champion, 9) > _checkpoint_selection_score(weaker_vs_champion, 9)
+
+
+def test_checkpoint_selection_score_prefers_stronger_previous_checkpoint_when_champion_missing() -> None:
+    weaker_vs_previous = {
+        "winrate": 0.62,
+        "decisiveWinRate": 0.30,
+        "drawRate": 0.32,
+        "winrateAsP1": 0.70,
+        "winrateAsP2": 0.54,
+        "balancedSideWinrate": 0.54,
+        "winrateVsPreviousCheckpoint": 0.48,
+        "decisiveWinRateVsPreviousCheckpoint": 0.18,
+    }
+    stronger_vs_previous = {
+        "winrate": 0.62,
+        "decisiveWinRate": 0.30,
+        "drawRate": 0.32,
+        "winrateAsP1": 0.70,
+        "winrateAsP2": 0.54,
+        "balancedSideWinrate": 0.54,
+        "winrateVsPreviousCheckpoint": 0.60,
+        "decisiveWinRateVsPreviousCheckpoint": 0.26,
+    }
+
+    assert _checkpoint_selection_score(stronger_vs_previous, 9) > _checkpoint_selection_score(weaker_vs_previous, 9)
 
 
 def test_build_pure_gap_relabel_candidate_captures_tactical_gap() -> None:

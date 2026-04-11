@@ -320,6 +320,22 @@
 
         <!-- TTT5 Training progress card -->
         <div v-if="ttt5Progress && ttt5Progress.phase && !datasetProgress && !backgroundProgress" class="card ttt5-training-panel">
+          <div class="overall-progress-panel">
+            <div class="overall-progress-header">
+              <strong>Общий прогресс</strong>
+              <span class="heartbeat-pill" :class="isHeartbeatFresh(ttt5Progress) ? 'heartbeat-fresh' : 'heartbeat-stale'">
+                {{ getHeartbeatLabel(ttt5Progress) }}
+              </span>
+            </div>
+            <div class="progress overall-progress">
+              <div class="bar ttt5-bar overall-bar" :style="{ width: getOverallPercent(ttt5Progress) + '%' }"></div>
+            </div>
+            <div class="overall-progress-meta">
+              <span class="overall-progress-value">{{ getOverallPercent(ttt5Progress).toFixed(1) }}%</span>
+              <span class="overall-progress-text">{{ getOverallDetailText(ttt5Progress) }}</span>
+            </div>
+          </div>
+
           <div class="phase-badges">
             <template v-if="isLegacyStructuredPhase(ttt5Progress.phase)">
               <span class="phase-badge"
@@ -605,6 +621,21 @@
             <strong>Фоновое дообучение</strong>
             <span class="bg-train-epochs">{{backgroundProgress.epoch}}/{{backgroundProgress.epochs}} эпох</span>
           </div>
+          <div class="overall-progress-panel">
+            <div class="overall-progress-header">
+              <strong>Общий прогресс</strong>
+              <span class="heartbeat-pill" :class="isHeartbeatFresh(backgroundProgress) ? 'heartbeat-fresh' : 'heartbeat-stale'">
+                {{ getHeartbeatLabel(backgroundProgress) }}
+              </span>
+            </div>
+            <div class="progress overall-progress">
+              <div class="bar bg-train-bar overall-bar" :style="{ width: getOverallPercent(backgroundProgress) + '%' }"></div>
+            </div>
+            <div class="overall-progress-meta">
+              <span class="overall-progress-value">{{ getOverallPercent(backgroundProgress).toFixed(1) }}%</span>
+              <span class="overall-progress-text">{{ getOverallDetailText(backgroundProgress) }}</span>
+            </div>
+          </div>
           <div class="progress">
             <div class="bar bg-train-bar" :style="{ width: (backgroundProgress.epochPercent||0)+'%' }"></div>
           </div>
@@ -654,6 +685,12 @@ function applyTheme() {
 
 function setVariant(v) {
   variant.value = v
+  const knownState = trainingStateByVariant.value?.[v]
+  if (knownState) {
+    applyTrainingStatus(knownState)
+  } else {
+    requestTrainingStatus(v)
+  }
 }
 
 const ws = ref(null)
@@ -663,6 +700,7 @@ const clearing = ref(false)
 const generatingDataset = ref(false)
 const progress = ref(null)
 const variant = ref('ttt3') // 'ttt3' или 'ttt5'
+const trainingStateByVariant = ref({})
 const boardSize = computed(() => variant.value === 'ttt5' ? 25 : 9)
 const gridN = computed(() => variant.value === 'ttt5' ? 5 : 3)
 const cellSize = computed(() => variant.value === 'ttt5' ? 60 : 80)
@@ -684,6 +722,114 @@ const probFading = ref(false) // Fade-out animation trigger
 const corpusStatus = ref(null) // { recentCount, hardMistakeCount, conversionCount, weakSideCount, ... }
 const corpusAnalyzing = ref(false) // analysis in progress
 const corpusLastEvent = ref('') // last event description
+
+function requestTrainingStatus(targetVariant = variant.value) {
+  if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+    ws.value.send(JSON.stringify({ type: 'get_training_status', payload: { variant: targetVariant } }))
+  }
+}
+
+function applyTrainingStatus(payload) {
+  if (!payload || !payload.variant) return
+
+  trainingStateByVariant.value = {
+    ...trainingStateByVariant.value,
+    [payload.variant]: payload,
+  }
+
+  if (payload.variant !== variant.value) return
+
+  const trainActive = Boolean(payload.active)
+  const backgroundActive = Boolean(payload.backgroundActive)
+  const phase = payload.phase || payload.payload?.phase || ''
+  const stage = payload.stage || payload.payload?.stage || ''
+  const nextProgress = { ...(payload.payload || {}) }
+  for (const key of ['overallPercent', 'overallEta', 'heartbeatTs', 'secondsSinceUpdate', 'heartbeatFresh', 'eventTs']) {
+    if (payload[key] != null) nextProgress[key] = payload[key]
+  }
+  if (payload.message && !nextProgress.message) nextProgress.message = payload.message
+
+  training.value = trainActive
+  if (!trainActive) {
+    cancellingTraining.value = false
+  }
+
+  if (Object.keys(nextProgress).length > 0) {
+    ttt5Progress.value = { ...(ttt5Progress.value || {}), ...nextProgress }
+    trainingMeta.value = { ...(trainingMeta.value || {}), ...nextProgress }
+    applyGpuTelemetry(nextProgress)
+  }
+
+  if (backgroundActive && Object.keys(nextProgress).length > 0) {
+    backgroundProgress.value = {
+      ...(backgroundProgress.value || {}),
+      ...nextProgress,
+      epoch: nextProgress.epoch || backgroundProgress.value?.epoch || 1,
+      epochs: nextProgress.epochs || backgroundProgress.value?.epochs || 1,
+      epochPercent: nextProgress.epochPercent ?? nextProgress.overallPercent ?? backgroundProgress.value?.epochPercent ?? 0,
+      message: nextProgress.message || backgroundProgress.value?.message,
+    }
+  }
+
+  if (Array.isArray(payload.metricsHistory) && payload.metricsHistory.length > 0) {
+    metricsHistory.value = [...payload.metricsHistory]
+  }
+
+  if (Array.isArray(payload.winrateHistory) && payload.winrateHistory.length > 0) {
+    winrateHistory.value = [...payload.winrateHistory]
+      .map(item => ({
+        cycle: Number(item.cycle || 0),
+        winrate: Number(item.winrate || 0),
+        decisiveWinRate: item.decisiveWinRate != null ? Number(item.decisiveWinRate || 0) : null,
+        drawRate: item.drawRate != null ? Number(item.drawRate || 0) : null,
+        winrateAsP1: item.winrateAsP1 != null ? Number(item.winrateAsP1 || 0) : null,
+        winrateAsP2: item.winrateAsP2 != null ? Number(item.winrateAsP2 || 0) : null,
+        balancedSideWinrate: item.balancedSideWinrate != null ? Number(item.balancedSideWinrate || 0) : null,
+        tacticalOverrideRate: item.tacticalOverrideRate != null ? Number(item.tacticalOverrideRate || 0) : null,
+        valueGuidedRate: item.valueGuidedRate != null ? Number(item.valueGuidedRate || 0) : null,
+        modelPolicyRate: item.modelPolicyRate != null ? Number(item.modelPolicyRate || 0) : null,
+        wins: Number(item.wins || 0),
+        losses: Number(item.losses || 0),
+        draws: Number(item.draws || 0),
+      }))
+      .sort((a, b) => a.cycle - b.cycle)
+  }
+
+  if (Array.isArray(payload.confirmWinrateHistory) && payload.confirmWinrateHistory.length > 0) {
+    confirmWinrateHistory.value = [...payload.confirmWinrateHistory]
+      .map(item => ({
+        cycle: Number(item.cycle || 0),
+        winrate: Number(item.winrate || 0),
+        decisiveWinRate: item.decisiveWinRate != null ? Number(item.decisiveWinRate || 0) : null,
+        drawRate: item.drawRate != null ? Number(item.drawRate || 0) : null,
+        winrateAsP1: item.winrateAsP1 != null ? Number(item.winrateAsP1 || 0) : null,
+        winrateAsP2: item.winrateAsP2 != null ? Number(item.winrateAsP2 || 0) : null,
+        balancedSideWinrate: item.balancedSideWinrate != null ? Number(item.balancedSideWinrate || 0) : null,
+        tacticalOverrideRate: item.tacticalOverrideRate != null ? Number(item.tacticalOverrideRate || 0) : null,
+        valueGuidedRate: item.valueGuidedRate != null ? Number(item.valueGuidedRate || 0) : null,
+        modelPolicyRate: item.modelPolicyRate != null ? Number(item.modelPolicyRate || 0) : null,
+        wins: Number(item.wins || 0),
+        losses: Number(item.losses || 0),
+        draws: Number(item.draws || 0),
+      }))
+      .sort((a, b) => a.cycle - b.cycle)
+  }
+
+  if (trainActive) {
+    if (!trainingStartTime.value) trainingStartTime.value = Date.now()
+    status.value = payload.message || getOverallDetailText(nextProgress) || `Обучение активно${phase ? `: ${phase}` : ''}`
+    return
+  }
+
+  if (backgroundActive) {
+    status.value = payload.message || getOverallDetailText(nextProgress) || `Фоновая оценка активна${stage ? `: ${stage}` : ''}`
+    return
+  }
+
+  if (payload.message) {
+    status.value = payload.message
+  }
+}
 
 // Get winning line indices
 function getWinningLine(brd) {
@@ -906,6 +1052,7 @@ const trainingElapsed = ref(0) // Elapsed seconds
 const trainingETA = ref(0) // Estimated remaining seconds
 let trainingTimerInterval = null
 let gpuPollInterval = null
+let trainingStatusPollInterval = null
 
 const metricsHistory = ref([]) // For training charts
 const winrateHistory = ref([]) // Winrate vs engine per exam cycle
@@ -986,6 +1133,130 @@ function formatPositionCount(progress) {
   const effective = progress.effectivePositions || 0
   if (effective > base) return `${base} (${effective})`
   return String(base)
+}
+
+function clampPercent(value) {
+  const num = Number(value)
+  if (!Number.isFinite(num)) return 0
+  return Math.min(100, Math.max(0, num))
+}
+
+function extractPhaseFraction(progress) {
+  if (!progress) return null
+  const pairs = [
+    ['step', 'totalSteps'],
+    ['game', 'totalGames'],
+    ['generated', 'total'],
+    ['currentBatch', 'batchesPerEpoch'],
+    ['batch', 'totalBatches'],
+    ['samplesDone', 'samplesTotal'],
+    ['cycle', 'totalCycles'],
+    ['iteration', 'totalIterations'],
+    ['epoch', 'totalEpochs'],
+  ]
+  for (const [currentKey, totalKey] of pairs) {
+    const currentValue = Number(progress[currentKey])
+    const totalValue = Number(progress[totalKey])
+    if (Number.isFinite(currentValue) && Number.isFinite(totalValue) && totalValue > 0) {
+      return Math.min(1, Math.max(0, currentValue / totalValue))
+    }
+  }
+  return null
+}
+
+function estimateOverallPercent(progress) {
+  if (!progress) return 0
+  if (progress.overallPercent != null) return clampPercent(progress.overallPercent)
+  if (progress.percent != null) return clampPercent(progress.percent)
+  if (progress.epochPercent != null) return clampPercent(progress.epochPercent)
+
+  const ranges = {
+    preparing: [0, 2],
+    foundation: [2, 55],
+    tactical: [2, 15],
+    bootstrap: [15, 30],
+    turbo_train: [30, 62],
+    exam: [62, 72],
+    repair: [72, 79],
+    repair_eval: [79, 82],
+    holdout: [82, 86],
+    checkpoint_selection: [86, 88],
+    arena: [88, 90],
+    self_play_gen: [90, 92.5],
+    self_play_warmup: [92.5, 93.5],
+    self_play_train: [93.5, 97],
+    self_play_exam: [97, 98.5],
+    self_play_acceptance: [98.5, 99],
+    confirm_exam: [99, 99.7],
+    promotion: [99.7, 100],
+    done: [100, 100],
+    background_done: [100, 100],
+  }
+  const range = ranges[progress.phase]
+  if (!range) return 0
+  const fraction = extractPhaseFraction(progress)
+  if (fraction == null) return clampPercent(range[0])
+  return clampPercent(range[0] + (range[1] - range[0]) * fraction)
+}
+
+function getOverallPercent(progress) {
+  return estimateOverallPercent(progress)
+}
+
+function getHeartbeatAgeSeconds(progress) {
+  if (!progress) return null
+  if (progress.secondsSinceUpdate != null) {
+    const num = Number(progress.secondsSinceUpdate)
+    if (Number.isFinite(num)) return Math.max(0, num)
+  }
+  if (progress.heartbeatTs) {
+    const parsed = Date.parse(progress.heartbeatTs)
+    if (!Number.isNaN(parsed)) {
+      return Math.max(0, Math.floor((Date.now() - parsed) / 1000))
+    }
+  }
+  return null
+}
+
+function isHeartbeatFresh(progress) {
+  const age = getHeartbeatAgeSeconds(progress)
+  return age == null || age <= 5
+}
+
+function getHeartbeatLabel(progress) {
+  if (!progress) return 'нет данных'
+  const age = getHeartbeatAgeSeconds(progress)
+  if (age == null) return 'живой статус'
+  if (age <= 1) return 'обновлено только что'
+  return `обновлено ${age}с назад`
+}
+
+function getOverallEta(progress) {
+  if (!progress) return null
+  const direct = Number(progress.overallEta ?? progress.eta)
+  if (Number.isFinite(direct) && direct > 0) return direct
+  const elapsed = Number(progress.elapsed)
+  const pct = getOverallPercent(progress)
+  if (Number.isFinite(elapsed) && elapsed > 3 && pct > 1) {
+    return Math.floor(elapsed * (100 - pct) / pct)
+  }
+  return null
+}
+
+function getOverallDetailText(progress) {
+  if (!progress) return ''
+  const phase = getPhaseLabel(progress.phase)
+  const stage = getStageLabel(progress.stage)
+  const eta = getOverallEta(progress)
+  const parts = []
+  if (phase) parts.push(phase)
+  if (stage) parts.push(stage)
+  if (progress.totalIterations) parts.push(`итерация ${progress.iteration || 0}/${progress.totalIterations}`)
+  else if (progress.totalCycles) parts.push(`цикл ${progress.cycle || 0}/${progress.totalCycles}`)
+  if (progress.totalGames) parts.push(`игра ${progress.game || 0}/${progress.totalGames}`)
+  else if (progress.totalSteps) parts.push(`шаг ${progress.step || 0}/${progress.totalSteps}`)
+  if (eta && eta > 0) parts.push(`ETA ~${formatTime(eta)}`)
+  return parts.join(' · ')
 }
 
 function getPhaseLabel(name) {
@@ -1099,6 +1370,15 @@ function extractGpuTelemetry(payload) {
     name: source.name || payload.deviceName || null,
   }
   return Object.values(snapshot).some(v => v !== null && v !== undefined) ? snapshot : null
+}
+
+function applyGpuTelemetry(payload) {
+  const snapshot = extractGpuTelemetry(payload)
+  if (!snapshot) return
+  gpuTelemetry.value = {
+    ...(gpuTelemetry.value || {}),
+    ...snapshot,
+  }
 }
 
 // ===== uPlot Training Charts =====
@@ -1321,6 +1601,8 @@ function connectWS() {
       if (ws.value.readyState === WebSocket.OPEN) {
         ws.value.send(JSON.stringify({ type: 'get_history_stats' }))
         ws.value.send(JSON.stringify({ type: 'get_gpu_info' }))
+        requestTrainingStatus('ttt3')
+        requestTrainingStatus('ttt5')
       }
     }
     
@@ -1374,7 +1656,7 @@ function connectWS() {
         console.log('[WS] Received:', msg.type, msg.payload || '')
         
         // Обработка событий фонового обучения
-        if (msg.type === 'background_train.start') {
+        if (msg.type === 'background_train.start' || msg.type === 'background_train.started') {
           backgroundProgress.value = {
             epoch: 0,
             epochs: msg.payload.epochs || 1,
@@ -1382,7 +1664,12 @@ function connectWS() {
             newSkills: msg.payload.newSkills || 0,
             totalSkills: msg.payload.totalSkills || 0,
             newSkillsPercent: msg.payload.newSkillsPercent || 0,
-            message: msg.payload.message
+            message: msg.payload.message,
+            phase: msg.payload.phase,
+            stage: msg.payload.stage,
+            overallPercent: msg.payload.overallPercent ?? msg.payload.epochPercent ?? 0,
+            heartbeatTs: new Date().toISOString(),
+            secondsSinceUpdate: 0,
           }
           status.value = msg.payload.message || 'Фоновое обучение началось...'
           console.log('[WS] Background training started:', msg.payload)
@@ -1400,7 +1687,17 @@ function connectWS() {
             batchProgress: msg.payload.batchProgress,
             currentBatch: msg.payload.currentBatch,
             batchesPerEpoch: msg.payload.batchesPerEpoch,
-            message: msg.payload.message
+            message: msg.payload.message,
+            phase: msg.payload.phase,
+            stage: msg.payload.stage,
+            game: msg.payload.game,
+            totalGames: msg.payload.totalGames,
+            step: msg.payload.step,
+            totalSteps: msg.payload.totalSteps,
+            overallPercent: msg.payload.overallPercent ?? msg.payload.epochPercent ?? 0,
+            overallEta: msg.payload.overallEta,
+            heartbeatTs: new Date().toISOString(),
+            secondsSinceUpdate: 0,
           }
           // Используем epochPercent для статуса, если есть batchProgress - показываем его
           const progressText = msg.payload.batchProgress ? 
@@ -1471,6 +1768,10 @@ function connectWS() {
           backgroundProgress.value = null
           console.error('[WS] Background training error:', msg.error)
         }
+        if (msg.type === 'training.status') {
+          applyTrainingStatus(msg.payload || {})
+          console.log('[WS] Training status synced:', msg.payload)
+        }
         
         if (msg.type === 'train.progress') {
           // Игнорируем прогресс обычного обучения, если идет фоновое
@@ -1482,7 +1783,7 @@ function connectWS() {
             if (msg.payload.phase) {
               ttt5Progress.value = msg.payload
               trainingMeta.value = { ...(trainingMeta.value || {}), ...msg.payload }
-              gpuTelemetry.value = extractGpuTelemetry(msg.payload)
+              applyGpuTelemetry(msg.payload)
               if (msg.payload.metricsHistory) {
                 metricsHistory.value = msg.payload.metricsHistory
               }
@@ -1578,7 +1879,7 @@ function connectWS() {
           cancellingTraining.value = false
           destroyCharts()
           trainingMeta.value = msg.payload
-          gpuTelemetry.value = extractGpuTelemetry(msg.payload)
+          applyGpuTelemetry(msg.payload)
           progress.value = { percent: 0, epoch: 0, epochs: msg.payload.epochs }
           ttt5Progress.value = { ...msg.payload, phase: 'preparing', percent: 0, elapsed: 0, eta: 0 }
           metricsHistory.value = []
@@ -1862,7 +2163,7 @@ function connectWS() {
         if (msg.type === 'gpu.info') {
           gpuAvailable.value = msg.payload.available || false
           gpuBackend.value = msg.payload.backend || 'cpu'
-          gpuTelemetry.value = extractGpuTelemetry(msg.payload)
+          applyGpuTelemetry(msg.payload)
           console.log('[WS] GPU info:', msg.payload)
         }
         if (msg.type === 'game.started') {
@@ -1932,7 +2233,9 @@ function startTrain() {
   trainingTimerInterval = setInterval(() => {
     trainingElapsed.value = Math.floor((Date.now() - trainingStartTime.value) / 1000)
     // Estimate ETA from progress percent
-    const pct = progress.value?.percent || ttt5Progress.value?.percent || 0
+    const pct = backgroundProgress.value
+      ? getOverallPercent(backgroundProgress.value)
+      : (ttt5Progress.value ? getOverallPercent(ttt5Progress.value) : (progress.value?.percent || 0))
     if (pct > 2 && trainingElapsed.value > 3) {
       trainingETA.value = Math.floor(trainingElapsed.value * (100 - pct) / pct)
     }
@@ -2429,6 +2732,7 @@ watch(training, (val) => {
 onUnmounted(() => {
   destroyCharts()
   if (gpuPollInterval) clearInterval(gpuPollInterval)
+  if (trainingStatusPollInterval) clearInterval(trainingStatusPollInterval)
 })
 
 // Сбрасываем игру и настройки при смене варианта
@@ -2460,6 +2764,11 @@ onMounted(() => {
       ws.value.send(JSON.stringify({ type: 'get_gpu_info' }))
     }
   }, 3000)
+  trainingStatusPollInterval = setInterval(() => {
+    if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+      requestTrainingStatus(variant.value)
+    }
+  }, 1000)
 })
 </script>
 
@@ -3365,6 +3674,74 @@ body {
 
 .bg-train-bar {
   background: linear-gradient(90deg, var(--accent), #60a5fa) !important;
+}
+
+.overall-progress-panel {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-secondary) 72%, transparent);
+}
+
+.overall-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.overall-progress {
+  height: 10px;
+}
+
+.overall-bar {
+  transition: width 0.25s ease;
+}
+
+.overall-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 0.92rem;
+}
+
+.overall-progress-value {
+  color: var(--text-primary);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.overall-progress-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.heartbeat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  border: 1px solid var(--border-color);
+  white-space: nowrap;
+}
+
+.heartbeat-fresh {
+  color: var(--accent-green);
+  border-color: color-mix(in srgb, var(--accent-green) 35%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-green) 10%, transparent);
+}
+
+.heartbeat-stale {
+  color: var(--accent-red);
+  border-color: color-mix(in srgb, var(--accent-red) 35%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-red) 10%, transparent);
 }
 
 /* ===== GPU Telemetry ===== */

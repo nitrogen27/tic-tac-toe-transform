@@ -41,6 +41,7 @@ class ModelRegistry:
         self.base_dir = SAVED_DIR / f"{self.variant}_resnet"
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._migrate_legacy()
+        self._heal_checkpoint_aliases()
 
     # ------------------------------------------------------------------
     # Paths
@@ -261,6 +262,33 @@ class ModelRegistry:
         """Public access to manifest data."""
         return self._read_manifest()
 
+    def clear_checkpoints(self, *, preserve_history: bool = True) -> None:
+        """Remove all local checkpoint files for this variant.
+
+        This is an explicit user action and must not be auto-healed back from a
+        working checkpoint on the next registry init. We therefore remove both
+        serving and working aliases and reset the current champion pointer in
+        manifest while optionally preserving historical promotion records.
+        """
+        for path in (
+            self.legacy_path,
+            self.candidate_path,
+            self.champion_path,
+            self.working_candidate_path,
+            self.candidate_meta_path,
+            self.working_candidate_meta_path,
+        ):
+            path.unlink(missing_ok=True)
+
+        manifest = self._read_manifest()
+        history = manifest.get("history", []) if preserve_history else []
+        manifest = {
+            "variant": self.variant,
+            "current_champion_generation": None,
+            "history": history,
+        }
+        self._write_manifest(manifest)
+
     # ------------------------------------------------------------------
     # Legacy migration
     # ------------------------------------------------------------------
@@ -270,3 +298,36 @@ class ModelRegistry:
         if self.legacy_path.exists() and not self.champion_path.exists():
             shutil.copy2(self.legacy_path, self.champion_path)
             logger.info("Migrated legacy model.pt → champion.pt for %s", self.variant)
+
+    def _heal_checkpoint_aliases(self) -> None:
+        """Best-effort recovery for serving/candidate aliases after interrupted runs.
+
+        Training is allowed to update ``candidate_working.pt`` frequently, but the
+        serving-facing files should not disappear. If they do, recover the safest
+        available alias so the runtime does not end up with no checkpoint at all.
+        """
+        if self.champion_path.exists() and not self.legacy_path.exists():
+            shutil.copy2(self.champion_path, self.legacy_path)
+            logger.warning("Recovered missing model.pt from champion.pt for %s", self.variant)
+
+        if self.legacy_path.exists() and not self.champion_path.exists():
+            shutil.copy2(self.legacy_path, self.champion_path)
+            logger.warning("Recovered missing champion.pt from model.pt for %s", self.variant)
+
+        if not self.candidate_path.exists() and self.working_candidate_path.exists():
+            shutil.copy2(self.working_candidate_path, self.candidate_path)
+            logger.warning("Recovered missing candidate.pt from candidate_working.pt for %s", self.variant)
+
+        if not self.champion_path.exists() and self.working_candidate_path.exists():
+            fallback = self.working_candidate_path
+            if fallback is not None:
+                shutil.copy2(fallback, self.champion_path)
+                logger.warning(
+                    "Recovered missing champion.pt from %s for %s",
+                    fallback.name,
+                    self.variant,
+                )
+
+        if self.champion_path.exists() and not self.legacy_path.exists():
+            shutil.copy2(self.champion_path, self.legacy_path)
+            logger.warning("Recovered missing model.pt from champion.pt for %s", self.variant)

@@ -9,6 +9,14 @@ from typing import Any
 
 import websockets
 
+TERMINAL_TRAINING_EVENTS = {
+    "train.error",
+    "train.cancelled",
+    "promotion.rejected",
+    "background_train.done",
+    "background_train.error",
+}
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -44,7 +52,19 @@ def latest_training_log(root: Path, variant: str) -> Path | None:
     if not log_dir.exists():
         return None
     logs = sorted(log_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return logs[0] if logs else None
+    if not logs:
+        return None
+
+    active_logs: list[Path] = []
+    for log_path in logs:
+        last_obj = read_last_jsonl_object(log_path)
+        event = str(last_obj.get("event") or "")
+        if event and event not in TERMINAL_TRAINING_EVENTS:
+            active_logs.append(log_path)
+
+    if active_logs:
+        return max(active_logs, key=lambda p: p.stat().st_mtime)
+    return logs[0]
 
 
 def read_last_jsonl_object(path: Path) -> dict[str, Any]:
@@ -76,10 +96,20 @@ def compact_training_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "totalCycles",
         "iteration",
         "totalIterations",
+        "percent",
+        "overallPercent",
+        "overallEta",
+        "game",
+        "totalGames",
+        "generated",
+        "total",
         "epoch",
         "totalEpochs",
+        "epochPercent",
         "step",
         "totalSteps",
+        "batch",
+        "totalBatches",
         "loss",
         "accuracy",
         "acc",
@@ -98,10 +128,27 @@ def compact_training_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "hybridFrozenBlockRecall",
         "pureExactTrapRecall",
         "hybridExactTrapRecall",
+        "pureWorstTrapFamilyRecall",
+        "hybridWorstTrapFamilyRecall",
+        "pureWorstTrapFamily",
+        "hybridWorstTrapFamily",
+        "pureP1TrapRecall",
+        "pureP2TrapRecall",
+        "hybridP1TrapRecall",
+        "hybridP2TrapRecall",
+        "exactPackSize",
+        "exactPackFamilyCount",
         "servingReady",
         "servingSource",
         "servingGeneration",
         "winrateVsAlgorithm",
+        "winrateVsChampion",
+        "decisiveWinRateVsChampion",
+        "drawRateVsChampion",
+        "winrateVsPreviousCheckpoint",
+        "decisiveWinRateVsPreviousCheckpoint",
+        "drawRateVsPreviousCheckpoint",
+        "acceptedVsPreviousCheckpoint",
         "decisiveWinRate",
         "drawRate",
         "winrateAsP1",
@@ -111,13 +158,30 @@ def compact_training_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "pureMissedWinCount",
         "pureMissedBlockCount",
         "promoted",
+        "promotionPending",
+        "evaluationQueued",
         "promotionDecision",
         "reason",
+        "message",
         "elapsed",
         "eta",
+        "heartbeatTs",
+        "heartbeatFresh",
+        "secondsSinceUpdate",
         "speed",
         "speedUnit",
         "positions",
+        "positionsCollected",
+        "selfPlayReplaySamples",
+        "selfPlayMinReplaySamples",
+        "mixedReplaySources",
+        "mixedReplayWeights",
+        "selfPlayStats",
+        "arenaWins",
+        "arenaLosses",
+        "arenaDraws",
+        "progressTrend",
+        "deltaWinrate",
         "samplesPerSec",
         "gpuPowerW",
         "gpuUtilization",
@@ -127,6 +191,8 @@ def compact_training_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "selectedCheckpointCycle",
         "selectedCheckpointWinrate",
         "selectedCheckpointBalancedSideWinrate",
+        "selectedCheckpointWinrateVsChampion",
+        "selectedCheckpointWinrateVsPreviousCheckpoint",
         "confirmWinrateAsP1",
         "confirmWinrateAsP2",
         "confirmBalancedSideWinrate",
@@ -155,7 +221,7 @@ def read_training_state(root: Path, variant: str) -> dict[str, Any]:
     last_obj = read_last_jsonl_object(log_path)
     event = str(last_obj.get("event") or "")
     payload = last_obj.get("payload") or {}
-    active = event not in {"train.done", "train.error", "train.cancelled", "promotion.rejected"}
+    active = event not in TERMINAL_TRAINING_EVENTS
     return {
         "active": active,
         "logPath": str(log_path),
@@ -168,29 +234,36 @@ def read_training_state(root: Path, variant: str) -> dict[str, Any]:
     }
 
 
-async def fetch_gpu_info_once(uri: str) -> tuple[dict[str, Any], dict[str, Any]]:
+async def fetch_runtime_state_once(uri: str, variant: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     try:
         ws = await websockets.connect(uri, max_size=10_000_000)
     except Exception:
-        return {}, {}
+        return {}, {}, {}
     first: dict[str, Any] = {}
+    gpu_payload: dict[str, Any] = {}
+    training_payload: dict[str, Any] = {}
     try:
         try:
             first = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
         except Exception:
             first = {}
         await ws.send(json.dumps({"type": "get_gpu_info"}))
+        await ws.send(json.dumps({"type": "get_training_status", "payload": {"variant": variant}}))
         deadline = time.time() + 5
         while time.time() < deadline:
             raw = await asyncio.wait_for(ws.recv(), timeout=5)
             msg = json.loads(raw)
             if msg.get("type") == "gpu.info":
-                return msg.get("payload", {}) or {}, first
+                gpu_payload = msg.get("payload", {}) or {}
+            elif msg.get("type") == "training.status":
+                training_payload = msg.get("payload", {}) or {}
+            if gpu_payload and training_payload:
+                return gpu_payload, training_payload, first
     except Exception:
-        return {}, first
+        return gpu_payload, training_payload, first
     finally:
         await ws.close()
-    return {}, first
+    return gpu_payload, training_payload, first
 
 
 def make_snapshot(
@@ -199,6 +272,7 @@ def make_snapshot(
     gpu: dict[str, Any],
     manifest: dict[str, Any],
     candidate_path: Path,
+    working_candidate_path: Path,
     champion_path: Path,
     manifest_path: Path,
     api_log_path: Path,
@@ -224,6 +298,7 @@ def make_snapshot(
         },
         "files": {
             "candidate": file_stat(candidate_path),
+            "candidateWorking": file_stat(working_candidate_path),
             "champion": file_stat(champion_path),
             "manifest": file_stat(manifest_path),
             "apiLog": file_stat(api_log_path),
@@ -251,6 +326,7 @@ async def monitor(
     root = repo_root()
     variant_dir = root / "saved" / f"{variant}_resnet"
     candidate_path = variant_dir / "candidate.pt"
+    working_candidate_path = variant_dir / "candidate_working.pt"
     champion_path = variant_dir / "champion.pt"
     manifest_path = variant_dir / "manifest.json"
     api_log_path = root / ".runtime" / "legacy-ui-api" / "api.log"
@@ -271,16 +347,22 @@ async def monitor(
                 if duration is not None and (time.time() - started) >= duration:
                     break
 
-                gpu, first_msg = await fetch_gpu_info_once(uri)
+                gpu, server_training_state, first_msg = await fetch_runtime_state_once(uri, variant)
                 if not first and first_msg:
                     first = first_msg
                 manifest = read_manifest(manifest_path)
-                training_state = read_training_state(root, variant)
+                training_state = server_training_state or read_training_state(root, variant)
+                if training_state:
+                    training_state = {
+                        **training_state,
+                        "payload": compact_training_payload(training_state.get("payload") or {}),
+                    }
                 snapshot = make_snapshot(
                     variant=variant,
                     gpu=gpu,
                     manifest=manifest,
                     candidate_path=candidate_path,
+                    working_candidate_path=working_candidate_path,
                     champion_path=champion_path,
                     manifest_path=manifest_path,
                     api_log_path=api_log_path,
@@ -300,7 +382,7 @@ async def monitor(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Monitor active training metrics into JSONL")
     parser.add_argument("--variant", default="ttt5")
-    parser.add_argument("--interval", type=float, default=5.0)
+    parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument("--uri", default="ws://127.0.0.1:8080/")
     parser.add_argument("--out", default=None)

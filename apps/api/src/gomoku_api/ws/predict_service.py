@@ -17,6 +17,8 @@ import torch.nn.functional as F
 from gomoku_api.config import settings
 from gomoku_api.ws.model_profiles import variant_model_hparams
 from gomoku_api.ws.model_registry import ModelRegistry
+from gomoku_api.ws.subprocess_utils import windows_hidden_subprocess_kwargs
+from trainer_lab.data.encoder import board_to_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -206,8 +208,6 @@ def _evaluate_afterstate_values(
     board_size: int,
     candidate_moves: list[int],
 ) -> dict[int, float]:
-    from trainer_lab.data.encoder import board_to_tensor
-
     if not candidate_moves:
         return {}
 
@@ -754,6 +754,7 @@ async def _engine_predict(board: list[int], current: int, board_size: int, win_l
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **windows_hidden_subprocess_kwargs(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(json.dumps(payload).encode()), timeout=10)
         result = json.loads(stdout.decode())
@@ -1002,10 +1003,20 @@ def _mcts_predict(
     for idx, prob in enumerate(policy_flat):
         probs_raw[idx] = prob
 
-    # Select best legal move
     legal = [i for i, v in enumerate(board) if v == 0]
-    best_move = max(legal, key=lambda i: probs_raw[i]) if legal else -1
+    value_scores = _evaluate_afterstate_values(model, board, current, board_size, legal)
+    best_move, tactical_meta = _select_threat_aware_move(
+        board,
+        current,
+        board_size,
+        win_length,
+        probs_raw,
+        value_scores=value_scores,
+    )
     confidence = probs_raw[best_move] if best_move >= 0 else 0.0
+    search_mode = tactical_meta.get("searchMode") or "none"
+    if search_mode == "none":
+        search_mode = "mcts"
 
     return {
         "move": best_move,
@@ -1017,8 +1028,10 @@ def _mcts_predict(
         "modelSource": _current_model_source(variant),
         "value": round(root_value, 4),
         "searchBacked": True,
-        "searchMode": "mcts",
+        "searchMode": search_mode,
         "searchDepth": num_simulations,
+        "mctsConfidence": round(confidence, 4),
+        **tactical_meta,
     }
 
 

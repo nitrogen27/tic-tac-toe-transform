@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from gomoku_api.config import settings
+from gomoku_api.ws.subprocess_utils import windows_hidden_subprocess_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class RapfiAdapter:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._workdir or None,
+            **windows_hidden_subprocess_kwargs(),
         )
         self._board_size = None
         logger.info("Started Rapfi adapter: pid=%s binary=%s", self._process.pid, self._binary)

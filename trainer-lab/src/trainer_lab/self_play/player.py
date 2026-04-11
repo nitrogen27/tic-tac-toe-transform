@@ -6,7 +6,7 @@ import copy
 import logging
 import math
 import random
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -367,6 +367,7 @@ def generate_games_parallel(
     c_puct: float = 1.5,
     dirichlet_alpha: float = 0.3,
     dirichlet_weight: float = 0.25,
+    progress_callback: Callable[[int, int, int], None] | None = None,
 ) -> list[dict]:
     """Generate self-play games in parallel threads.
 
@@ -402,6 +403,11 @@ def generate_games_parallel(
                 positions = future.result()
                 all_positions.extend(positions)
                 completed += 1
+                if progress_callback is not None:
+                    try:
+                        progress_callback(completed, num_games, len(all_positions))
+                    except Exception:
+                        logger.debug("Self-play progress callback failed", exc_info=True)
                 if completed % max(1, num_games // 10) == 0:
                     logger.info(
                         "Parallel self-play: %d/%d games (%d positions)",
@@ -410,6 +416,11 @@ def generate_games_parallel(
             except Exception as exc:
                 logger.warning("Self-play game failed: %s", exc)
                 completed += 1
+                if progress_callback is not None:
+                    try:
+                        progress_callback(completed, num_games, len(all_positions))
+                    except Exception:
+                        logger.debug("Self-play progress callback failed", exc_info=True)
 
     logger.info(
         "Parallel generation done: %d games, %d positions (%d workers)",

@@ -76,3 +76,41 @@ def test_serving_summary_prefers_champion(tmp_path, monkeypatch) -> None:
     assert summary["servingReady"] is True
     assert summary["servingSource"] == "champion"
     assert summary["servingGeneration"] == 9
+
+
+def test_registry_heals_missing_serving_files_from_working_candidate(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(model_registry, "SAVED_DIR", tmp_path)
+    first = ModelRegistry("ttt5")
+    model = _tiny_model()
+
+    first.save_working_candidate(model, generation=4, metrics={"phase": "foundation"})
+
+    healed = ModelRegistry("ttt5")
+
+    assert healed.working_candidate_path.exists()
+    assert healed.candidate_path.exists()
+    assert healed.champion_path.exists()
+    assert healed.legacy_path.exists()
+
+
+def test_clear_checkpoints_removes_serving_and_working_files(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(model_registry, "SAVED_DIR", tmp_path)
+    registry = ModelRegistry("ttt5")
+    model = _tiny_model()
+
+    registry.save_working_candidate(model, generation=4, metrics={"phase": "foundation"})
+    registry.promote_candidate(
+        generation=4,
+        metrics={"winrateVsAlgorithm": 0.8},
+        source_path=registry.working_candidate_path,
+    )
+
+    registry.clear_checkpoints(preserve_history=True)
+
+    assert not registry.working_candidate_path.exists()
+    assert not registry.candidate_path.exists()
+    assert not registry.champion_path.exists()
+    assert not registry.legacy_path.exists()
+    manifest = registry.read_manifest()
+    assert manifest["current_champion_generation"] is None
+    assert len(manifest["history"]) == 1

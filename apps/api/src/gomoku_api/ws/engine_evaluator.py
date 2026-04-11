@@ -17,6 +17,7 @@ import logging
 from typing import Any
 
 from gomoku_api.config import settings
+from gomoku_api.ws.subprocess_utils import windows_hidden_subprocess_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class EngineEvaluator:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **windows_hidden_subprocess_kwargs(),
         )
         logger.info("Started persistent engine evaluator: pid=%s", self._process.pid)
 
