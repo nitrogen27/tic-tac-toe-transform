@@ -348,3 +348,71 @@ class SelfPlayPlayer:
             if (g + 1) % max(1, n // 10) == 0:
                 logger.info("Self-play: %d/%d games (%d positions)", g + 1, n, len(all_positions))
         return all_positions
+
+
+# ---------------------------------------------------------------------------
+# Parallel game generation (multi-threaded)
+# ---------------------------------------------------------------------------
+
+
+def generate_games_parallel(
+    model: PolicyValueResNet,
+    num_games: int,
+    board_size: int = 5,
+    win_length: int | None = None,
+    num_simulations: int = 200,
+    num_workers: int = 4,
+    device: torch.device | None = None,
+    warm_up_steps: int = 8,
+    c_puct: float = 1.5,
+    dirichlet_alpha: float = 0.3,
+    dirichlet_weight: float = 0.25,
+) -> list[dict]:
+    """Generate self-play games in parallel threads.
+
+    Uses ThreadPoolExecutor so each thread shares the model (GIL released
+    during torch inference). Returns all positions with 256-padded policy.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    dev = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    model.to(dev)
+    model.eval()
+
+    config = SelfPlayConfig(
+        games=1,
+        simulations=num_simulations,
+        warm_up_steps=warm_up_steps,
+        c_puct=c_puct,
+        dirichlet_alpha=dirichlet_alpha,
+        dirichlet_weight=dirichlet_weight,
+    )
+
+    def _play_one() -> list[dict]:
+        player = SelfPlayPlayer(model, config, dev)
+        return player.play_game(board_size=board_size, win_length=win_length)
+
+    all_positions: list[dict] = []
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futures = [pool.submit(_play_one) for _ in range(num_games)]
+        for future in as_completed(futures):
+            try:
+                positions = future.result()
+                all_positions.extend(positions)
+                completed += 1
+                if completed % max(1, num_games // 10) == 0:
+                    logger.info(
+                        "Parallel self-play: %d/%d games (%d positions)",
+                        completed, num_games, len(all_positions),
+                    )
+            except Exception as exc:
+                logger.warning("Self-play game failed: %s", exc)
+                completed += 1
+
+    logger.info(
+        "Parallel generation done: %d games, %d positions (%d workers)",
+        completed, len(all_positions), num_workers,
+    )
+    return all_positions
