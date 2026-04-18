@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import torch
 from pathlib import Path
 
 from gomoku_api.ws import model_registry
 from gomoku_api.ws import predict_service
+from trainer_lab.specs import resolve_variant_spec
 
 
 def _policy_index(move: int, board_size: int = 5) -> int:
@@ -368,3 +371,60 @@ def test_get_model_loads_champion_checkpoint_for_serving(tmp_path, monkeypatch) 
     loaded = predict_service._get_model("ttt5")
 
     assert loaded is not None
+
+
+def test_get_model_rejects_incompatible_structured_serving_checkpoint(tmp_path, monkeypatch) -> None:
+    saved_dir = tmp_path / "saved"
+    variant_dir = saved_dir / "gomoku15_resnet"
+    variant_dir.mkdir(parents=True)
+
+    from trainer_lab.config import ModelConfig
+    from trainer_lab.models.resnet import PolicyValueResNet
+
+    cfg = ModelConfig()
+    model = PolicyValueResNet(
+        in_channels=cfg.in_channels,
+        res_filters=128,
+        res_blocks=8,
+        policy_filters=cfg.policy_filters,
+        value_fc=192,
+        board_max=cfg.board_max,
+    )
+    torch.save(model.state_dict(), variant_dir / "champion.pt")
+    manifest = {
+        "variant": "gomoku15",
+        "current_champion_generation": 3,
+        "history": [
+            {
+                "generation": 3,
+                "variantSpec": resolve_variant_spec("gomoku9_curriculum").to_metadata(),
+            }
+        ],
+    }
+    (variant_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setattr(model_registry, "SAVED_DIR", Path(saved_dir))
+    monkeypatch.setattr(predict_service, "SAVED_DIR", Path(saved_dir))
+    predict_service.clear_cached_model("gomoku15")
+
+    loaded = predict_service._get_model("gomoku15")
+
+    assert loaded is None
+
+
+def test_predict_accepts_curriculum_variant_parsing(monkeypatch) -> None:
+    board = [0] * 81
+    monkeypatch.setattr(predict_service, "_get_model", lambda variant: None)
+
+    result = asyncio.run(
+        predict_service.predict(
+            board,
+            current=1,
+            mode="model",
+            variant="gomoku9_curriculum",
+            model_decision_mode="pure",
+        )
+    )
+
+    assert result["decisionMode"] == "pure"
+    assert result["fallback"] is True

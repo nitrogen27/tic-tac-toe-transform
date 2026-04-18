@@ -118,6 +118,14 @@ def test_variant_model_hparams_supports_ttt5_small_profile() -> None:
     assert ttt5_small == (64, 6, 128)
 
 
+def test_variant_model_hparams_supports_gomoku9_curriculum_profile() -> None:
+    cfg = ModelConfig()
+    profile, hparams = _variant_model_hparams(9, cfg, variant="gomoku9_curriculum")
+
+    assert profile == "curriculum"
+    assert hparams == (96, 6, 160)
+
+
 def test_selfplay_mixed_source_weights_shift_toward_self_play() -> None:
     early = _selfplay_mixed_source_weights(1, 10)
     late = _selfplay_mixed_source_weights(10, 10)

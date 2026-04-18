@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from gomoku_api.ws import model_registry
 from gomoku_api.ws.model_registry import ModelRegistry
+from trainer_lab.specs import resolve_variant_spec
 
 
 def _tiny_model() -> nn.Module:
@@ -114,3 +115,26 @@ def test_clear_checkpoints_removes_serving_and_working_files(tmp_path, monkeypat
     manifest = registry.read_manifest()
     assert manifest["current_champion_generation"] is None
     assert len(manifest["history"]) == 1
+
+
+def test_resolve_serving_checkpoint_rejects_incompatible_structured_metadata(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(model_registry, "SAVED_DIR", tmp_path)
+    registry = ModelRegistry("gomoku15")
+    model = _tiny_model()
+    incompatible_spec = resolve_variant_spec("gomoku9_curriculum")
+
+    registry.save_working_candidate(
+        model,
+        generation=7,
+        metrics={"variantSpec": incompatible_spec.to_metadata()},
+    )
+    registry.promote_candidate(
+        generation=7,
+        metrics={"variantSpec": incompatible_spec.to_metadata()},
+        source_path=registry.working_candidate_path,
+    )
+
+    path, source = registry.resolve_serving_checkpoint(expected_spec=resolve_variant_spec("gomoku15"))
+
+    assert path is None
+    assert source == "incompatible"

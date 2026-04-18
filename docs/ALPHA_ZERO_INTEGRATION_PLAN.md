@@ -17,6 +17,9 @@ The target is not "rewrite everything into another repo". The target is:
 3. create a stronger and more stable training system for `ttt5`,
 4. keep `pure` and `hybrid` measured separately.
 
+Size-curriculum follow-up for unified `9x9 -> 16x16` rollout:
+- [GOMOKU_SIZE_CURRICULUM_ARCHITECTURE.md](./GOMOKU_SIZE_CURRICULUM_ARCHITECTURE.md)
+
 
 ## Executive Summary
 

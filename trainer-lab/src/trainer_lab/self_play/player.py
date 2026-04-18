@@ -15,8 +15,11 @@ import torch.nn.functional as F
 from trainer_lab.config import SelfPlayConfig
 from trainer_lab.data.encoder import board_to_tensor
 from trainer_lab.models.resnet import PolicyValueResNet
+from trainer_lab.specs import PADDED_BOARD_SIZE, PADDED_POLICY_SIZE, resolve_variant_spec
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_GOMOKU_BOARD_SIZE = resolve_variant_spec("gomoku15").board_size
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +32,7 @@ class GameState:
 
     __slots__ = ("board_size", "win_length", "board", "current_player", "last_move", "move_count")
 
-    def __init__(self, board_size: int = 15, win_length: int | None = None) -> None:
+    def __init__(self, board_size: int = _DEFAULT_GOMOKU_BOARD_SIZE, win_length: int | None = None) -> None:
         self.board_size = board_size
         self.win_length = win_length if win_length is not None else (4 if board_size <= 5 else 5)
         self.board: list[list[int]] = [[0] * board_size for _ in range(board_size)]
@@ -164,12 +167,12 @@ def _expand_node(
     mask = torch.full((logits.shape[0],), float("-inf"))
     for m in legal:
         r, c = divmod(m, bs)
-        mask[r * 16 + c] = 0.0  # policy uses 16x16 grid
+        mask[r * PADDED_BOARD_SIZE + c] = 0.0  # policy uses padded 16x16 grid
     probs = F.softmax(logits + mask, dim=0)
 
     for m in legal:
         r, c = divmod(m, bs)
-        p = probs[r * 16 + c].item()
+        p = probs[r * PADDED_BOARD_SIZE + c].item()
         node.children.append(MCTSNode(parent=node, move=m, prior=p))
 
     return value
@@ -259,7 +262,7 @@ class SelfPlayPlayer:
         self.model.to(self.device)
         self.model.eval()
 
-    def play_game(self, board_size: int = 15, win_length: int | None = None) -> list[dict]:
+    def play_game(self, board_size: int = _DEFAULT_GOMOKU_BOARD_SIZE, win_length: int | None = None) -> list[dict]:
         """Play a single self-play game using MCTS.
 
         Returns list of position records with 256-padded policy targets:
@@ -289,11 +292,11 @@ class SelfPlayPlayer:
             )
 
             # Convert board_size^2 policy to 256-padded (16x16) format
-            policy_256 = [0.0] * 256
+            policy_256 = [0.0] * PADDED_POLICY_SIZE
             for idx, prob in enumerate(policy_flat):
                 if prob > 0:
                     r, c = divmod(idx, board_size)
-                    policy_256[r * 16 + c] = prob
+                    policy_256[r * PADDED_BOARD_SIZE + c] = prob
 
             # Store position before making the move
             positions.append({
@@ -336,7 +339,7 @@ class SelfPlayPlayer:
     def generate_games(
         self,
         num_games: int | None = None,
-        board_size: int = 15,
+        board_size: int = _DEFAULT_GOMOKU_BOARD_SIZE,
         win_length: int | None = None,
     ) -> list[dict]:
         """Generate multiple self-play games and collect all positions."""

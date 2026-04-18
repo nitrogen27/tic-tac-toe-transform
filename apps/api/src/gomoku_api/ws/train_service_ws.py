@@ -8,13 +8,13 @@ import json
 import logging
 import math
 import random
-import re
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset
+from trainer_lab.specs import VariantSpec, resolve_variant_spec as _shared_resolve_variant_spec
 
 from gomoku_api.ws.gpu_info import get_gpu_info
 from gomoku_api.ws.model_profiles import (
@@ -37,18 +37,15 @@ def _ensure_saved_dir(variant: str) -> Path:
 
 
 def _resolve_variant_spec(variant: str) -> tuple[int, int]:
-    if variant == "ttt3":
-        return 3, 3
-    if variant == "ttt5":
-        return 5, 4
+    spec = _shared_resolve_variant_spec(variant)
+    return spec.board_size, spec.win_length
 
-    match = re.fullmatch(r"gomoku(?P<size>\d+)", variant)
-    if match:
-        board_size = int(match.group("size"))
-        if 7 <= board_size <= 16:
-            return board_size, 5
 
-    raise ValueError(f"Unsupported training variant: {variant}")
+def _variant_metric_metadata(variant_spec: VariantSpec) -> dict[str, Any]:
+    return {
+        "variantSpec": variant_spec.to_metadata(),
+        "curriculumStage": variant_spec.curriculum_stage,
+    }
 
 
 def _count_model_parameters(model: torch.nn.Module) -> int:
@@ -339,6 +336,7 @@ def _populate_validation_payload(
 def _build_deferred_train_done_payload(
     *,
     registry: Any,
+    variant_spec: VariantSpec,
     variant: str,
     epochs: int,
     started_at: float,
@@ -360,6 +358,8 @@ def _build_deferred_train_done_payload(
     manifest = registry.read_manifest()
     payload: dict[str, Any] = {
         "variant": variant,
+        "curriculumStage": variant_spec.curriculum_stage,
+        "variantSpec": variant_spec.to_metadata(),
         "epochs": epochs,
         "elapsed": round(time.monotonic() - started_at, 1),
         "metricsHistory": metrics_history,
@@ -378,7 +378,7 @@ def _build_deferred_train_done_payload(
         "confirmBackendRequested": confirm_backend_requested,
         "confirmBackendResolved": confirm_backend_resolved,
         "message": "Основное обучение завершено; confirm и promotion продолжаются в фоне.",
-        **registry.serving_summary(),
+        **registry.serving_summary(expected_spec=variant_spec),
     }
     _populate_selected_checkpoint_payload(payload, selected_checkpoint_summary)
     if selected_checkpoint_summary:
@@ -445,6 +445,8 @@ async def run_deferred_evaluator_tail(
     from gomoku_api.ws.predict_service import clear_cached_model
 
     variant = str(context["variant"])
+    variant_spec = _shared_resolve_variant_spec(variant)
+    variant_metric_metadata = _variant_metric_metadata(variant_spec)
     board_size = int(context["boardSize"])
     win_len = int(context["winLen"])
     cycle_count = int(context["cycleCount"])
@@ -528,6 +530,8 @@ async def run_deferred_evaluator_tail(
         "type": "background_train.started",
         "payload": {
             "variant": variant,
+            "curriculumStage": variant_spec.curriculum_stage,
+            "variantSpec": variant_spec.to_metadata(),
             "epoch": 1,
             "epochs": 1,
             "epochPercent": 0,
@@ -645,13 +649,15 @@ async def run_deferred_evaluator_tail(
     )
     await evaluator_cb({
         "type": "train.progress",
-        "payload": {
-            "phase": "promotion",
-            "stage": "decision",
-            "variant": variant,
-            "promotionDecision": decision.promoted,
-            "message": "Фоновый promotion завершает проверку кандидата.",
-            **decision.to_dict(),
+            "payload": {
+                "phase": "promotion",
+                "stage": "decision",
+                "variant": variant,
+                "curriculumStage": variant_spec.curriculum_stage,
+                "variantSpec": variant_spec.to_metadata(),
+                "promotionDecision": decision.promoted,
+                "message": "Фоновый promotion завершает проверку кандидата.",
+                **decision.to_dict(),
         },
     })
 
@@ -660,6 +666,7 @@ async def run_deferred_evaluator_tail(
         registry.promote_candidate(
             generation=cycle_count,
             metrics={
+                **variant_metric_metadata,
                 **decision.to_dict(),
                 "modelProfile": model_profile,
                 "resFilters": res_filters,
@@ -674,6 +681,8 @@ async def run_deferred_evaluator_tail(
             "type": "model.promoted",
             "payload": {
                 "variant": variant,
+                "curriculumStage": variant_spec.curriculum_stage,
+                "variantSpec": variant_spec.to_metadata(),
                 "generation": cycle_count,
                 "promotionDecision": True,
                 **decision.to_dict(),
@@ -703,6 +712,7 @@ async def run_deferred_evaluator_tail(
             registry.commit_working_candidate(
                 generation=cycle_count,
                 metrics={
+                    **variant_metric_metadata,
                     "phase": "checkpoint_selection",
                     "selectedCheckpointCycle": selected_checkpoint_cycle,
                     "selectedCheckpointWinrate": selected_summary_for_commit.get("winrate"),
@@ -731,6 +741,8 @@ async def run_deferred_evaluator_tail(
             "type": "promotion.rejected",
             "payload": {
                 "variant": variant,
+                "curriculumStage": variant_spec.curriculum_stage,
+                "variantSpec": variant_spec.to_metadata(),
                 "generation": cycle_count,
                 "promotionDecision": False,
                 **decision.to_dict(),
@@ -743,6 +755,8 @@ async def run_deferred_evaluator_tail(
     manifest = registry.read_manifest()
     done_payload: dict[str, Any] = {
         "variant": variant,
+        "curriculumStage": variant_spec.curriculum_stage,
+        "variantSpec": variant_spec.to_metadata(),
         "epochs": epochs,
         "elapsed": round(time.monotonic() - started_at, 1),
         "metricsHistory": metrics_history,
@@ -762,7 +776,7 @@ async def run_deferred_evaluator_tail(
         "confirmBackendRequested": confirm_backend_requested,
         "confirmBackendResolved": confirm_backend_resolved,
         "message": "Фоновая оценка завершена.",
-        **registry.serving_summary(),
+        **registry.serving_summary(expected_spec=variant_spec),
     }
     _populate_selected_checkpoint_payload(done_payload, selected_checkpoint_summary)
     if quick_result:
@@ -789,13 +803,22 @@ async def run_deferred_evaluator_tail(
     
 
 
-def _variant_model_hparams(board_size: int, cfg: Any, *, variant: str = "", model_profile: str | None = None, manifest: dict[str, Any] | None = None) -> tuple[str, tuple[int, int, int]]:
+def _variant_model_hparams(
+    board_size: int,
+    cfg: Any,
+    *,
+    variant: str = "",
+    model_profile: str | None = None,
+    manifest: dict[str, Any] | None = None,
+    variant_spec: VariantSpec | None = None,
+) -> tuple[str, tuple[int, int, int]]:
     return _shared_variant_model_hparams(
         variant or f"gomoku{board_size}",
         board_size,
         cfg,
         model_profile=model_profile,
         manifest=manifest,
+        spec=variant_spec,
     )
 
 
@@ -4574,12 +4597,13 @@ async def train_variant(
     runtime_flags = _prepare_cuda_runtime(device)
     cfg = ModelConfig()
 
-    board_size, win_len = _resolve_variant_spec(variant)
+    variant_spec = _shared_resolve_variant_spec(variant)
+    board_size, win_len = variant_spec.board_size, variant_spec.win_length
     rapid_mode = board_size <= 5
 
     registry = ModelRegistry(variant)
     manifest = registry.read_manifest()
-    serving_summary = registry.serving_summary()
+    serving_summary = registry.serving_summary(expected_spec=variant_spec)
     model_dir = _ensure_saved_dir(variant)
     requested_model_profile = str(kwargs.get("modelProfile", "auto"))
     current_manifest_profile = current_model_profile_from_manifest(manifest)
@@ -4596,6 +4620,7 @@ async def train_variant(
         variant=variant,
         model_profile=requested_model_profile,
         manifest=manifest,
+        variant_spec=variant_spec,
     )
     if requested_model_profile.strip().lower() not in {"", "auto"} and current_manifest_profile and current_manifest_profile != model_profile:
         logger.info(
@@ -4662,6 +4687,16 @@ async def train_variant(
         repair_steps = max(32, min(192, max(epochs * 4, turbo_steps // 2)))
         exam_every = 1  # large boards: exam every cycle
         exam_threshold_acc = float(kwargs.get("examThresholdAcc", 0.0))
+    if variant_spec.is_curriculum and board_size <= 9:
+        bootstrap_games = int(kwargs.get("bootstrapGames", min(bootstrap_games, 48)))
+        cycle_count = max(3, min(8, cycle_count))
+        exam_games = max(8, min(exam_games, 24))
+        exam_pairs = max(2, min(6, exam_games // 4))
+        teacher_seed_count = max(192, min(data_count, max(teacher_seed_count, bootstrap_games * 4)))
+        turbo_steps = max(40, min(160, epochs * 6))
+        repair_steps = max(24, min(96, max(epochs * 3, turbo_steps // 2)))
+        exam_every = 1
+        exam_threshold_acc = float(kwargs.get("examThresholdAcc", 0.0))
     repair_pool_size = max(512, min(data_count, teacher_seed_count))
     failure_bank_max = max(256, min(data_count * 2, 2048))
 
@@ -4675,7 +4710,14 @@ async def train_variant(
     failure_bank: list[dict[str, Any]] = []
     frozen_suites: dict[str, list[dict[str, Any]]] = {}
     started_at = time.monotonic()
-    common = {"variant": variant, "boardSize": board_size, "winLength": win_len}
+    common = {
+        "variant": variant,
+        "boardSize": board_size,
+        "winLength": win_len,
+        "curriculumStage": variant_spec.curriculum_stage,
+        "variantSpec": variant_spec.to_metadata(),
+    }
+    variant_metric_metadata = _variant_metric_metadata(variant_spec)
     use_user_corpus = bool(kwargs.get("useCorpus", False)) and variant == "ttt5"
     user_corpus_mode = str(kwargs.get("corpusMode", "quick_repair")).strip().lower()
     user_corpus = None
@@ -4757,6 +4799,8 @@ async def train_variant(
             "batchSize": batch_size,
             "boardSize": board_size,
             "winLength": win_len,
+            "curriculumStage": variant_spec.curriculum_stage,
+            "variantSpec": variant_spec.to_metadata(),
             "device": device.type,
             "deviceName": live_gpu.get("name", str(device)),
             "mixedPrecision": runtime_flags["mixedPrecision"],
@@ -4766,7 +4810,7 @@ async def train_variant(
             "modelParams": _count_model_parameters(model),
             "totalIterations": cycle_count,
             "totalCycles": cycle_count,
-            "trainingMode": "cyclic_engine_exam",
+            "trainingMode": "size_curriculum" if variant_spec.is_curriculum else "cyclic_engine_exam",
             "modelProfile": model_profile,
             "teacherBackend": teacher_backend_requested,
             "teacherBackendResolved": engine_backend_resolved,
@@ -4931,7 +4975,11 @@ async def train_variant(
             **common,
         )
         completed_phases.append("foundation")
-        registry.save_working_candidate(model, generation=0, metrics={"phase": "foundation"})
+        registry.save_working_candidate(
+            model,
+            generation=0,
+            metrics={**variant_metric_metadata, "phase": "foundation"},
+        )
         foundation_validation = await _run_validation_snapshot(
             model,
             holdout_bank,
@@ -5104,7 +5152,11 @@ async def train_variant(
             failureBankSize=len(failure_bank),
             **common,
         )
-        registry.save_working_candidate(model, generation=cycle, metrics={"phase": "turbo_train", "cycle": cycle})
+        registry.save_working_candidate(
+            model,
+            generation=cycle,
+            metrics={**variant_metric_metadata, "phase": "turbo_train", "cycle": cycle},
+        )
         pre_repair_state = _clone_model_state_dict(model)
 
         cycle_failures: list[dict[str, Any]] = []
@@ -5267,7 +5319,11 @@ async def train_variant(
                 newFailures=len(cycle_failures),
                 **common,
             )
-            registry.save_working_candidate(model, generation=cycle, metrics={"phase": "repair", "cycle": cycle})
+            registry.save_working_candidate(
+                model,
+                generation=cycle,
+                metrics={**variant_metric_metadata, "phase": "repair", "cycle": cycle},
+            )
 
         after_matches = _score_policy_matches(model, cycle_failures, device) if cycle_failures else []
         fixed_errors = sum((not before) and after for before, after in zip(before_matches, after_matches))
@@ -5407,6 +5463,7 @@ async def train_variant(
             model,
             generation=cycle_count,
             metrics={
+                **variant_metric_metadata,
                 "phase": "checkpoint_selection",
                 "cycle": selected_checkpoint_cycle,
                 "winrate": selected_checkpoint_summary.get("winrate"),
@@ -5799,6 +5856,7 @@ async def train_variant(
                         model,
                         generation=cycle_count + sp_iter,
                         metrics={
+                            **variant_metric_metadata,
                             "phase": "self_play",
                             "iteration": sp_iter,
                             "acceptedVsPreviousCheckpoint": True,
@@ -5825,6 +5883,7 @@ async def train_variant(
                 model,
                 generation=cycle_count,
                 metrics={
+                    **variant_metric_metadata,
                     "phase": "self_play_best",
                     "winrateVsAlgorithm": best_sp_winrate,
                     "acceptedVsPreviousCheckpoint": True,
@@ -5833,6 +5892,7 @@ async def train_variant(
 
     done_payload = _build_deferred_train_done_payload(
         registry=registry,
+        variant_spec=variant_spec,
         variant=variant,
         epochs=epochs,
         started_at=started_at,
@@ -5868,6 +5928,8 @@ async def train_variant(
     return {
         "deferredEvaluator": {
             "variant": variant,
+            "variantSpec": variant_spec.to_metadata(),
+            "curriculumStage": variant_spec.curriculum_stage,
             "boardSize": board_size,
             "winLen": win_len,
             "cycleCount": cycle_count,

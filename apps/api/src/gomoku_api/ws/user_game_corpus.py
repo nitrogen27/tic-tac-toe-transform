@@ -18,6 +18,7 @@ from typing import Any
 from gomoku_api.ws.offline_gen import _soft_policy_from_engine_hints
 from gomoku_api.ws.oracle_backends import create_oracle_evaluator
 from gomoku_api.ws.predict_service import _find_immediate_move, _model_predict
+from trainer_lab.specs import resolve_variant_spec as _shared_resolve_variant_spec
 
 logger = logging.getLogger(__name__)
 
@@ -53,15 +54,8 @@ CONVERSION_TYPES = {
 
 
 def resolve_variant_spec(variant: str) -> tuple[int, int]:
-    if variant == "ttt3":
-        return 3, 3
-    if variant == "ttt5":
-        return 5, 4
-    if variant.startswith("gomoku"):
-        digits = "".join(ch for ch in variant if ch.isdigit())
-        board_size = int(digits) if digits else 15
-        return board_size, 5
-    return 15, 5
+    spec = _shared_resolve_variant_spec(variant)
+    return spec.board_size, spec.win_length
 
 
 def _flat_to_board2d(board: list[int], board_size: int) -> list[list[int]]:

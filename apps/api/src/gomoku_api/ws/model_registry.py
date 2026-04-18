@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from trainer_lab.specs import VariantSpec, variant_metadata_matches
 
 logger = logging.getLogger(__name__)
 
@@ -147,28 +148,75 @@ class ModelRegistry:
     def has_champion(self) -> bool:
         return self.champion_path.exists() or self.legacy_path.exists()
 
-    def resolve_serving_checkpoint(self) -> tuple[Path | None, str]:
+    def _current_champion_entry(self) -> dict[str, Any] | None:
+        manifest = self.read_manifest()
+        history = list(manifest.get("history") or [])
+        if not history:
+            return None
+        current_generation = manifest.get("current_champion_generation")
+        if current_generation is None:
+            return history[-1]
+        for entry in reversed(history):
+            if entry.get("generation") == current_generation:
+                return entry
+        return history[-1]
+
+    def current_champion_metadata(self) -> dict[str, Any] | None:
+        return self._current_champion_entry()
+
+    def _has_structured_variant_metadata(self, metadata: dict[str, Any] | None) -> bool:
+        if not isinstance(metadata, dict):
+            return False
+        candidate = metadata.get("variantSpec")
+        if isinstance(candidate, dict):
+            metadata = candidate
+        return any(
+            key in metadata
+            for key in ("variantId", "boardSize", "winLength", "paddedSize", "policySize", "compatibilityKey")
+        )
+
+    def resolve_serving_checkpoint(self, *, expected_spec: VariantSpec | None = None) -> tuple[Path | None, str]:
         """Return the verified checkpoint that runtime is allowed to serve.
 
         Serving must stay on the promoted champion. The legacy ``model.pt`` is
         only kept as a compatibility alias for the same promoted weights.
         """
         if self.champion_path.exists():
-            return self.champion_path, "champion"
-        if self.legacy_path.exists():
-            return self.legacy_path, "legacy"
-        return None, "none"
+            path, source = self.champion_path, "champion"
+        elif self.legacy_path.exists():
+            path, source = self.legacy_path, "legacy"
+        else:
+            return None, "none"
+        if expected_spec is not None:
+            champion_meta = self.current_champion_metadata()
+            if self._has_structured_variant_metadata(champion_meta) and not variant_metadata_matches(expected_spec, champion_meta):
+                logger.error(
+                    "Refusing incompatible serving checkpoint for %s: expected=%s meta=%s",
+                    self.variant,
+                    expected_spec.to_metadata(),
+                    champion_meta,
+                )
+                return None, "incompatible"
+        return path, source
 
-    def serving_summary(self) -> dict[str, Any]:
+    def serving_summary(self, *, expected_spec: VariantSpec | None = None) -> dict[str, Any]:
         """Return lightweight metadata describing the active serving source."""
-        path, source = self.resolve_serving_checkpoint()
+        path, source = self.resolve_serving_checkpoint(expected_spec=expected_spec)
         manifest = self.read_manifest()
+        champion_meta = self.current_champion_metadata()
+        variant_spec_meta = None
+        if isinstance(champion_meta, dict):
+            candidate = champion_meta.get("variantSpec")
+            if isinstance(candidate, dict):
+                variant_spec_meta = candidate
         return {
             "variant": self.variant,
             "servingReady": path is not None,
             "servingSource": source,
             "servingCheckpointPath": str(path) if path is not None else None,
             "servingGeneration": manifest.get("current_champion_generation"),
+            "servingCompatibility": "exact" if source in {"champion", "legacy"} and path is not None else source,
+            "servingVariantSpec": variant_spec_meta,
         }
 
     def has_active_candidate(self) -> bool:

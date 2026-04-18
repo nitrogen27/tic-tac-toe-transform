@@ -55,3 +55,21 @@ def test_mixed_replay_save_and_load_round_trip(tmp_path) -> None:
     assert restored.summary()["sources"]["anchor"] == 1
     assert restored.summary()["sources"]["self_play"] == 1
     assert restored.summary()["sources"]["user"] == 1
+
+
+def test_mixed_replay_summary_tracks_board_sizes_and_curriculum_stages() -> None:
+    replay = MixedReplay(
+        total_capacity=100,
+        source_limits={"anchor": 20, "self_play": 20, "user": 20},
+    )
+    replay.add("anchor", {"id": "a-1", "board_size": 9, "curriculumStage": "curriculum"})
+    replay.add("self_play", {"id": "sp-1", "board_size": 9, "variantSpec": {"curriculumStage": "curriculum", "boardSize": 9}})
+    replay.add("user", {"id": "u-1", "board_size": 15, "curriculumStage": "production"})
+
+    summary = replay.summary()
+
+    assert summary["boardSizes"] == {"9": 2, "15": 1}
+    assert summary["sourceBoardSizes"]["anchor"] == {"9": 1}
+    assert summary["sourceBoardSizes"]["self_play"] == {"9": 1}
+    assert summary["sourceBoardSizes"]["user"] == {"15": 1}
+    assert summary["curriculumStages"] == {"curriculum": 2, "production": 1}

@@ -12,15 +12,36 @@ from trainer_lab.config import ModelConfig
 from trainer_lab.data.encoder import board_to_tensor
 from trainer_lab.models.resnet import PolicyValueResNet
 from trainer_lab.self_play.player import GameState, mcts_search
+from trainer_lab.specs import PADDED_BOARD_SIZE, VariantSpec, resolve_variant_spec
 
 logger = logging.getLogger(__name__)
 
 
-def _make_empty_position(board_size: int = 15) -> dict:
+def _default_gomoku_spec() -> VariantSpec:
+    return resolve_variant_spec("gomoku15")
+
+
+def _resolve_eval_spec(
+    *,
+    board_size: int | None = None,
+    win_length: int | None = None,
+    variant_spec: VariantSpec | None = None,
+) -> tuple[int, int]:
+    spec = variant_spec or _default_gomoku_spec()
+    resolved_board_size = int(board_size or spec.board_size)
+    if win_length is not None:
+        return resolved_board_size, int(win_length)
+    if variant_spec is not None and resolved_board_size == variant_spec.board_size:
+        return resolved_board_size, variant_spec.win_length
+    return resolved_board_size, 4 if resolved_board_size <= 5 else 5
+
+
+def _make_empty_position(board_size: int | None = None, *, variant_spec: VariantSpec | None = None) -> dict:
     """Create an empty board position dictionary."""
+    resolved_board_size, _ = _resolve_eval_spec(board_size=board_size, variant_spec=variant_spec)
     return {
-        "board_size": board_size,
-        "board": [[0] * board_size for _ in range(board_size)],
+        "board_size": resolved_board_size,
+        "board": [[0] * resolved_board_size for _ in range(resolved_board_size)],
         "current_player": 1,
         "last_move": None,
     }
@@ -58,7 +79,7 @@ def _model_move(
     for r in range(bs):
         for c in range(bs):
             if position["board"][r][c] == 0:
-                idx = r * 16 + c
+                idx = r * PADDED_BOARD_SIZE + c
                 if logits[idx].item() > best_score:
                     best_score = logits[idx].item()
                     best_move = (r, c)
@@ -139,9 +160,10 @@ def _check_winner(position: dict, win_length: int = 5) -> int:
 def evaluate_vs_random(
     model: PolicyValueResNet,
     num_games: int = 20,
-    board_size: int = 15,
+    board_size: int | None = None,
     max_moves: int = 225,
     device: torch.device | None = None,
+    variant_spec: VariantSpec | None = None,
 ) -> dict[str, float]:
     """Play *num_games* against a random opponent and report win/draw/loss rates.
 
@@ -153,11 +175,12 @@ def evaluate_vs_random(
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    resolved_board_size, _ = _resolve_eval_spec(board_size=board_size, variant_spec=variant_spec)
 
     wins = draws = losses = 0
 
     for g in range(num_games):
-        pos = _make_empty_position(board_size)
+        pos = _make_empty_position(resolved_board_size)
         game_result = 0  # 0=draw, 1=player1 wins, 2=player2 wins
 
         for _ in range(max_moves):
@@ -195,12 +218,13 @@ def evaluate_vs_previous_checkpoint(
     previous_model: PolicyValueResNet,
     *,
     num_games: int = 20,
-    board_size: int = 15,
+    board_size: int | None = None,
     win_length: int | None = None,
     max_moves: int | None = None,
     simulations: int = 400,
     deterministic: bool = True,
     device: torch.device | None = None,
+    variant_spec: VariantSpec | None = None,
 ) -> dict[str, float]:
     """Head-to-head evaluation of current model against previous checkpoint.
 
@@ -208,8 +232,12 @@ def evaluate_vs_previous_checkpoint(
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    wl = win_length if win_length is not None else (4 if board_size <= 5 else 5)
-    limit = max_moves if max_moves is not None else board_size * board_size
+    resolved_board_size, wl = _resolve_eval_spec(
+        board_size=board_size,
+        win_length=win_length,
+        variant_spec=variant_spec,
+    )
+    limit = max_moves if max_moves is not None else resolved_board_size * resolved_board_size
 
     current_model.eval()
     previous_model.eval()
@@ -220,7 +248,7 @@ def evaluate_vs_previous_checkpoint(
     wins_as_first = wins_as_second = 0
 
     for game_idx in range(num_games):
-        state = GameState(board_size, wl)
+        state = GameState(resolved_board_size, wl)
         current_is_first = (game_idx % 2 == 0)
         game_result = 0
 

@@ -19,6 +19,7 @@ from gomoku_api.ws.model_profiles import variant_model_hparams
 from gomoku_api.ws.model_registry import ModelRegistry
 from gomoku_api.ws.subprocess_utils import windows_hidden_subprocess_kwargs
 from trainer_lab.data.encoder import board_to_tensor
+from trainer_lab.specs import PADDED_BOARD_SIZE, resolve_variant_spec
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ def _nxn_winner(board: list[int], n: int, win_len: int, last_move: int) -> int:
 
 def _policy_cell_index(flat_index: int, board_size: int) -> int:
     row, col = divmod(flat_index, board_size)
-    return row * 16 + col
+    return row * PADDED_BOARD_SIZE + col
 
 
 def _flat_to_board2d(board: list[int], board_size: int, current: int) -> list[list[int]]:
@@ -687,13 +688,11 @@ def _loaded_model_decision(
 
     mask = torch.full_like(logits, float("-inf"))
     for idx in legal_flat:
-        r, c = divmod(idx, board_size)
-        mask[r * 16 + c] = 0.0
+        mask[_policy_cell_index(idx, board_size)] = 0.0
     probs_tensor = F.softmax(logits + mask, dim=0)
 
     for idx in legal_flat:
-        r, c = divmod(idx, board_size)
-        probs_raw[idx] = probs_tensor[r * 16 + c].item()
+        probs_raw[idx] = probs_tensor[_policy_cell_index(idx, board_size)].item()
 
     value_scores = _evaluate_afterstate_values(model, board, current, board_size, legal_flat)
     if resolved_mode == "pure":
@@ -811,11 +810,17 @@ def _get_model(variant: str):
     if variant in _loaded_models:
         return _loaded_models[variant]
 
+    try:
+        variant_spec = resolve_variant_spec(variant)
+    except ValueError:
+        _loaded_model_sources[variant] = "none"
+        return None
+
     registry = ModelRegistry(variant)
     # Serve only the promoted checkpoint. ``model.pt`` is just a legacy alias
     # for the same promoted weights and remains safe to use as compatibility
     # fallback, but active candidates must not leak into runtime serving.
-    model_path, model_source = registry.resolve_serving_checkpoint()
+    model_path, model_source = registry.resolve_serving_checkpoint(expected_spec=variant_spec)
     if model_path is None:
         _loaded_model_sources[variant] = "none"
         return None
@@ -826,19 +831,12 @@ def _get_model(variant: str):
 
         cfg = ModelConfig()
         manifest = ModelRegistry(variant).read_manifest()
-        if variant == "ttt3":
-            board_size = 3
-        elif variant == "ttt5":
-            board_size = 5
-        elif variant.startswith("gomoku"):
-            board_size = int(variant.replace("gomoku", ""))
-        else:
-            board_size = 15
         model_profile, (res_filters, res_blocks, value_fc) = variant_model_hparams(
             variant,
-            board_size,
+            variant_spec.board_size,
             cfg,
             manifest=manifest,
+            spec=variant_spec,
         )
         model = PolicyValueResNet(
             in_channels=cfg.in_channels,
@@ -1059,13 +1057,8 @@ async def predict(
             board_size = int(math.sqrt(n))
             variant = f"gomoku{board_size}"
 
-    if variant == "ttt3":
-        board_size, win_length = 3, 3
-    elif variant == "ttt5":
-        board_size, win_length = 5, 4
-    else:
-        board_size = int(variant.replace("gomoku", ""))
-        win_length = 5
+    variant_spec = resolve_variant_spec(variant)
+    board_size, win_length = variant_spec.board_size, variant_spec.win_length
 
     if mode == "algorithm":
         if variant == "ttt3":

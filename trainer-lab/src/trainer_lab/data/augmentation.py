@@ -6,6 +6,8 @@ from typing import Sequence
 
 import torch
 
+from trainer_lab.specs import PADDED_BOARD_SIZE, PADDED_POLICY_SIZE
+
 
 # ---------------------------------------------------------------------------
 # Low-level transforms on [C, 16, 16] planes and [256] policy vectors
@@ -64,9 +66,9 @@ def _transform_policy(policy: torch.Tensor, transform_fn) -> torch.Tensor:
 
     The policy is reshaped to [1, 16, 16], transformed, then flattened back.
     """
-    grid = policy.view(1, 16, 16)
+    grid = policy.view(1, PADDED_BOARD_SIZE, PADDED_BOARD_SIZE)
     grid = transform_fn(grid)
-    return grid.reshape(256)
+    return grid.reshape(PADDED_POLICY_SIZE)
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +109,9 @@ def augment_sample(
             bs = board_size
             aug_planes = torch.zeros_like(planes)
             aug_planes[:, :bs, :bs] = fn(planes[:, :bs, :bs].clone())
-            pol_grid = policy.view(1, 16, 16)
+            pol_grid = policy.view(1, PADDED_BOARD_SIZE, PADDED_BOARD_SIZE)
             aug_pol_grid = torch.zeros_like(pol_grid)
             aug_pol_grid[:, :bs, :bs] = fn(pol_grid[:, :bs, :bs].clone())
-            aug_policy = aug_pol_grid.reshape(256)
+            aug_policy = aug_pol_grid.reshape(PADDED_POLICY_SIZE)
         results.append((aug_planes, aug_policy, value.clone()))
     return results

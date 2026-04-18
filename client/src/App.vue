@@ -6,6 +6,8 @@
       <div class="variant-tabs">
         <button @click="setVariant('ttt3')" :class="{active: variant==='ttt3'}">3x3</button>
         <button @click="setVariant('ttt5')" :class="{active: variant==='ttt5'}">5x5</button>
+        <button @click="setVariant('gomoku9_curriculum')" :class="{active: variant==='gomoku9_curriculum'}">9x9</button>
+        <button @click="setVariant('gomoku15')" :class="{active: variant==='gomoku15'}">15x15</button>
       </div>
       <div class="header-right">
         <div class="gpu-pill" :class="{ 'gpu-active': gpuAvailable, 'gpu-inactive': !gpuAvailable }">
@@ -126,7 +128,7 @@
             </label>
             <label class="mode-label">
               <input type="radio" v-model="gameMode" value="algorithm" :disabled="training || clearing" />
-              <span>Алгоритм (minimax)</span>
+              <span>Алгоритм</span>
             </label>
           </div>
           <div class="mode-selector" v-if="gameMode === 'model' && gameType === 'human'">
@@ -699,13 +701,25 @@ const cancellingTraining = ref(false)
 const clearing = ref(false)
 const generatingDataset = ref(false)
 const progress = ref(null)
-const variant = ref('ttt3') // 'ttt3' или 'ttt5'
+const VARIANT_SPECS = {
+  ttt3: { grid: 3, winLen: 3, label: '3x3' },
+  ttt5: { grid: 5, winLen: 4, label: '5x5' },
+  gomoku9_curriculum: { grid: 9, winLen: 5, label: '9x9 curriculum' },
+  gomoku15: { grid: 15, winLen: 5, label: '15x15' },
+}
+
+function variantSpecOf(v) {
+  return VARIANT_SPECS[v] || VARIANT_SPECS.ttt3
+}
+
+const variant = ref('ttt3')
 const trainingStateByVariant = ref({})
-const boardSize = computed(() => variant.value === 'ttt5' ? 25 : 9)
-const gridN = computed(() => variant.value === 'ttt5' ? 5 : 3)
+const currentVariantSpec = computed(() => variantSpecOf(variant.value))
+const boardSize = computed(() => currentVariantSpec.value.grid * currentVariantSpec.value.grid)
+const gridN = computed(() => currentVariantSpec.value.grid)
 const cellSize = computed(() => variant.value === 'ttt5' ? 60 : 80)
-const winLen = computed(() => variant.value === 'ttt5' ? 4 : 3)
-const board = ref(Array(9).fill(0))
+const winLen = computed(() => currentVariantSpec.value.winLen)
+const board = ref(Array(VARIANT_SPECS.ttt3.grid * VARIANT_SPECS.ttt3.grid).fill(0))
 const current = ref(1) // 1 = X (человек/модель), 2 = O (бот/алгоритм)
 const waiting = ref(false) // Флаг ожидания ответа от сервера
 const status = ref('Ваш ход (X)')
@@ -2240,8 +2254,11 @@ function startTrain() {
       trainingETA.value = Math.floor(trainingElapsed.value * (100 - pct) / pct)
     }
   }, 1000)
-  const trainType = variant.value === 'ttt5' ? 'train_ttt5' : 'train_ttt3'
-  status.value = `Отправка запроса на обучение ${variant.value === 'ttt5' ? 'TTT5' : 'TTT3'} Transformer...`
+  const trainType =
+    variant.value === 'ttt3'
+      ? 'train'
+      : (variant.value === 'ttt5' ? 'train_ttt5' : 'train_gomoku')
+  status.value = `Отправка запроса на обучение ${currentVariantSpec.value.label}...`
   try {
     const preset = PRESETS[activePreset.value]
     const payload = {
@@ -2261,6 +2278,12 @@ function startTrain() {
         payload.selfPlayGames = preset.selfPlayGames || 100
         payload.selfPlaySims = preset.selfPlaySims || 100
         payload.selfPlayTrainSteps = preset.selfPlayTrainSteps || 80
+      }
+    }
+    if (variant.value !== 'ttt3' && variant.value !== 'ttt5') {
+      payload.variant = variant.value
+      if (variant.value === 'gomoku9_curriculum') {
+        payload.modelProfile = 'curriculum'
       }
     }
     ws.value.send(JSON.stringify({ type: trainType, payload }))
@@ -2738,12 +2761,13 @@ onUnmounted(() => {
 // Сбрасываем игру и настройки при смене варианта
 watch(variant, (newVariant) => {
   stopAutoGame()
-  // При переключении на TTT5 отключаем minimax
-  if (newVariant === 'ttt5') {
+  // Авто-режим оставляем только для 3x3, остальные варианты ведём через human+predict flow.
+  if (newVariant !== 'ttt3') {
     gameMode.value = 'model'
     gameType.value = 'human'
   }
-  board.value = Array(newVariant === 'ttt5' ? 25 : 9).fill(0)
+  const spec = variantSpecOf(newVariant)
+  board.value = Array(spec.grid * spec.grid).fill(0)
   current.value = 1
   gameOver.value = false
   waiting.value = false

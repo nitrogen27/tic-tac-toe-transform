@@ -117,13 +117,59 @@ class MixedReplay:
     def size_by_source(self) -> dict[str, int]:
         return {source: len(buffer) for source, buffer in self._buffers.items()}
 
+    @staticmethod
+    def _record_board_size(record: dict[str, Any]) -> str:
+        candidate = record.get("board_size")
+        if candidate is None:
+            variant_spec = record.get("variantSpec")
+            if isinstance(variant_spec, dict):
+                candidate = variant_spec.get("boardSize")
+        try:
+            return str(int(candidate))
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _record_curriculum_stage(record: dict[str, Any]) -> str:
+        stage = record.get("curriculumStage")
+        if stage is None:
+            variant_spec = record.get("variantSpec")
+            if isinstance(variant_spec, dict):
+                stage = variant_spec.get("curriculumStage")
+        normalized = str(stage or "").strip().lower()
+        return normalized or "unknown"
+
     def summary(self) -> dict[str, Any]:
+        board_sizes: dict[str, int] = {}
+        source_board_sizes: dict[str, dict[str, int]] = {}
+        curriculum_stages: dict[str, int] = {}
+        source_curriculum_stages: dict[str, dict[str, int]] = {}
+
+        for source, buffer in self._buffers.items():
+            per_source_sizes: dict[str, int] = {}
+            per_source_stages: dict[str, int] = {}
+            for record in buffer:
+                size_key = self._record_board_size(record)
+                stage_key = self._record_curriculum_stage(record)
+                board_sizes[size_key] = board_sizes.get(size_key, 0) + 1
+                per_source_sizes[size_key] = per_source_sizes.get(size_key, 0) + 1
+                curriculum_stages[stage_key] = curriculum_stages.get(stage_key, 0) + 1
+                per_source_stages[stage_key] = per_source_stages.get(stage_key, 0) + 1
+            if per_source_sizes:
+                source_board_sizes[source] = per_source_sizes
+            if per_source_stages:
+                source_curriculum_stages[source] = per_source_stages
+
         return {
             "total": len(self),
             "capacity": self.total_capacity,
             "sources": self.size_by_source(),
             "sourceLimits": dict(self.source_limits),
             "defaultSampleWeights": dict(self.default_sample_weights),
+            "boardSizes": board_sizes,
+            "sourceBoardSizes": source_board_sizes,
+            "curriculumStages": curriculum_stages,
+            "sourceCurriculumStages": source_curriculum_stages,
         }
 
     def sample(

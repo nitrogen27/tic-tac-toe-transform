@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from trainer_lab.specs import PADDED_BOARD_SIZE
+
 
 def board_to_tensor(position: dict) -> torch.Tensor:
     """Convert a position dictionary to a ``[6, 16, 16]`` float tensor.
@@ -31,7 +33,7 @@ def board_to_tensor(position: dict) -> torch.Tensor:
     opponent: int = 3 - current_player
     last_move = position.get("last_move")
 
-    planes = torch.zeros(6, 16, 16, dtype=torch.float32)
+    planes = torch.zeros(6, PADDED_BOARD_SIZE, PADDED_BOARD_SIZE, dtype=torch.float32)
 
     for r in range(board_size):
         for c in range(board_size):

@@ -17,6 +17,7 @@ from trainer_lab.export.onnx_export import export_to_onnx
 from trainer_lab.models.resnet import PolicyValueResNet
 from trainer_lab.self_play.player import SelfPlayPlayer
 from trainer_lab.self_play.mixed_replay import MixedReplay
+from trainer_lab.specs import VariantSpec, resolve_variant_spec
 from trainer_lab.training.loss import GomokuLoss
 from trainer_lab.training.trainer import train_epoch
 
@@ -39,11 +40,15 @@ class SelfPlayPipeline:
         train_cfg: TrainConfig | None = None,
         selfplay_cfg: SelfPlayConfig | None = None,
         device: torch.device | None = None,
+        *,
+        variant: str = "gomoku15",
+        variant_spec: VariantSpec | None = None,
     ) -> None:
         self.model_cfg = model_cfg or ModelConfig()
         self.train_cfg = train_cfg or TrainConfig()
         self.selfplay_cfg = selfplay_cfg or SelfPlayConfig()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.variant_spec = variant_spec or resolve_variant_spec(variant)
 
         self.model = PolicyValueResNet(
             in_channels=self.model_cfg.in_channels,
@@ -109,10 +114,12 @@ class SelfPlayPipeline:
                     self.model,
                     previous_eval_model,
                     num_games=self.selfplay_cfg.evaluation_games,
-                    board_size=15,
+                    board_size=self.variant_spec.board_size,
+                    win_length=self.variant_spec.win_length,
                     simulations=self.selfplay_cfg.evaluation_simulations,
                     deterministic=self.selfplay_cfg.deterministic_eval,
                     device=self.device,
+                    variant_spec=self.variant_spec,
                 )
                 logger.info(
                     "Gen %d eval vs prev: wins=%.0f%% draws=%.0f%% losses=%.0f%% first=%.0f%% second=%.0f%%",
@@ -124,7 +131,13 @@ class SelfPlayPipeline:
                     results["wins_as_second"] * 100,
                 )
 
-                random_results = evaluate_vs_random(self.model, num_games=10, device=self.device)
+                random_results = evaluate_vs_random(
+                    self.model,
+                    num_games=10,
+                    board_size=self.variant_spec.board_size,
+                    device=self.device,
+                    variant_spec=self.variant_spec,
+                )
                 logger.info(
                     "Gen %d eval vs random: wins=%.0f%% draws=%.0f%% losses=%.0f%%",
                     gen,

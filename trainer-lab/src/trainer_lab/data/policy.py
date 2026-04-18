@@ -6,11 +6,13 @@ from typing import Sequence
 
 import torch
 
+from trainer_lab.specs import PADDED_BOARD_SIZE, PADDED_POLICY_SIZE
+
 
 def pad_policy_target(
     policy: Sequence[float] | torch.Tensor,
     board_size: int,
-    board_max: int = 16,
+    board_max: int = PADDED_BOARD_SIZE,
 ) -> torch.Tensor:
     """Pad a flat ``board_size x board_size`` policy into a flat ``board_max x board_max`` tensor.
 
@@ -18,7 +20,7 @@ def pad_policy_target(
     as a float tensor. This makes the helper safe to use across both fixed-size and
     variable-size datasets.
     """
-    target_cells = board_max * board_max
+    target_cells = PADDED_POLICY_SIZE if board_max == PADDED_BOARD_SIZE else board_max * board_max
     if isinstance(policy, torch.Tensor):
         tensor = policy.detach().clone().to(dtype=torch.float32).view(-1)
     else:
